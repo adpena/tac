@@ -6,6 +6,51 @@ Neural video compression optimized for downstream perception models.
 
 tac trains tiny CNN post-filters that correct decoded video frames by backpropagating through frozen perception networks. The filter learns corrections that minimize the scorer's distortion metric, not generic pixel quality.
 
+
+## How it fits together
+
+```mermaid
+flowchart LR
+  subgraph Local["Local CPU (microseconds per candidate)"]
+    GEN["Candidate generator<br/>(apogee_intN, sidechannel sweep, etc.)"]
+    RANK["MetaLagrangianSearch<br/>(predictor + distortion proxy)"]
+    GATE{"Sanity gate<br/>(5 hardened checks)"}
+  end
+
+  subgraph Cloud["Paid GPU (Lightning T4 / Vast.ai 4090)"]
+    DISP["parallel_dispatch_top_k<br/>(ThreadPoolExecutor)"]
+    EVAL["upstream/evaluate.py<br/>(contest-CUDA T4)"]
+    JSON["contest_auth_eval.json<br/>(per-dispatch)"]
+  end
+
+  subgraph Feedback["Closed-loop reseed"]
+    HARV["harvest_and_reseed<br/>(filters [contest-CUDA] only)"]
+    ANCHOR["anchors_*.json<br/>(empirical calibration)"]
+  end
+
+  GEN --> RANK
+  RANK -->|"top-K"| GATE
+  GATE -->|"PASS"| DISP
+  GATE -->|"REFUSE"| GEN
+  DISP --> EVAL
+  EVAL --> JSON
+  JSON --> HARV
+  HARV --> ANCHOR
+  ANCHOR -->|"strengthens"| RANK
+
+  style GATE fill:#fff3cd,stroke:#856404
+  style ANCHOR fill:#d4edda,stroke:#155724
+  style EVAL fill:#cce5ff,stroke:#004085
+```
+
+The cycle is: rank cheap, dispatch top-K in parallel, harvest only what tagged
+`[contest-CUDA]`, reseed the calibration. The sanity gate refuses anything the
+predictor or proxy can't justify (extrapolation outside calibrated range,
+lossy-better-than-lossless math incoherence, missing distortion model). The
+single binary running this loop end-to-end is `tools/feedback_loop_sweep.py`
+in [adpena/comma-lab](https://github.com/adpena/comma-lab).
+
+
 ## Installation
 
 ```bash
