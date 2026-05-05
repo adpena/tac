@@ -1,6 +1,8 @@
-# tac -- Task-Aware Codec
+# tac — Task-Aware Compression
 
 Neural video compression optimized for downstream perception models.
+
+**`tac`** is the tight production library extracted from **`comma-lab`** (the comma video compression contest research workspace at https://github.com/adpena/comma-lab — currently being sanitized for public release; see PR [#107](https://github.com/commaai/comma_video_compression_challenge/pull/107) for the contest submission). This repo contains the reusable codec primitives, score-band predictor with refusal modes, distortion proxy, parallel-dispatch toolchain, and hardened preflight infrastructure. The full research trajectory — experimental ledger, byte-level deconstruction of public PRs, lane registry, dispatch wrappers, methodology writeup, and 585 session-memory files — lives in `comma-lab`.
 
 tac trains tiny CNN post-filters that correct decoded video frames by backpropagating through frozen perception networks. The filter learns corrections that minimize the scorer's distortion metric, not generic pixel quality.
 
