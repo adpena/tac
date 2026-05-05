@@ -34,6 +34,44 @@ trainer = Trainer(model, config, device="mps")
 trainer.fit(comp_pairs, gt_pairs, posenet, segnet, sal_weights)
 ```
 
+For the closed-loop search side of the library — meta-Lagrangian ranker,
+score-band predictor with refusal modes, parallel-dispatch actuator, and
+harvest-and-reseed feedback — see [`examples/quickstart.py`](examples/quickstart.py).
+It runs without a GPU and without comma-challenge data:
+
+```bash
+python examples/quickstart.py
+```
+
+## What this is for
+
+**Meta-Lagrangian search engine** (`tac.optimizer.MetaLagrangianSearch`):
+ranks codec candidates with a Boyd-style multi-constraint Lagrangian,
+combining a closed-form distortion proxy, a score-band predictor, and a
+5-gate predispatch sanity ladder. Refused candidates sort to the bottom of
+the dispatch queue regardless of nominal score; the engine is deterministic,
+arch-agnostic, and uses the exact contest score formula.
+
+**Predictor with refusal modes** (`tac.predictor.score_band`): predicts a
+contest-CUDA score band from rel_err and archive bytes, but *refuses* when
+calibration support is insufficient (`insufficient_anchors`,
+`extrapolation`, `lossy_better_than_lossless_incoherent`, ...). Built after
+the apogee_int4 8x miss (predicted [0.155, 0.180]; landed 1.4287
+[contest-CUDA]) — refusal is the feature, not the bug.
+
+**Parallel-dispatch actuator** (production wires
+`tools/parallel_dispatch_top_k.py` from the parent comma-lab repo):
+`concurrent.futures.ThreadPoolExecutor` over the existing dispatch wrappers
+with per-dispatch and total-cost gating, harvested-JSONL output, and strict
+refusal of candidates not marked `ready_for_exact_eval_dispatch=true`.
+
+**Closed-loop feedback** (production wires
+`tools/feedback_loop_sweep.py`): rank → fan-out N concurrent paid-GPU
+dispatches → harvest [contest-CUDA] rows → cross-verify against
+`contest_auth_eval.json` → append empirical anchors → re-rank → repeat,
+gated by `--max-cycles`, `--max-total-cost`, `--max-cost-per-cycle`, and
+`--convergence-eps`.
+
 ## What it does
 
 Video compression codecs (H.264, AV1) optimize for human perception -- PSNR, SSIM, perceptual quality. But many downstream consumers are neural networks, not humans. A self-driving car's perception stack does not care about perceptual quality; it cares about whether PoseNet and SegNet produce correct outputs from the decoded frames.
