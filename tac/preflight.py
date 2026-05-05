@@ -1,0 +1,21456 @@
+"""Preflight pipeline validator — catches integration mismatches before GPU burns.
+
+Every bug in this project was at a boundary between components:
+  - Masks at wrong resolution (48x64 vs 384x512 → score 103 vs 2)
+  - Poses optimized against wrong masks (27x PoseNet regression)
+  - Archive missing artifacts (119KB vs 338KB → 0.108 rate error)
+  - eval_roundtrip defaulting False (proxy-auth drift 11x)
+  - FP4 without QAT (26x PoseNet degradation)
+  - TTO frames at GT range [0,255] instead of TTO-optimized [0,~184] (WILDE failure 2026-04-25)
+  - Ad-hoc nohup watchers dying silently (3-A100 deployment failure 2026-04-25)
+
+CANONICAL ENTRY POINT: preflight_all(). Combines:
+  - preflight_check         → artifact validation (renderer/masks/poses/archive)
+  - preflight_training_inputs → TTO range, profile arch, eval_roundtrip
+  - check_codebase_drift    → AST scan blocks ad-hoc patterns
+
+Usage:
+    from tac.preflight import preflight_all
+    preflight_all(
+        profile_name="shiraz",
+        profile_arch=PROFILES["shiraz"],
+        tto_frames_path="experiments/results/tto_v7_hinge_500/tto_frames.pt",
+        gt_poses_path="experiments/results/gt_poses.pt",
+        masks_path="submissions/robust_current/masks_crf50.mkv",
+    )
+"""
+from __future__ import annotations
+
+import ast
+import datetime as _dt
+import hashlib
+import importlib.util
+import os
+import re
+import shlex
+import struct
+import subprocess
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+
+import torch
+
+
+class PreflightError(Exception):
+    """A preflight check failed — do NOT proceed."""
+    pass
+
+
+class PreflightWarning:
+    """A preflight check raised a concern but is not fatal."""
+    def __init__(self, msg: str):
+        self.msg = msg
+
+
+def preflight_check(
+    renderer_path: str | Path | None = None,
+    masks_path: str | Path | None = None,
+    poses_path: str | Path | None = None,
+    archive_path: str | Path | None = None,
+    expected_n_frames: int = 1200,
+    expected_n_pairs: int = 600,
+    expected_seg_h: int = 384,
+    expected_seg_w: int = 512,
+    verbose: bool = True,
+) -> list[PreflightWarning]:
+    """Run all preflight checks. Raises PreflightError on fatal issues.
+
+    Returns list of warnings (non-fatal concerns).
+    """
+    warnings: list[PreflightWarning] = []
+    checks_passed = 0
+    checks_total = 0
+
+    def _pass(msg: str) -> None:
+        nonlocal checks_passed, checks_total
+        checks_total += 1
+        checks_passed += 1
+        if verbose:
+            print(f"  [PASS] {msg}")
+
+    def _fail(msg: str) -> None:
+        nonlocal checks_total
+        checks_total += 1
+        if verbose:
+            print(f"  [FAIL] {msg}")
+        raise PreflightError(msg)
+
+    def _warn(msg: str) -> None:
+        nonlocal checks_total
+        checks_total += 1
+        warnings.append(PreflightWarning(msg))
+        if verbose:
+            print(f"  [WARN] {msg}")
+
+    if verbose:
+        print("=" * 60)
+        print("PREFLIGHT CHECK")
+        print("=" * 60)
+
+    # ── Renderer checks ──────────────────────────────────────────
+    if renderer_path:
+        renderer_path = Path(renderer_path)
+        if not renderer_path.exists():
+            _fail(f"Renderer not found: {renderer_path}")
+
+        raw = renderer_path.read_bytes()
+        magic = raw[:4]
+
+        runtime_renderer_magics = {
+            b"DPSM": "DPSM runtime renderer",
+            b"I4LZ": "INT4+LZMA2 runtime renderer",
+            b"FP8H": "FP8H runtime renderer",
+            b"CCh1": "Cool-Chic runtime renderer",
+            b"C3R1": "C3 residual runtime renderer",
+            b"SCv1": "Self-compressing runtime renderer",
+            b"SZv1": "Szabolcs/SegMap runtime renderer",
+            b"QFAI": "Q-FAITHFUL JointFrameGenerator runtime renderer",
+            b"QZS3": "QZS3 JointFrameGenerator runtime renderer",
+            b"MQZ1": "MQZ1 mixed/local QZS runtime renderer",
+            b"QH0": "PR85 QH0 JointFrameGenerator runtime renderer",
+            b"QM0": "PR85 QM0 JointFrameGenerator runtime renderer",
+            b"QH1": "PR85 QH1 lossless record-repack JointFrameGenerator runtime renderer",
+            b"NWC1": "Neural weight codec runtime renderer",
+            b"OWV2": "OWV2 runtime renderer",
+            b"OWV3": "OWV3 runtime renderer",
+            b"IMPS": "IMP sparse-CSR runtime renderer",
+        }
+        pytorch_pickle_magics = (b"PK\x03\x04", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
+
+        if magic == b"ASYM":
+            header_len = struct.unpack("<I", raw[4:8])[0]
+            import json
+            header = json.loads(raw[8:8 + header_len])
+            pose_dim = header.get("pose_dim", 0)
+            base_ch = header.get("base_ch", "?")
+            dsconv = header.get("use_dsconv", False)
+            _pass(f"Renderer: ASYM, pose_dim={pose_dim}, base_ch={base_ch}, dsconv={dsconv}, {len(raw):,}B")
+
+            if pose_dim == 0:
+                _warn("Renderer has pose_dim=0 — FiLM conditioning disabled, poses will have no effect")
+            if pose_dim > 0 and poses_path is None:
+                _warn("Renderer has pose_dim>0 but no poses_path provided — will use zero poses")
+        elif magic == b"FP4A":
+            _pass(f"Renderer: FP4A, {len(raw):,}B")
+            _warn("FP4 renderer — verify QAT was used during training (post-hoc QAT degrades 3-26x)")
+        elif magic in runtime_renderer_magics:
+            _pass(f"Renderer: {runtime_renderer_magics[magic]}, {len(raw):,}B")
+        elif raw[:3] in runtime_renderer_magics:
+            _pass(f"Renderer: {runtime_renderer_magics[raw[:3]]}, {len(raw):,}B")
+        elif raw[:8] == b"NWCS1\0\0\0":
+            _pass(f"Renderer: NWCS1 sensitivity-aware neural weight codec runtime renderer, {len(raw):,}B")
+        elif raw.startswith(pytorch_pickle_magics):
+            _warn(f"Renderer: PyTorch checkpoint payload, {len(raw):,}B")
+        else:
+            _fail(
+                f"Renderer: unknown non-pickle binary format (magic={magic!r}). "
+                "Refusing to assume PyTorch .pt because that reopens the "
+                "renderer.bin torch.load bug class; add an explicit runtime "
+                "loader/preflight branch for this wire format."
+            )
+
+    # ── Mask checks ──────────────────────────────────────────────
+    if masks_path:
+        masks_path = Path(masks_path)
+        if not masks_path.exists():
+            _fail(f"Masks not found: {masks_path}")
+
+        if masks_path.suffix in (".mkv", ".mp4"):
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                 str(masks_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if probe.returncode == 0:
+                parts = probe.stdout.strip().split(",")
+                w, h = int(parts[0]), int(parts[1])
+                size = masks_path.stat().st_size
+
+                if h == expected_seg_h and w == expected_seg_w:
+                    _pass(f"Masks: {w}x{h} (native resolution), {size:,}B")
+                elif expected_seg_h % h == 0 and expected_seg_w % w == 0:
+                    scale = expected_seg_h // h
+                    _warn(f"Masks at 1/{scale} resolution ({w}x{h}), will upsample to {expected_seg_w}x{expected_seg_h}")
+                else:
+                    _fail(f"Masks resolution {w}x{h} is not a clean factor of {expected_seg_w}x{expected_seg_h}")
+            else:
+                _warn("Could not probe mask video with ffprobe")
+        elif masks_path.suffix == ".pt":
+            m = torch.load(str(masks_path), weights_only=True)
+            if m.shape[1] != expected_seg_h or m.shape[2] != expected_seg_w:
+                _warn(f"Masks shape {m.shape} — expected (N, {expected_seg_h}, {expected_seg_w})")
+            else:
+                _pass(f"Masks: {m.shape}, .pt format")
+
+    # ── Pose checks ──────────────────────────────────────────────
+    if poses_path:
+        poses_path = Path(poses_path)
+        if not poses_path.exists():
+            _fail(f"Poses not found: {poses_path}")
+
+        p = torch.load(str(poses_path), weights_only=True)
+        if p.shape[0] != expected_n_pairs:
+            _fail(f"Poses shape {p.shape} — expected ({expected_n_pairs}, 6). "
+                  f"Wrong number of pairs.")
+        if p.shape[1] != 6:
+            _fail(f"Poses shape {p.shape} — expected (N, 6). Wrong pose dimension.")
+        _pass(f"Poses: {p.shape}, dtype={p.dtype}")
+
+        if p.abs().max() > 100:
+            _warn(f"Poses max value {p.abs().max():.1f} — unusually large, may indicate wrong scale")
+        if p.abs().mean() < 0.001:
+            _warn(f"Poses mean abs {p.abs().mean():.6f} — near zero, may not have been optimized")
+
+    # ── Pose-mask consistency ────────────────────────────────────
+    # This is the #1 source of score regressions in this project.
+    # Poses optimized against wrong masks caused 27x PoseNet degradation.
+    if poses_path and masks_path:
+        _warn("CRITICAL: Verify poses were optimized against THESE EXACT masks. "
+              "Mismatched poses caused 27x PoseNet regression. "
+              "optimize_poses.py now requires --masks to prevent this.")
+
+    # ── Archive checks ───────────────────────────────────────────
+    if archive_path:
+        archive_path = Path(archive_path)
+        if not archive_path.exists():
+            _fail(f"Archive not found: {archive_path}")
+
+        try:
+            # R38 fix: use detect_pose_manifest to autopick the right
+            # manifest based on which pose format the archive actually has.
+            from tac.submission_archive import validate_archive, detect_pose_manifest
+            manifest = detect_pose_manifest(archive_path)
+            result = validate_archive(archive_path, manifest, strict=False)
+            if result.valid:
+                _pass(f"Archive: {result.archive_bytes:,}B, rate={result.rate_term:.4f}, valid")
+            else:
+                for err in result.errors:
+                    _fail(f"Archive: {err}")
+                for w in result.warnings:
+                    _warn(f"Archive: {w}")
+        except Exception as e:
+            _warn(f"Archive validation failed: {e}")
+
+    # ── Summary ──────────────────────────────────────────────────
+    if verbose:
+        print(f"\n  {checks_passed}/{checks_total} checks passed, {len(warnings)} warnings")
+        if warnings:
+            print("  Warnings:")
+            for w in warnings:
+                print(f"    - {w.msg}")
+        print("=" * 60)
+
+    return warnings
+
+
+# Note: __main__ block moved to the bottom of the module so all validator
+# functions (preflight_all et al.) are defined before invocation. Was a
+# misleading-CLI bug per R38 — operators running `python -m tac.preflight`
+# only got artifact validation, silently skipping all 5 codebase layers.
+
+
+def preflight_all(
+    profile_name: str | None = None,
+    profile_arch: dict | None = None,
+    tto_frames_path: str | Path | None = None,
+    gt_poses_path: str | Path | None = None,
+    masks_path: str | Path | None = None,
+    renderer_path: str | Path | None = None,
+    archive_path: str | Path | None = None,
+    check_codebase: bool = True,
+    verbose: bool = True,
+) -> None:
+    """Single entry point: run ALL preflight checks. Raises on any failure.
+
+    This is what every deployment / pipeline / experiment should call FIRST.
+    Combines:
+      - preflight_check: artifact validation (renderer/masks/poses/archive shapes, magic bytes)
+      - preflight_training_inputs: training-time data integrity (TTO range, profile arch, eval_roundtrip)
+      - preflight_codebase: AST scan for forbidden ad-hoc patterns (no nohup, no launch_*.sh)
+
+    Pass only the args relevant to your stage. e.g., training preflight needs
+    profile_name + tto_frames_path + gt_poses_path + masks_path. Inflate-time
+    preflight needs renderer_path + masks_path + archive_path.
+    """
+    # 1. Codebase drift check (cheap, always run unless explicitly disabled)
+    if check_codebase:
+        check_codebase_drift(strict=True)
+        # 2026-04-30 supply-chain incident: PyPI `lightning` 2.6.2/2.6.3
+        # contained Mini Shai-Hulud style credential-stealing malware that
+        # executes on import. This repository uses `lightning-sdk`; any
+        # install path for bare `lightning` is a remote-runner compromise risk.
+        check_no_compromised_lightning_supply_chain(strict=True, verbose=verbose)
+        # Lightning SSH custody must not regress to TOFU-disabled shell snippets
+        # or bare provider-host targets. Direct provider targets have already
+        # caused confusing auth failures; scripts/runbooks should use an SSH
+        # config alias whose resolved policy is checked with ssh -G.
+        check_lightning_ssh_static_policy(strict=True, verbose=verbose)
+        # 2026-05-05 recovery R13: public/submission helpers had a stale
+        # provider download path that disabled host-key checking and ran
+        # evaluate.py on CPU. Keep provider orchestration out of submission
+        # surfaces and require CUDA for any helper that scores.
+        check_no_submission_provider_or_cpu_score_leakage(strict=True, verbose=verbose)
+        # 2026-04-30 Lightning r3 exact-eval failure: CUDA preflight and
+        # archive/inflate succeeded, but upstream evaluate.py crashed on
+        # missing `nvidia.dali`. Exact-eval runners must bootstrap/probe DALI
+        # before copying the archive or spending inflate time, then rerun the
+        # supply-chain scan after any dependency mutation.
+        check_lightning_exact_eval_runner_bootstraps_dali(strict=True, verbose=verbose)
+        # 2026-05-01 public-floor PVL1 promotion attempt exposed a separate
+        # closure hole: exact-eval Studio submits could stage the archive
+        # without the inflate runtime config.env, then fail after queue time.
+        # T4/g4dn submits must also pin inflate-side Torch for old drivers.
+        check_lightning_exact_eval_manifest_runtime_closure(strict=True, verbose=verbose)
+        # Remote archive-only H100/L40S diagnostics are only useful if their
+        # score JSON is tied to preserved archive bytes. This catches wrapper
+        # regressions before overwritten artifact paths create false evidence.
+        check_remote_archive_only_eval_custody_closure(strict=True, verbose=verbose)
+        # 2026-05-02 Apogee CMG3A incident: byte-targeted/plain run-count
+        # mask grammars can clear archive-custody preflight yet collapse
+        # PoseNet by 3-5+ distance on exact CUDA. New remote dispatch code must
+        # carry a pose-safety selector, a field policy, or an explicit reviewed
+        # waiver marker before spending GPU on this measured-bad shape.
+        check_cmg3a_remote_dispatch_requires_pose_safety(strict=True, verbose=verbose)
+        # 2026-05-02 PMG-HOTSPOT incident: row-span/predictive mask grammars
+        # have attractive byte screens but exact CUDA showed catastrophic
+        # PoseNet collapse. Remote scripts may preserve old artifacts for
+        # forensics, but new spend needs an explicit geometry-escape proof or a
+        # guarded historical-replay marker.
+        check_pmg_remote_dispatch_requires_geometry_escape(strict=True, verbose=verbose)
+        # 2026-05-02 standalone component traces hit the same runtime-boundary
+        # class as archive-only evals: system ffmpeg can lack the explicit
+        # color contract and inflate-side uv can mutate shared envs. Component
+        # traces are diagnostic, but they drive hard-pair/water-fill decisions,
+        # so runtime drift must fail before profile feedback enters the loop.
+        check_contest_component_trace_runtime_parity(strict=True, verbose=verbose)
+        check_dispatch_claim_helper_present(strict=True, verbose=verbose)
+        # 2026-04-30 MCP shutdown directive: repo-owned MCP configs must stay
+        # empty unless the user explicitly re-enables them. This catches
+        # accidental reintroduction of `.codex/.claude/.cursor` MCP server
+        # entries before helper processes respawn from editor/runtime config.
+        check_no_active_mcp_server_config(strict=True, verbose=verbose)
+        # Config checks do not catch helpers already spawned by an editor or
+        # previous agent session. Fail closed on live orphaned MCP helpers too.
+        check_no_live_mcp_processes(strict=True, verbose=verbose)
+        preflight_arity(strict=True, verbose=verbose)
+        # Check 72 (2026-04-29): close BUG CLASS A — invented CLI flags inside
+        # remote_lane_*.sh shell-script invocations of experiments/*.py. The
+        # existing preflight_arity walks Python launchers (subprocess.run +
+        # bash -c strings); the bare shell pattern was a structural blind spot.
+        # Live-codebase scan finds 0 violations across 84 scripts × ~170
+        # invocations, so flips straight to STRICT. Memory ref: the 2026-04-29
+        # Lane MM/SA-v2/SC++-v2/SO-v2 ~$3 Modal incident.
+        preflight_shell_lane_arity(strict=True, verbose=verbose)
+        # Check 73 (2026-04-29): close BUG CLASS B — unchunked SegMap /
+        # renderer training that OOMs T4 (7.03 GiB allocation in 14.56 GiB
+        # of VRAM, 11.66 GiB already in use). Lane scripts invoking
+        # experiments/train_segmap.py or experiments/train_renderer.py MUST
+        # pass --batch-size <= 32 OR export GPU_TIER_HINT to opt out of T4.
+        # The matching code-side fix is the new chunked train_epoch
+        # (segmap_renderer.py SegMapTrainer.train_epoch + the train_segmap.py
+        # main-loop wiring of args.batch_size). Live-codebase scan: 0
+        # violations → straight to STRICT.
+        preflight_t4_oom_training_guard(strict=True, verbose=verbose)
+        # 2026-05-05 recovery: shell/CLI typo and portability hazards caused
+        # repeated dead dispatches (`--rmote`, adjudicator-only flags on
+        # launchers, zsh `path`, GNU find on macOS). The scanner is strict over
+        # live dispatch/runbook surfaces and excludes historical custody logs.
+        check_dispatch_cli_shell_hazards(strict=True, verbose=verbose)
+        # 2026-05-05 council Q2 (PCC9): no L2 promotion via zero-delta smoke
+        # evidence. Live count was 4 (PR106 sister lanes); demoted L2->L1
+        # in commit 9155f0e1. Strict-flipped after cleanup.
+        check_lane_smoke_signal_nontrivial(strict=True, verbose=verbose)
+        # 2026-05-05 council Q4 (PCC10): anti-arbitrariness scanner — every
+        # prediction-logic numeric literal must carry a provenance tag
+        # ([contest-defined] / [calibration:...] / [empirical:...] /
+        # [heuristic:...] / [inherited:...]). Live count was 6; fixed in
+        # commit 9155f0e1. Strict-flipped after cleanup.
+        check_calibration_provenance(strict=True, verbose=verbose)
+        # 2026-05-05 council Q5-B4 (PCC11): wrapper scripts whose `# Stage N:`
+        # comments lack a real command in the stage body. Live count was 63
+        # across 20 wrappers pre-tightening; dedupe + skip-marker filters
+        # (SKIPPED|TODO|STUB|"ready at"|"nothing additional"|"manual")
+        # brought it to 0. Strict-flipped after cleanup.
+        check_dispatch_wrapper_stages_implemented(strict=True, verbose=verbose)
+        # 2026-05-05 public-submission recovery: reverse_engineering/ must stay
+        # a curated deconstruction surface, not a raw archive/provider dump or
+        # hidden second source tree. This strict check allows explicit orphan
+        # queues while blocking raw artifacts and unclassified files.
+        check_reverse_engineering_tree_curation(strict=True, verbose=verbose)
+        # 2026-04-27 codex R5-2 Finding #2: scanner flipped to strict after
+        # all 19 known violations were fixed (12 dead resolvers in
+        # train_renderer.py + 7 dead imports across test_fp4_quality /
+        # train_distill / benchmark_mlx / train_renderer). The scanner now
+        # blocks the same silent-default class it was added to prevent.
+        # See feedback_dead_resolver_violations_20260427 memory entry +
+        # test_preflight_dead_resolvers_strict_passes_on_real_codebase.
+        preflight_dead_resolvers(strict=True, verbose=verbose)
+        # 2026-05-05 hidden-gem recovery: a second-order dead-feature class
+        # slipped past dead-resolver checks. `use_variance_noise` resolved
+        # cleanly in profiles/argparse, but train_distill raised
+        # NotImplementedError and train_renderer never applied the loss.
+        # This AST guard requires the flag to enter the live objective path.
+        check_feature_flags_have_live_objective_effect(strict=True, verbose=verbose)
+        preflight_profiles(strict=True, verbose=verbose)
+        preflight_arch_consistency(strict=True, verbose=verbose)
+        preflight_filename_contract(strict=True, verbose=verbose)
+        preflight_loader_format_safety(strict=True, verbose=verbose)
+        preflight_canonical_checkpoints(strict=True, verbose=verbose)
+        preflight_build_renderer_signature(strict=True, verbose=verbose)
+        preflight_bootstrap_safety(strict=True, verbose=verbose)
+
+        # 2026-04-27 codex R5-3 Finding #4 + R5-3-r3: wire all 11 meta-bug
+        # checks (FORBIDDEN PATTERNS / CLAUDE.md) into preflight_all STRICT.
+        # Live-codebase counts went 40 → 0 across F1 (commit 7d2b5299), F2
+        # (commit a94a9325), and the codex-round-4 probe-before-DALI fix.
+        # Every entry point — pre-commit hook (tools/preflight_hook.py), CI
+        # (.github/workflows/ci.yml), and any direct preflight_all caller —
+        # now BLOCKS at commit/PR/run time on any new violation. The bug
+        # classes that wasted days of GPU time + multiple rounds of council
+        # rework are now structurally extinct. Reverting any of these fixes
+        # will fail strict here.
+        check_no_mps_fallback_default(strict=True, verbose=verbose)
+        check_shell_set_e_present(strict=True, verbose=verbose)
+        check_no_shell_zip_binary(strict=True, verbose=verbose)
+        check_no_pipefail_grep_q_trap(strict=True, verbose=verbose)
+        check_no_eval_roundtrip_false(strict=True, verbose=verbose)
+        check_no_scorer_load_at_inflate(strict=True, verbose=verbose)
+        check_training_scripts_have_auth_eval(strict=True, verbose=verbose)
+        check_no_disable_eval_roundtrip_flag(strict=True, verbose=verbose)
+        check_no_pack_sparse_delta_approved_outside_promotion_tool(strict=True, verbose=verbose)
+        check_inflate_sh_handles_br_centrally(strict=True, verbose=verbose)
+        check_remote_scripts_have_nvdec_probe(strict=True, verbose=verbose)
+
+        # 2026-04-27 codex R5-r6: 5 new checks for round-6 findings.
+        # Each guards a regression of the matching finding fix. All 5 land
+        # at 0 live-codebase violations (verified post-fix), so they go
+        # straight to strict=True per the Lane A → strict pattern.
+        check_no_brittle_six_line_waiver_lookback(strict=True, verbose=verbose)
+        check_kl_distill_uses_roundtripped_frames(strict=True, verbose=verbose)
+        check_train_renderer_kl_aux_explicit_scope(strict=True, verbose=verbose)
+        check_distillation_policy_schema_clean(strict=True, verbose=verbose)
+        check_eval_roundtrip_gate_called_after_output_dir_resolution(strict=True, verbose=verbose)
+        check_nvdec_probe_has_error_classification(strict=True, verbose=verbose)
+        check_archive_builders_use_deterministic_zip(strict=True, verbose=verbose)
+        check_no_raw_zip_extractall(strict=True, verbose=verbose)
+        # 2026-05-02 public Apogee supplement/site hygiene. The repo has
+        # legacy private custody/state docs, so the default full-preflight pass
+        # keeps this warn-only. Release tooling should call the same checker
+        # with strict=True over the explicit public publish surface.
+        check_public_release_hygiene(strict=False, verbose=verbose)
+        # 2026-04-29 PM: silent-default override class. Audit hardened in
+        # commit 4eeb6452 (246 noisy → 0 actionable); 3 real bugs fixed in
+        # commit 256c5e42. Lands STRICT directly at 0 live violations.
+        # Memory: feedback_silent_default_bug_class_findings_20260429.md.
+        check_silent_default_audit_clean(strict=True, verbose=verbose)
+
+        # 2026-04-29 Round 3 grand-council prescription: 3 active bug
+        # classes get STRICT preflight checks. All 3 land at 0 live
+        # violations after their fixes (commits 8746793e Lane GP callsite,
+        # cc1ba193 STC FALSIFICATION withdrawn, ef8592d9 Lane PD docstring).
+        # check_empirical_claims_have_evidence is wired warn-only first
+        # because tagging discipline across legacy docs/reports needs a
+        # cleanup pass — promote to strict after the 0-count sweep.
+        # Memory: feedback_three_active_bug_classes_needing_strict_checks_20260429.md.
+        check_callsite_contracts_satisfied(strict=True, verbose=verbose)
+        check_no_proxy_metric_drives_decision(strict=True, verbose=verbose)
+        # PCC2 (2026-04-30): comment-only contracts. Catches the IMP cycle
+        # 0 = 1.98 metabug class — placeholder/stub with a comment promising
+        # the wrapper will swap in the real impl, but no backing assertion.
+        # Lands STRICT @ 0 live unbacked findings: the canonical incident
+        # in experiments/train_imp_cycle.py:_finetune now has an inline
+        # backing assertion (n_trainable == 0 → raise RuntimeError) that
+        # documents the deploy contract + the PCC3 wall-clock-floor in
+        # train_imp_cycle.main covers the runtime gate. Reverting either
+        # safety net will fail strict here.
+        # Council: feedback_grand_council_pcc2_comment_only_contracts_20260430.md
+        check_no_comment_only_contracts(strict=True, verbose=verbose)
+        # Check 85 (DARTS-S NaN-display incident 2026-04-29 PM): epoch_metrics
+        # key references must match TRAINER_RETURN_KEYS. Today's incident:
+        # 5h of GPU compute appeared to show seg=nan/pose=nan because the
+        # printer in train_segmap.py read keys "seg"/"seg_loss" but trainer
+        # returns "seg_dist"/"pose_dist". Lands STRICT @ 0 violations after
+        # train_segmap.py cleanup + DistillTrainer.step keys registered.
+        check_training_script_metric_keys_consistent(strict=True, verbose=verbose)
+        # Check 86 (DARTS-S freeze ROOT CAUSE incident 2026-04-29 PM):
+        # forbid bare .round() inside eval-roundtrip chains. .round() has
+        # zero gradient → severs backprop → optimizer "steps" but params
+        # don't move → 5h GPU burned producing constant loss=277.02 across
+        # 400 epochs. Lane SC++/SA-v2/SO/MM v2 all invalidated. Lands STRICT
+        # @ 0 violations after segmap_renderer.py:281 fix.
+        check_no_bare_round_in_eval_roundtrip(strict=True, verbose=verbose)
+        # Check 87 (Council C OOM-class deep fix incident 2026-04-29 PM):
+        # SegMap-class lane scripts (any invocation of train_segmap.py)
+        # must pass --bf16 + --scorer-chunk N + --batch-size B with B*N<=8.
+        # Without DF2 (bf16 autocast) AND DF3 (per-pair scorer chunking),
+        # PoseNet FastViT stage-1 self-attention map allocates ~21 GiB
+        # in fp32 at B=16 frames — 14 OOM crashes on Modal A10G 22 GB
+        # shared-tenant cost ~$3.50 with zero artifact. Lands STRICT @ 0
+        # violations after the 8 SegMap-class scripts (SC++/SA/SO/HM-S/
+        # PA/WC-S/DARTS-S/FR-Ω) are updated to pass the new flags +
+        # the matching DF2+DF3 implementation in segmap_renderer.py.
+        # Memory: .omx/research/council_oom_class_deep_fix_20260429.md.
+        check_segmap_class_lanes_have_oom_guards(strict=True, verbose=verbose)
+
+        # Check 88 (Council D EMA wire-in 2026-04-29 PM): every training
+        # script in experiments/train_*.py + qat_*.py + quantize_*.py must
+        # instantiate EMA, call ema.update(model) after optimizer.step(),
+        # and ship the EMA shadow as the inference checkpoint. Per
+        # CLAUDE.md "EMA — NON-NEGOTIABLE". The Quantizr (#1, 0.33) +
+        # Selfcomp (#2, 0.38) full pipelines run EMA through ALL stages
+        # (anchor → finetune → joint → QAT → final). Council D audit
+        # found 8 missing wire-ins; landed in same commit as Check 88
+        # (train_szabolcs.py, qat_finetune.py, qat_omega_lagrangian.py,
+        # quantize_distilled.py, train_imp_cycle.py, train_lora_tto.py,
+        # train_postfilter_on_renderer.py + the train_joint_pair.py
+        # duplicate-class fix). Lands STRICT @ 0 violations after fix-ups.
+        # Memory: .omx/research/council_ema_audit_20260429.md.
+        check_training_paths_use_ema_correctly(strict=True, verbose=verbose)
+
+        # Check 89 (Council B UNIWARD NO-OP incident): encode-then-discard
+        # antipattern in remote_lane_*.sh scripts. WARN-ONLY initially —
+        # 14 live hits need per-lane manual classification (legitimate
+        # "cp anchor base then encode + replace one file" vs the UNIWARD
+        # bug where encode runs but Stage 4 cp overwrites the encoded
+        # payload). Promote to STRICT after sweep + waivers added.
+        check_remote_lane_scripts_use_computed_payloads(strict=False, verbose=verbose)
+
+        # 2026-04-27 meta-bug audit (commit a57731a0): 12 NEW checks for
+        # additional bug classes from session + memory. 4 land at 0 live
+        # violations and go straight to strict; the other 8 have real
+        # existing violations and stay warn-only until a cleanup pass.
+        # Per-check live counts at wire-in time:
+        #   check_vastai_create_has_label                 0  → STRICT
+        #   check_waivers_specify_env_gate                0  → STRICT
+        #   check_inflate_scorer_load_has_runtime_banner  0  → STRICT
+        #   check_vastai_prompts_have_cost_cap            0  → STRICT
+        #   check_vastai_create_writes_tracker            2  warn
+        #   check_subagent_prompts_no_cpu_fallback        1  warn
+        #   check_scores_have_lane_tag                   20  warn (run_log/findings cleanup)
+        #   check_halfframe_archive_uses_trained_profile  2  warn
+        #   check_profile_keys_have_resolvers            91  warn (real audit needed — same class as pose_dim)
+        #   check_test_files_imports_resolve             25  warn (broken-test cleanup)
+        #   check_uniward_delta_has_attestation_gate      6  warn
+        #   check_remote_scripts_write_provenance         5  warn (Lane provenance write)
+        check_vastai_create_has_label(strict=True, verbose=verbose)
+        check_waivers_specify_env_gate(strict=True, verbose=verbose)
+        check_inflate_scorer_load_has_runtime_banner(strict=True, verbose=verbose)
+        check_vastai_prompts_have_cost_cap(strict=True, verbose=verbose)
+        # 2026-04-27 final cleanup pass: 8 warn-only checks now at 0
+        # live violations (commits eb985e40 + 17e5f903 + 676bf206 + this).
+        # Promoted to strict — bug classes structurally extinct.
+        check_vastai_create_writes_tracker(strict=True, verbose=verbose)
+        check_subagent_prompts_no_cpu_fallback(strict=True, verbose=verbose)
+        check_scores_have_lane_tag(strict=True, verbose=verbose)
+        check_halfframe_archive_uses_trained_profile(strict=True, verbose=verbose)
+        check_profile_keys_have_resolvers(strict=True, verbose=verbose)
+        check_test_files_imports_resolve(strict=True, verbose=verbose)
+        check_uniward_delta_has_attestation_gate(strict=True, verbose=verbose)
+        check_remote_scripts_write_provenance(strict=True, verbose=verbose)
+
+        # 2026-04-27 council forensics (findings.md "Lane G — really dead,
+        # or bugged?"): forbid `F.kl_div(..., reduction="batchmean")` on
+        # spatial tensors. The bug under-divides the per-pixel mean by
+        # H × W (=196,608 for 384×512 SegNet), silently over-weighting
+        # every caller. Lands at 0 live violations after the losses.py
+        # fix → straight to strict per the Lane A pattern. See Check M
+        # comment block above the function definition.
+        check_kl_div_reduction_correct(strict=True, verbose=verbose)
+
+        # 2026-04-27 forensic council (findings.md "Lane F regression"):
+        # 29th meta-bug check. Forbid the silent-default-masquerading-as-
+        # negative-result pattern (auto-discover from N hardcoded paths +
+        # WARN-and-proceed instead of raise). Lane F (qat_finetune.py) +
+        # Lane G (kl_distill_weight default) are the 2 known instances —
+        # both fixed; live count after qat_finetune.py fix should be 0.
+        # See Check N comment block above the function definition + memory
+        # `feedback_silent_default_masquerading_as_negative_result`.
+        check_no_silent_auto_discovery_with_warn(strict=True, verbose=verbose)
+
+        # 2026-04-27: 3 new meta-bug checks (30, 31, 32) for DX hardening.
+        # All STRICT after sweep-fix landed in this commit:
+        # - Check 30 (executable-bit): Lane GH bug + 6 historical chmod'd
+        # - Check 31 (predicted_band): 8 lane scripts patched with band metadata
+        # - Check 32 (contest-cuda-tag): 8 lane scripts patched with [contest-CUDA]
+        # Bootstraps + sweep orchestrators + auth-eval-only scripts EXEMPT
+        # via EXEMPT_SUFFIXES list inside each check function.
+        check_remote_scripts_executable_bit(strict=True, verbose=verbose)
+        check_remote_scripts_record_predicted_band(strict=True, verbose=verbose)
+        check_remote_scripts_tag_contest_cuda_at_completion(strict=True, verbose=verbose)
+
+        # 2026-04-28: 2 more strict meta-bug checks (33, 34) from overnight
+        # deploy failures. Both STRICT after the comment-stripping fix:
+        # NVDEC 7/12 hosts bad → probe must be Stage 0.
+        # Lane S motion.head 6-vs-4 mismatch → resume needs shape validation.
+        check_remote_scripts_probe_nvdec_early(strict=True, verbose=verbose)
+        check_resume_from_state_dict_shape_compat(strict=True, verbose=verbose)
+
+        # 2026-04-28: 2 more strict meta-bug checks (35, 36) from observed
+        # patterns this session:
+        # - tmux kill-server kills OTHER lanes' sessions (would cascade-fail
+        #   shared-host runs; caught myself doing this in quick_setup)
+        # - unconditional ensurepip crashes on PyTorch containers with newer
+        #   pip than the bundled wheels (setup_full bug, just fixed)
+        check_no_tmux_kill_server_in_lane_scripts(strict=True, verbose=verbose)
+        check_no_unconditional_ensurepip(strict=True, verbose=verbose)
+
+        # 2026-04-28 evening: 2 more checks (37, 38) from today's overnight wave.
+        # macOS resource forks crash auth_eval; SSH no-timeout hangs parent agent.
+        # Both STRICT after setup_full purge-once landed (Check 37 satisfied
+        # via canonical bootstrap path); SSH check has 0 violations (no
+        # script in repo uses ssh — it's all parent-agent invoked).
+        check_lane_scripts_strip_macos_resource_forks(strict=True, verbose=verbose)
+        check_ssh_commands_have_connect_timeout(strict=True, verbose=verbose)
+
+        # 2026-04-28 late: Check 39 — undeployed archive-artifact producers.
+        # CATCHES the recurring "code-shipped-never-deployed" failure mode:
+        # tools that produce a registered submission artifact and have a
+        # __main__ entry but no scripts/remote_lane_*.sh invocation. Lane EC
+        # sat unused 2 weeks because of this exact gap. Lands at 0 live
+        # violations after exemption pass for kaggle_kernels (alternative
+        # platform), library helpers (scorer_targets.py), and 2 dead lanes
+        # (mini_tto_inflate, optimize_embedding) — straight to STRICT per
+        # the Lane A pattern. References:
+        # - project_lane_ec_engineered_corrections_20260428
+        # - project_outstanding_work_and_stacks_20260428 TIER 3
+        check_undeployed_archive_artifact_producers(strict=True, verbose=verbose)
+
+        # 2026-04-28 late: Check 40 — FP4 hardware-disclosure markers.
+        # CATCHES the bug class that destroyed Lane F lineage: production
+        # FP4 paths without hardware-capability disclosure. Lane F V1=2.73,
+        # V2=1.79, V3=1.85 were all simulated FakeQuantFP4 in FP32 — 4090
+        # is CC 8.9 and NVFP4 needs Blackwell CC 10.0, so "FP4 architectural
+        # hostility" was unverifiable. Lands at 0 live violations after
+        # adding `# FP4_HARDWARE_DISCLOSED:` markers to the 3 actual
+        # production sites (fp4_quantize.py, profile_fp4_layer_sensitivity.py,
+        # qat_finetune.py). Straight to STRICT — bug class structurally
+        # extinct. Reference: project_cosmos_deep_dive_addendum_20260428.
+        # Lane F-V5 (hardware FP8 via torchao.float8) is the proper rescue
+        # path for Ada/Lovelace+ (CC >= 8.9) hardware.
+        check_fp4_production_paths_disclose_hardware(strict=True, verbose=verbose)
+
+        # 2026-04-28 evening: Check 41 — remote_lane_*.sh heartbeat loop.
+        # CATCHES the silent-non-start failure mode that wasted ~$2.50 today
+        # on instances 35739770/35739771/35739773 (Lane W Iceland, Lane K
+        # Denmark, Lane OS-V2 NC). SSH + clone succeeded but lane script
+        # never executed; no heartbeat.log on disk meant no readiness
+        # verification possible. Lands at 0 live violations with sweep
+        # orchestrators exempted. Reference:
+        # feedback_vastai_launch_returns_success_before_lane_starts.
+        check_remote_lane_scripts_have_heartbeat(strict=True, verbose=verbose)
+
+        # 2026-04-28: Check 42 — pose-projection train/inference parity.
+        # CATCHES the BUG-1 class from Lane M-V2 audit: pose-projection
+        # helpers used at OPTIMIZATION time but NOT at INFLATE time produce
+        # train/inference distribution mismatches. Lane M-V2 lost 5h GPU +
+        # $1.50 to this exact bug (PoseNet 0.076 = 15× Lane A baseline was
+        # signal of the bug, not the architectural premise). 0 live
+        # violations after waivers (BUG-1 marked WAIVED until V3-clean
+        # lands, scorer_exploits gradient projection marked WAIVED for
+        # different domain). STRICT.
+        # Reference: project_lane_m_v2_audit_council_findings_20260428.
+        check_pose_projection_train_inference_parity(strict=True, verbose=verbose)
+
+        # 2026-04-28 PM: Check 43 — launcher tarball must include lane anchors.
+        # CATCHES the bug class where a tarball --exclude pattern wins over
+        # a lane script's anchor reference. 3 lanes lost 2026-04-28 PM
+        # because lane_a_landed/ was excluded but archive_lane_a.zip is the
+        # canonical anchor. STRICT @ 0 violations after launcher fix landed.
+        check_launcher_tarball_includes_lane_anchors(strict=True, verbose=verbose)
+
+        # 2026-04-29 AM: Check 66 (no-git-reset-hard-in-lane-scripts).
+        # `git reset --hard origin/main` in lane Stage-1 wipes local-only
+        # anchor files (archive_lane_a.zip, baseline dirs) that the launcher
+        # just SCP'd. 5/6 TIER-1 lanes crashed 2026-04-29 from this bug.
+        # STRICT @ 0 violations after stripping pattern from all 11 scripts.
+        check_no_git_reset_hard_in_remote_lane_scripts(strict=True, verbose=verbose)
+
+        # 2026-04-29 AM: Check 67 (python-files-compile) + Check 68 (shell-syntax)
+        # + Check 69 (anchor files exist locally).
+        # PROACTIVE: catches SyntaxError + IndentationError + bash syntax bugs
+        # + missing anchor files BEFORE they ship to remote and crash deploy.
+        # User demand: "preflight needs to include a python compile step of all so
+        # we can identify any python errors without deploying" + "autodetect and
+        # permanently prevent all bugs possible to anticipate".
+        # 631 .py files compile in ~0.75s; 109 shell scripts in ~0.45s; 72
+        # anchor refs scanned in <0.1s. Total proactive cost: ~1.3s.
+        # Check 69 caught 8 real bugs on first run (Lane F-V5 + Lane J-IMP +
+        # Lane J-JBL all referenced non-existent lane_g_v3_landed/iter_0/).
+        check_python_files_compile(strict=True, verbose=verbose)
+        check_shell_scripts_syntax_clean(strict=True, verbose=verbose)
+        check_lane_anchor_files_exist_locally(strict=True, verbose=verbose)
+        # Check 70: pytest --collect-only catches missing imports + fixture errors.
+        # Runs in ~1.3s for 4306 tests. STRICT @ 0.
+        check_pytest_collection_clean(strict=True, verbose=verbose)
+        # Check 71: shadowed-module-import inside function body (causes
+        # UnboundLocalError when the name is used before the inner import).
+        # 2026-04-29: train_renderer.py crashed all 4 v4 lanes with this exact
+        # bug. py_compile + pytest-collect couldn't catch (legal syntax, only
+        # surfaces when the function path is exercised). STRICT @ 0.
+        check_no_shadowed_module_import_used_before_local_import(strict=True, verbose=verbose)
+        # Check 72: Python heredocs embedded in shell scripts must compile.
+        # py_compile (Check 67) only sees .py files. bash -n (Check 68) treats
+        # heredocs as opaque. R9 batch-patch injected bash code INTO python
+        # heredocs causing SyntaxError that no prior check caught. STRICT @ 0
+        # after fix-heredoc-pipestatus + uniward dedup.
+        check_python_heredocs_in_shell_compile(strict=True, verbose=verbose)
+        # Check 73: remote_lane_*.sh scripts must pass all required argparse
+        # args of the Python scripts they invoke. Existing preflight_arity
+        # only scanned 2 launchers (pipeline.py, deploy_vastai.py) — missing
+        # 70+ remote_lane scripts. Q-FAITHFUL crashed on Modal at 64s with
+        # `train_renderer.py: error: --tag required` because no preflight
+        # check covered that surface. STRICT @ 0 after fixing 3 scripts.
+        check_remote_lane_argparse_arity(strict=True, verbose=verbose)
+        # Check 74: heredoc undefined-name detection. AST-walks every python
+        # heredoc, finds Name references not satisfied by imports/locals/
+        # builtins. Catches the dumb-but-easy "missing import" class that
+        # crashed UNIWARD 3+ times tonight (sys, json). Bash-injected $VAR
+        # tokens are stubbed before parsing.
+        check_python_heredocs_no_undefined_names(strict=True, verbose=verbose)
+        # Check 75 WARN-ONLY: detect `torch.zeros(N, 6)` pose-tensor
+        # off-manifold pattern. Lane GP v2 = 89.66, Lane M-V1 = 2.35 from
+        # this exact bug. 9 live violations: needs audit + waivers before
+        # STRICT promotion. See project_lane_gp_v2_audit_20260429.
+        check_no_off_manifold_pose_zeros(strict=False, verbose=verbose)
+        # Check 76 WARN-ONLY: every masks.mkv referenced as a lane anchor
+        # SHOULD be full resolution (≥384×512). Lane UNIWARD v7 = 53.61
+        # (anchored on 64×48 masks), matches historical 2026-04-21 disaster
+        # (score 103.27). Currently warn-only because submissions/
+        # baseline_dilated_h64_0_90/masks.mkv (1 site) still exists and
+        # 10+ scripts reference its directory (some only for renderer.bin,
+        # not masks). Promote to STRICT after triage of remaining scripts.
+        check_lane_anchor_masks_full_resolution(strict=False, verbose=verbose)
+
+        # 2026-04-29: Check 43 — controlled-baseline methodology for new
+        # Tuna-2 lanes. WARN-ONLY initially because it only applies to
+        # remote_lane scripts added/modified after 2026-04-29 and is a
+        # methodology guard, not a current correctness blocker.
+        check_remote_lane_scripts_have_controlled_baseline(strict=False, verbose=verbose)
+
+        # 2026-04-28 evening: 4 NEW meta-bug checks (44, 45, 46, 47) for
+        # test-assertion strength + archive-size discipline. Ref Round 22
+        # bit-STE sign bug post-mortem (4 review rounds dismissed it because
+        # the only assertion was `grad is not None`).
+        # Per-check live counts at wire-in time + promotion plan:
+        #   Check 44 (gradient-direction-tests-exist)             0  → STRICT
+        #   Check 45 (loss-convergence-tests)                     0  → STRICT
+        #   Check 46 (quantizer-roundtrip-tests)                  0  → STRICT (R25 promotion: 5 test files added covering archive_codec/entropy_archive/mask_entropy_coder/network_codec/semantic_quantization; quantization_audit waived as drift-MEASUREMENT module not a quantizer)
+        #   Check 47 (lane-archive-size-assertion)                0  → STRICT
+        check_gradient_direction_tests_exist(strict=True, verbose=verbose)
+        check_posenet_gradient_preprocess_patch(strict=True, verbose=verbose)
+        check_line_search_scorer_runtime_preflight(strict=True, verbose=verbose)
+        check_test_assertion_strength_for_loss_functions(strict=True, verbose=verbose)
+        check_quantizer_modules_have_round_trip_test(strict=True, verbose=verbose)
+        check_lane_deploy_scripts_have_archive_size_assertion(strict=True, verbose=verbose)
+
+        # 2026-04-28 evening: 3 NEW meta-bug checks (48, 49, 50) from the
+        # killed-lanes forensic audit. Reference:
+        # project_killed_lanes_forensic_audit_20260428.
+        # All 3 ship WARN-only initially because the live codebase has real
+        # violations the user may want to fix incrementally:
+        # - Check 48 (orphan-src-tac-modules): catches Lane V class — silent
+        #   modules added but never wired into a profile / CLI / script.
+        # - Check 49 (profile-loss-mode-allowlist-parity): catches Lane J-JBL
+        #   class — profile loss_mode value not in train_renderer.py
+        #   _VALID_LOSS_MODES allowlist. Live count: 2 (posenet_embedding,
+        #   segnet_kl in profiles that may not actively dispatch through
+        #   train_renderer.py). Promote to STRICT after audit + fix.
+        # - Check 50 (deploy-script-profile-exists): catches typo'd or
+        #   missing PROFILES registrations. Live count: 4 (one false-positive
+        #   in a comment, two profiles needing registration). Promote to
+        #   STRICT after lane script cleanup.
+        check_no_orphan_src_tac_modules(strict=False, verbose=verbose)
+        check_profile_loss_modes_in_validator_allowlist(strict=False, verbose=verbose)
+        check_deploy_script_profiles_exist_in_registry(strict=False, verbose=verbose)
+
+        # 2026-04-28 deep DX hardening pass 2: 3 NEW meta-bug checks
+        # (51, 52, 53) for silent-swallow / unchecked-subprocess /
+        # operator-discoverability. All ship WARN-only initially. Promote
+        # to STRICT after one-time cleanup pass per the established
+        # warn-only → strict pattern (see Lane A pattern in checks 1-11).
+        # Reference: feedback_deep_hardening_pass_2_patterns_20260428.
+        # - Check 51 (no-bare-except): catches `except:` and
+        #   `except Exception: pass`. Same class as the
+        #   tools/fleet_dashboard_live.py bug fixed in this pass.
+        # - Check 52 (subprocess-run-checked): catches subprocess.run()
+        #   without check=True or returncode check. Same class as the
+        #   LANE-B silent-cascade trap (feedback_zip_dep_bootstrap_trap)
+        #   but at the Python level.
+        # - Check 53 (tools-have-argparse): operator-discoverability:
+        #   tools/*.py + scripts/*.py with __main__ entry must wire
+        #   argparse or click for --help.
+        check_no_bare_except(strict=False, verbose=verbose)
+        # 2026-04-28 deep hardening pass 3: Checks 52 + 53 promoted to STRICT
+        # after one-time cleanup pass. Subprocess: 31 violations triaged into
+        # 2 classes — wrappers/best-effort (24 waivers with concrete reason)
+        # vs real bugs (7 fail-loud `check=True` adds for ffmpeg/ffprobe pipes
+        # in hybrid_inflate, optimize_poses, train_distill, benchmark_codecs,
+        # variable_rate). Argparse: 7 violations — 5 hook/dispatcher waivers
+        # + 1 real argparse add (check_determinism.py) + 1 thin-shim waiver.
+        # Bug classes structurally extinct.
+        check_subprocess_run_checked(strict=True, verbose=verbose)
+        check_tools_have_argparse(strict=True, verbose=verbose)
+
+        # 2026-04-28 evening: 2 NEW STRICT meta-bug checks (54, 55) for the
+        # canonical NVDEC workflow. Today wasted ~$10 on 87% NVDEC_BAD
+        # Vast.ai 4090 hosts before the 2-layer fix landed:
+        # - Layer 1 DETECTION (commit 58e55890): scripts/probe_nvdec.sh
+        #   --lightweight at setup_full.sh Stage 0.5 catches ~95% of
+        #   NVDEC-missing hosts BEFORE the 5-minute DALI install.
+        # - Layer 2 ACTION (commit 5acebb88-ish): launch_lane_on_vastai.py
+        #   phase2-launch Stage 2 polls setup.log + auto-destroys NVDEC_BAD.
+        # Per the user mandate ("we need to automate and canonicalize and
+        # permanently guard against NVDEC issue"), both layers are now
+        # structurally extinct bug classes — any future refactor that
+        # drops the poll OR re-orders the probe AFTER DALI fails preflight.
+        # Both checks land at 0 live violations → straight to STRICT per
+        # the Lane A pattern.
+        # Reference: feedback_canonical_nvdec_workflow_GUARD_20260428.
+        check_phase2_launch_polls_setup_log(strict=True, verbose=verbose)
+        check_setup_full_probe_before_dali(strict=True, verbose=verbose)
+
+        # 2026-04-28: Check 56 — verify_vast_instances.py auto-destroy
+        # path must enforce BOTH IDLE-stale-minutes AND SETUP-stale-
+        # minutes. Without the SETUP timer, a TRULY hung setup_full.sh
+        # accrues cost forever (no heartbeat ever lands → IDLE timer
+        # never fires). Reference: feedback_setup_stuck_cost_leak_FIXED_20260428.
+        # Lands at 0 live violations → straight to STRICT.
+        check_verify_vast_setup_stuck_dual_threshold(
+            strict=True, verbose=verbose,
+        )
+
+        # 2026-04-29: Check 57 RETIRED. The pattern it required
+        # (`git fetch origin main && git reset --hard origin/main`) caused
+        # the 2026-04-29 5/6-TIER-1-lane crash by wiping local-only anchor
+        # files SCP'd by the launcher. Replaced by Check 66 which PROHIBITS
+        # the destructive pattern. The launcher tarball is now the canonical
+        # parity mechanism. (memory: feedback_git_reset_nukes_anchors_20260429)
+        # check_lane_scripts_use_canonical_git_sync(strict=True, verbose=verbose)
+
+        # 2026-04-28 deep hardening pass 3 dimension 2: 4 NEW meta-bug
+        # checks (58, 59, 60, 61). All ship STRICT initially because they
+        # land at 0 live violations on the current codebase per the Lane A
+        # pattern (commit 7d2b5299). Reference:
+        # feedback_deep_hardening_pass_3_patterns_20260428.
+        # - Check 58 (launcher-max-dph-floor): forbid hardcoded --max-dph
+        #   below 0.40, which over-restricts the host pool and starves the
+        #   search after NVDEC_BAD attrition (today wasted ~$10).
+        # - Check 59 (phase2-extract-cleanup): cmd_phase2_extract MUST call
+        #   destroy_instance() on CUDA-probe failure to stop cost accrual.
+        # - Check 60 (memory-md-size): MEMORY.md > 250 lines silently
+        #   truncates context loading. Today's session triggered the
+        #   200-line warning; 250 gives a 50-line buffer.
+        # - Check 61 (bootstrap-provenance): canonical bootstrap scripts
+        #   MUST write provenance.json (git_hash + gpu_name) for post-mortem
+        #   traceability per feedback_canonical_remote_bootstraps.
+        check_launcher_max_dph_floor(strict=True, verbose=verbose)
+        check_phase2_extract_destroys_on_failure(strict=True, verbose=verbose)
+        # Check 60 ships warn-only because MEMORY.md is a user-controlled
+        # file and the operator should fix it on their own cadence (this
+        # session: 234 lines, under the 250 ceiling — currently 0 violations).
+        check_memory_md_size_under_ceiling(strict=False, verbose=verbose)
+        check_canonical_bootstraps_write_provenance(strict=True, verbose=verbose)
+
+        # 2026-04-28 Codex F5 (5-finding adversarial review): every lane
+        # script that calls contest_auth_eval MUST either use the canonical
+        # experiments/contest_auth_eval.py module (which has the F5 guard
+        # for missing config.env) OR check PYTHON_INFLATE=renderer locally.
+        # Lane RM-d burned 1+ hour discovering the canonical inflate env
+        # was missing on the remote tarball. Lands at 0 live violations
+        # post-F5 fix → ships STRICT immediately.
+        check_lane_scripts_set_up_inflate_environment(strict=True, verbose=verbose)
+
+        # 2026-04-28 Check 64 — lane scripts must have a recent E2E smoke
+        # proof. Closes the structural gap that cost Lane RM-d 3.5h GPU:
+        # 63 STATIC preflight checks above all guard CODE PATTERNS, none
+        # actually run the deploy → inflate → contest_auth_eval pipeline
+        # locally. Check 64 enforces every remote_lane_*.sh has an entry
+        # in .omx/state/lane_e2e_smoke_proofs.json that is < 7 days old,
+        # written by experiments/canonical_local_auth_eval_smoke.py.
+        # Promoted to STRICT after the backfill landed all 70 existing
+        # lanes at 0 live violations. Reference:
+        # feedback_canonical_e2e_smoke_PERMANENT_GUARD_20260428.
+        check_lane_scripts_have_e2e_smoke_proof(strict=True, verbose=verbose)
+
+        # 2026-04-28 PM: Check 65 — lane CLASSES (not just per-lane scripts)
+        # must have at least one complete-pipeline proof on file. Closes the
+        # Lane RM-d structural gap: new lane classes shipping without ever
+        # demonstrating dispatch → train → archive → auth_eval cycle. Ships
+        # WARN-ONLY initially so the existing 70 lanes have a backfill window;
+        # promotion plan (Lane A pattern): backfill .omx/state/
+        # lane_class_proofs.json, then flip strict=True. Reference:
+        # feedback_artifact_recovery_canonical_workflow_20260428.
+        check_lane_classes_have_pipeline_proof(strict=False, verbose=verbose)
+
+        # 2026-04-29: Selfcomp / Lane MM checks. 2 STRICT + 1 warn-only.
+        # All three guard the new grayscale-LUT + block-FP paradigm:
+        #   * grayscale-LUT consistency: archives shipping grayscale.mkv must
+        #     dispatch via PYTHON_INFLATE=segmap or =renderer_grayscale.
+        #     Otherwise legacy ffmpeg arm reads masks.mkv (missing) and
+        #     silently emits blank .raw -> 100x score.
+        #   * block-FP qint/exp pairing: any code reading weight_qint must
+        #     also read weight_exponents (decoder invariant from Selfcomp
+        #     inflate.py L168-169). Reading qint alone -> 64x error band.
+        #   * segmap-export verify_roundtrip: WARN-only initially, flip
+        #     STRICT after first SegMap-paradigm lane lands.
+        # All grayscale-LUT-paradigm scripts (SA / SC++ / SO via parallel
+        # commit 7ca6680f + Lane MM) now set CONFIG_ENV_PATH to a config
+        # that exports PYTHON_INFLATE=segmap or =renderer_grayscale.
+        # Lands at 0 live violations -> straight to STRICT per Lane A pattern.
+        check_segmap_grayscale_lut_consistency(strict=True, verbose=verbose)
+        check_block_fp_exponents_alongside_qint(strict=True, verbose=verbose)
+        # WARN-only: flip STRICT once first SegMap-paradigm encoder lane lands.
+        check_segmap_export_calls_verify_roundtrip(strict=False, verbose=verbose)
+        check_segmap_hm_sa_lossy_pack_contract(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 91 — Lane GP basis-fit kill enforcement. Forbids
+        # any new experiments/fit_pose_*.py from importing smooth-basis fit
+        # functions (np.polyfit / scipy.interpolate.{BSpline,splrep,CubicSpline}
+        # / scipy.fft.dct) WITHOUT a `# LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:`
+        # marker pointing to .omx/research/council_lane_gp_v4_design_20260430.md.
+        # The Lane GP v3 (89.67) failure was mis-attributed to Runge phenomenon;
+        # actual root cause is white-noise trajectory in dims 1-5 (diff_std >
+        # signal_std). All smooth-basis fits plateau at RMSE ≈ 1.2 (near signal
+        # std). Lands STRICT @ 0 violations after experiments/fit_pose_gp.py
+        # gets the kill marker (in same commit). Memory:
+        # project_lane_gp_v4_killed_basis_fit_infeasible_20260430.md.
+        check_pose_basis_fit_kill_acknowledged(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 90 — Lane Maturity Registry consistency.
+        # Every lane MUST be tracked in .omx/state/lane_registry.json via
+        # tools/lane_maturity.py. The registry encodes the 7-gate Level-3
+        # production-hardened standard. This check delegates to
+        # tools/lane_maturity.validate_registry() — verifies schema_version,
+        # no duplicates, all gates present, stored level matches computed
+        # level, and every file-path-looking evidence string points to a
+        # real file. Lands STRICT @ 0 violations (verified 2026-04-30
+        # against 23 seeded lanes from the Phase 1/1.5/2/3 audit).
+        # Memory: feedback_production_hardened_standard_definition_20260430.
+        # Memory: project_lane_maturity_harness_landed_20260430.
+        check_lane_registry_consistent(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 92 — Lane 8 inflate-time multipass forbidden.
+        # MultiPassCompressor is a COMPRESS-time optimizer (per the strict-
+        # scorer-rule in CLAUDE.md). Any reference to it inside
+        # `submissions/robust_current/inflate_renderer.py` or `inflate.sh`
+        # would attempt to load the contest scorer at inflate time, which
+        # destroys the rate term (~73MB scorer weights inside archive.zip).
+        # Lands STRICT @ 0 live violations after Lane 8 implementation
+        # lands (the implementation lives in src/tac/multipass_compressor.py
+        # and experiments/pipeline.py:step_multipass — both are explicitly
+        # COMPRESS-time entry points and are exempted by path).
+        # Memory: project_lane_8_multipass_landed_20260430.md (TBD).
+        check_no_inflate_time_multipass(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 93 — Lane 19 (logit-margin) callers pass
+        # explicit threshold=. The loss module raises ValueError when
+        # threshold is None, but a positional default would silently bypass
+        # that gate (degrading margin loss to standard CE because all
+        # weights collapse to ~1.0 when threshold is too large or 0.0).
+        # Same bug class as the 3 silent-default fixes in commit 256c5e42
+        # (--fp4-codebook, --grad-clip, --wall-clock-timeout). Landing
+        # STRICT @ 0 violations because the only current caller
+        # (train_renderer.py auxiliary block) already passes threshold=.
+        # Memory: .omx/research/council_lane_19_logit_margin_design_20260430.md.
+        # Memory: feedback_silent_default_bug_class_findings_20260429.md.
+        check_logit_margin_loss_uses_boundary_mask(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 94 — Lane 17 (IMP) cycle scripts must use EMA
+        # AND end the chain with CUDA auth eval. Check 88 (Council D EMA
+        # wire-in) covers per-script EMA presence; this check covers the
+        # full Lane 17 dispatcher chain: any scripts/remote_lane_*imp*.sh
+        # MUST contain (a) Stage-4 contest_auth_eval invocation, (b)
+        # revert-on-regression kill criterion, (c) heartbeat loop, (d)
+        # NVDEC probe at Stage 0. Lands STRICT @ 0 violations after the
+        # Council Lane-17 design landed. Memory:
+        # .omx/research/council_lane_17_imp_design_20260430.md.
+        check_imp_cycles_use_ema_and_auth_eval(strict=True, verbose=verbose)
+
+        # 2026-04-30 ~23:30 UTC: Check 103 (PCC1) — Lane 17 IMP dispatcher
+        # MUST invoke a real trainer (train_distill / train_renderer /
+        # train_renderer_fridrich) in addition to train_imp_cycle.py.
+        # Closes the cycle 0 = 1.98 [contest-CUDA] metabug bug class
+        # permanently: train_imp_cycle.py's _finetune is a documented
+        # STUB loop (synthetic tensors, toy L2 loss, ~0.017s/epoch on L40S).
+        # Without a real-trainer swap, the dispatcher reproduces the metabug
+        # cycle after cycle. Council Option B+assertion 6/3/1 verdict in
+        # feedback_grand_council_imp_permanent_fix_review_20260430.md;
+        # SQ1/SQ2/SQ3 sub-questions 9/10 each in
+        # feedback_grand_council_imp_train_distill_swap_design_20260430.md.
+        # Lands STRICT @ 0 violations after the Stage 1.X swap landed in
+        # scripts/remote_lane_j_imp_iterative_magnitude_pruning.sh
+        # (same commit). Companion to PCC3 (the wall-clock assertion in
+        # train_imp_cycle.py main, ~L362-374) which catches the bug at
+        # runtime if the stub somehow gets shipped despite this check.
+        check_imp_dispatch_calls_train_distill(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 95 — Lane 12 (NeRV mask codec) discipline.
+        # The Lane 12 codec lane (`src/tac/nerv_mask_codec.py`) ships its
+        # own training loop (`NeRVMaskTrainer`) and standalone trainer
+        # script (`experiments/train_nerv_mask.py`). Both must follow the
+        # canonical training-path discipline:
+        #   - canonical `tac.training.EMA` (NOT a local re-implementation)
+        #   - refuse `device='mps'` at construction
+        #   - no bare `.round()` in autograd-active forwards (Council A
+        #     zero-gradient bug class)
+        #   - auth-eval delegated to `scripts/remote_lane_nerv.sh` Stage 3
+        # Lands STRICT @ 0 violations after Phase C/E + tests landed.
+        # Reference: .omx/research/council_lane_12_nerv_design_20260430.md.
+        check_nerv_codec_uses_ema_and_no_mps_and_auth_eval(
+            strict=True, verbose=verbose
+        )
+
+        # Check 91 STRICT — Lane 20 (Ballé hyperprior) BHv1 wire-format
+        # integrity. Verifies that:
+        #   - encode_qints_full_balle serializes hyper_decoder weights into
+        #     side_info (otherwise decode silently drifts because the FP16
+        #     weight roundtrip changes σ values; debugged 2026-04-30 Phase B)
+        #   - encode_qints_balle_auto keeps the static_baseline_bytes guard
+        #     and the static_wins sentinel (the kill criterion that prevents
+        #     shipping a regressing untrained codec — Phase E empirical
+        #     showed untrained Ballé is ~3x worse than static on FP4 streams)
+        # Lands STRICT @ 0 violations on the 2026-04-30 codebase (Lane 20
+        # Phase B implementation already complies).
+        # Reference: .omx/research/council_lane_20_balle_design_20260430.md.
+        check_balle_hyperprior_includes_side_info_in_archive(
+            strict=True, verbose=verbose
+        )
+
+        # 2026-04-30: Check 96 — Lane PFP16 fp16-or-smaller pose stream
+        # discipline. Lane GP v4 KILL VERDICT surfaced Hotz's dominant-
+        # strategy successor: cast `optimized_poses.pt` from fp32 (~15.6 KB
+        # pickle) to raw fp16 binary (~7.2 KB) for ~8 KB savings at ZERO
+        # distortion (PoseNet runs in fp16 internally during contest CUDA
+        # eval). This check guards against any new archive build script
+        # shipping fp32 pose tensors when fp16 is sufficient. Lands STRICT
+        # @ 0 violations on the 2026-04-30 codebase (the only existing
+        # pose-touching build scripts use either canonical pose encoders
+        # OR pure byte-copy from a pre-built artifact — neither triggers
+        # the heuristic).
+        # Reference: .omx/research/council_lane_gp_v4_design_20260430.md.
+        # Memory: project_lane_pfp16_landed_20260430.md.
+        check_pose_stream_uses_fp16_or_smaller(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 98 — remote contest-auth adjudication must read
+        # machine JSON, never human-readable score text. PFP16 exact CUDA
+        # landed at recomputed score 1.0440481283330025, but the remote script
+        # parsed `Final score: 100*... = 1.04` as 100.0 and falsely hard-killed
+        # the lane. This check forbids the whole parser class in remote lanes.
+        check_remote_lane_auth_eval_json_adjudication(
+            strict=True, verbose=verbose
+        )
+        check_remote_distillation_promotion_provenance(
+            strict=True, verbose=verbose
+        )
+
+        # 2026-04-30: Check 100 — retry launcher must be self-protecting.
+        # Dispatch attempts are production state transitions, not disposable
+        # helper calls. The wrapper must hold a single-flight lock, refuse a
+        # new Vast attempt when the same logical label is already live, and
+        # kill child process groups on timeout/signals so interrupted parents
+        # do not strand phase2 children or duplicate spend.
+        check_launch_retry_wrapper_singleflight_and_signal_safe(
+            strict=True, verbose=verbose
+        )
+
+        # 2026-04-30: Check 101 — Modal recovery docs must match the installed
+        # Modal CLI. Modal 1.4 removed the old `modal call get` command; stale
+        # guidance caused recovery confusion immediately after the OWV3 Fisher
+        # smoke dispatch. Recovery must go through experiments/modal_recover_lane.py
+        # and log streaming through `modal app logs <app-id>`.
+        check_modal_recovery_cli_guidance_current(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check 102 — Modal CPU auth eval must remain advisory.
+        # The Modal training wrapper may force AUTH_EVAL_DEVICE=cpu to avoid
+        # NVDEC, but CPU/MPS scores cannot promote, rank, retire, or anchor a
+        # stack. Enforce explicit advisory markers and device-aware recovery
+        # output so stale provider telemetry does not become score truth.
+        check_modal_cpu_auth_eval_is_advisory_only(strict=True, verbose=verbose)
+
+        # 2026-04-30: Check PCC4 — KILL/FALSIFIED memory files MUST cite a
+        # Grand Council adversarial review. Per the user mandate ("permanently
+        # fix all bugs and bug classes and metabugs and everything and have all
+        # design decisions and ultimate experiment subject to extreme paranoia
+        # and adversarial grand council reviews", 2026-04-30 ~22:55 UTC) and
+        # the Lane 17 IMP premature-KILL incident (cycle 0 = 1.98 was a
+        # measurement bug — 200 epochs claimed in stats.json but elapsed_sec
+        # = 3.47s revealed the in-script "lightweight loop" stub never got
+        # swapped for train_distill).
+        #
+        # The fixture project_lane_17_imp_killed_cycle_0_198_regression_
+        # 20260430.md auto-passes via the WITHDRAWN-in-title rule (a kill
+        # reversed under adversarial scrutiny IS the success outcome of this
+        # check). Live audit on 2026-04-30 found 4 legacy 2026-04-30 kill
+        # records lacking the canonical sections; they will be backfilled
+        # 2026-05-01: 4 pre-existing KILL/FALSIFIED memory files cleaned up
+        # (Lane GP v4, Lane GP class, Lane 7 PSD, All-Scores forensic audit
+        # — each got Grand Council review section + internal-consistency
+        # check + reactivation criteria appended). PCC4 now STRICT @ 0.
+        # Reference: feedback_grand_council_pcc4_kill_memory_review_
+        # enforcement_20260430.md.
+        check_kill_memory_files_have_council_review(
+            strict=True, verbose=verbose,
+        )
+
+        # 2026-05-01: PCC5/6/7/8 — loop-session permanent extinction checks.
+        # Each closes a bug class that wasted a Vast.ai dispatch (~$0.30 +
+        # 5-10 min) on 2026-05-01. All 4 ship WARN-ONLY; flip to STRICT once
+        # live-codebase violations are 0. Reference:
+        # feedback_loop_session_permanent_bug_class_extinction_20260501.md.
+        #   PCC5: contest-eval scripts must self-bootstrap uv (+ ffmpeg)
+        #   PCC6: venv-creating scripts must install pip (or annotate)
+        #   PCC7: vastai create instance must use --disk >= 60GB
+        #   PCC8: multi-candidate chain drivers must clean inflated/ per-cand
+        check_remote_archive_eval_self_bootstraps_uv_and_ffmpeg(
+            strict=False, verbose=verbose,
+        )
+        check_venv_creators_use_ensurepip(strict=False, verbose=verbose)
+        check_vastai_create_uses_min_disk_60(strict=False, verbose=verbose)
+        check_remote_chain_drivers_clean_inflated_per_candidate(
+            strict=False, verbose=verbose,
+        )
+        # PCC9: shell-script runtime references must resolve. Catches the
+        # subagent-worktree-lost-helper bug class (e.g. ensure_remote_uv.sh,
+        # line_search_pose_refinement.py — both were lost when subagent
+        # worktrees were auto-cleaned without committing helper source).
+        # Warn-only initially; one known violation as of 2026-05-04.
+        try:
+            from tac.preflight_runtime_refs import (
+                check_shell_script_runtime_refs_resolve,
+                check_test_imports_resolve_to_disk,
+            )
+            check_shell_script_runtime_refs_resolve(strict=False, verbose=verbose)
+            # PCC9b: sister check — test-file `from <experiments|tools|submissions>.X
+            # import` references must resolve. Catches the same lost-helper bug
+            # class but at pytest-collection time (e.g. test_qzs3_packer.py
+            # depending on lost experiments/repack_quantizr_faithful_qzs3_archive.py
+            # and experiments/build_renderer_packed_payload_archive.py — both
+            # safe-stubbed 2026-05-04). Warn-only initially.
+            check_test_imports_resolve_to_disk(strict=False, verbose=verbose)
+        except ImportError:
+            pass  # graceful if module missing during partial install
+
+    # 2. Training inputs (only if profile + tto_frames provided)
+    if profile_name and tto_frames_path and gt_poses_path and masks_path and profile_arch:
+        preflight_training_inputs(
+            tto_frames_path=tto_frames_path,
+            gt_poses_path=gt_poses_path,
+            masks_path=masks_path,
+            profile_name=profile_name,
+            profile_arch=profile_arch,
+            verbose=verbose,
+        )
+
+    # 3. Artifact preflight (only if any artifact path provided)
+    if any([renderer_path, masks_path, archive_path]):
+        preflight_check(
+            renderer_path=renderer_path,
+            masks_path=masks_path if not tto_frames_path else None,  # avoid double-check
+            poses_path=None,  # handled in training_inputs
+            archive_path=archive_path,
+            verbose=verbose,
+        )
+
+
+def preflight_training_inputs(
+    tto_frames_path: str | Path,
+    gt_poses_path: str | Path,
+    masks_path: str | Path,
+    profile_name: str,
+    profile_arch: dict,
+    verbose: bool = True,
+) -> None:
+    """Validate training inputs BEFORE the GPU starts.
+
+    Catches the failure modes that destroyed WILDE+GREEN on 2026-04-25:
+      - TTO frames at GT range [0, 255] instead of TTO-optimized [0, ~184]
+      - tto_frames.pt is corrupted (wrong dtype, infinite values)
+      - Mask count doesn't match expected_n_frames
+      - GT poses missing or wrong shape
+      - Profile architecture doesn't match what the renderer would expect
+
+    Raises PreflightError on fatal issues. No warnings — every fail is fatal.
+    """
+    if verbose:
+        print("=" * 60)
+        print(f"TRAINING PREFLIGHT — profile '{profile_name}'")
+        print("=" * 60)
+
+    # 1. TTO frames must exist, be valid, and be TTO-OPTIMIZED (range < 200)
+    p = Path(tto_frames_path)
+    if not p.exists():
+        raise PreflightError(f"TTO frames missing: {p}")
+    try:
+        t = torch.load(str(p), map_location="cpu", weights_only=True)
+    except Exception as e:
+        raise PreflightError(f"TTO frames corrupted (cannot torch.load): {p} — {e}")
+    # R38 fix: accept HWC (N,384,512,3) OR CHW (N,3,384,512). Project history
+    # has had silent HWC/CHW format bugs; the validator should not assume one.
+    if t.ndim != 4:
+        raise PreflightError(f"TTO frames wrong ndim {t.ndim} (expected 4): {p}")
+    valid_shapes = {(384, 512, 3), (3, 384, 512)}
+    if tuple(t.shape[1:]) not in valid_shapes:
+        raise PreflightError(
+            f"TTO frames wrong shape {tuple(t.shape)} (expected (N,384,512,3) HWC "
+            f"or (N,3,384,512) CHW): {p}"
+        )
+    tmin, tmax = float(t.min()), float(t.max())
+    if not (0 <= tmin and tmax < 1e6):
+        raise PreflightError(f"TTO frames out of range [{tmin},{tmax}] — likely corrupted: {p}")
+    # R38 fix: support both [0,255] uint-scale and [0,1] normalized scale.
+    # If max ≤ 1.5, treat as [0,1] — TTO-optimized [0,1] frames cluster ~0.72.
+    # If max > 1.5, treat as [0,255] — TTO-optimized clusters ~184.
+    if tmax > 1.5:
+        is_gt_video = tmax > 200
+    else:
+        # [0,1] scale: GT frames clamp to ~1.0; TTO-optimized cluster ~0.72.
+        is_gt_video = tmax > 0.95
+    if is_gt_video:
+        raise PreflightError(
+            f"TTO frames at GT-video range [0, {tmax:.0f}] — these are RAW GT FRAMES, "
+            f"not TTO-optimized. This is the WILDE failure mode (proxy 267 instead of 0.5). "
+            f"Re-run optimize_poses.py to generate TTO-optimized frames first. Path: {p}"
+        )
+    if verbose:
+        print(f"  [PASS] tto_frames.pt: {tuple(t.shape)} {t.dtype} range [{tmin:.1f},{tmax:.1f}] (TTO-optimized)")
+
+    # 2. GT poses must exist with shape (600, 6)
+    pp = Path(gt_poses_path)
+    if not pp.exists():
+        raise PreflightError(f"GT poses missing: {pp}")
+    try:
+        poses = torch.load(str(pp), map_location="cpu", weights_only=True)
+        if isinstance(poses, dict):
+            poses = poses.get("poses", poses.get("gt_poses"))
+    except Exception as e:
+        raise PreflightError(f"GT poses corrupted: {pp} — {e}")
+    # R38 fix: was AttributeError on poses=None when neither 'poses' nor
+    # 'gt_poses' key existed in the dict.
+    if poses is None:
+        raise PreflightError(
+            f"GT poses dict has neither 'poses' nor 'gt_poses' key: {pp}"
+        )
+    if poses.ndim != 2 or poses.shape[1] != 6:
+        raise PreflightError(f"GT poses wrong shape {tuple(poses.shape)} (expected (N,6)): {pp}")
+    if poses.shape[0] not in (600, 1200):
+        raise PreflightError(f"GT poses {poses.shape[0]} entries (expected 600 pairs or 1200 frames): {pp}")
+    if verbose:
+        print(f"  [PASS] gt_poses.pt: {tuple(poses.shape)}")
+
+    # 3. Mask video frame count
+    mp = Path(masks_path)
+    if not mp.exists():
+        raise PreflightError(f"Masks missing: {mp}")
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-count_frames",
+             "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames",
+             "-of", "csv=p=0", str(mp)],
+            text=True, timeout=60,
+        ).strip()
+        nframes = int(out)
+    except (subprocess.TimeoutExpired, ValueError, subprocess.CalledProcessError) as e:
+        raise PreflightError(f"ffprobe failed on masks: {mp} — {e}")
+    if nframes not in (600, 1200):
+        raise PreflightError(
+            f"Masks have {nframes} frames (expected 600 half-frame or 1200 full): {mp}"
+        )
+    if verbose:
+        print(f"  [PASS] masks.mkv: {nframes} frames ({'half-frame' if nframes == 600 else 'full'})")
+
+    # 4. Profile architecture sanity
+    required_keys = ["base_ch", "mid_ch", "depth", "pose_dim", "padding_mode"]
+    missing = [k for k in required_keys if k not in profile_arch]
+    if missing:
+        raise PreflightError(f"Profile '{profile_name}' missing arch keys: {missing}")
+    if profile_arch["padding_mode"] not in ("zeros", "replicate", "reflect"):
+        raise PreflightError(f"Profile '{profile_name}' has invalid padding_mode={profile_arch['padding_mode']}")
+    if not (1 <= profile_arch["depth"] <= 4):
+        raise PreflightError(f"Profile '{profile_name}' depth={profile_arch['depth']} out of range [1,4]")
+    if verbose:
+        print(f"  [PASS] profile arch: base_ch={profile_arch['base_ch']} "
+              f"mid_ch={profile_arch['mid_ch']} depth={profile_arch['depth']} "
+              f"pose_dim={profile_arch['pose_dim']} padding={profile_arch['padding_mode']}")
+
+    # 5. Profile must include eval_roundtrip=True (NON-NEGOTIABLE)
+    if not profile_arch.get("eval_roundtrip", False):
+        raise PreflightError(
+            f"Profile '{profile_name}' has eval_roundtrip=False. "
+            f"This causes 2-11x proxy-auth gap. NON-NEGOTIABLE per CLAUDE.md."
+        )
+    if verbose:
+        print(f"  [PASS] eval_roundtrip=True (CLAUDE.md non-negotiable)")
+
+    if verbose:
+        print(f"  ALL TRAINING PREFLIGHT CHECKS PASSED for profile '{profile_name}'")
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Patterns that should NEVER appear outside contest submissions.
+FORBIDDEN_FILE_PATTERNS = [
+    "experiments/launch_*.sh",
+    "experiments/launch_*.py",
+    "experiments/run_*.sh",
+    "experiments/qat_*.sh",
+    "experiments/vastai_*.sh",
+    "experiments/build_and_eval.sh",
+    "experiments/crf_sweep_score.sh",
+]
+
+ALLOWED_BASH_PATHS = {
+    "submissions/exact_current/inflate.sh",
+    "submissions/exact_current/compress.sh",
+    "submissions/exact_current/start.sh",
+    "submissions/robust_current/inflate.sh",
+    "submissions/robust_current/compress.sh",
+}
+
+
+class CodebaseDriftError(Exception):
+    """An ad-hoc pattern reappeared in the codebase. Block all deployment."""
+
+
+def _scan_text_for_dangerous_patterns(text: str, location: str) -> list[str]:
+    """Cross-language scan for shell patterns that have caused real outages.
+
+    Both bash files and Python files (via subprocess string literals + f-strings
+    + tmux-send-keys composition) feed through this. Each rule cites the exact
+    incident that motivated it so future maintainers can judge edge cases.
+
+    Args:
+        text: shell text — either a bash file body or a string literal that
+            will be passed to bash -c / ssh.
+        location: human-readable origin (e.g. "scripts/foo.sh" or
+            "src/tac/deploy/x.py:412") used in violation messages.
+
+    Returns: list of violations.
+    """
+    violations: list[str] = []
+
+    # Ad-hoc remote bootstrap scripts in /tmp. The 2026-04-26 SHIRAZ deploy
+    # repeatedly wrote /tmp/*.sh files that vanished on instance restart and
+    # were never under version control. The canonical entry point is
+    # `scripts/remote_train_bootstrap.sh <profile>` (rsynced with the repo).
+    # Allow `/tmp/*.log`, `/tmp/foo.bin`, `/tmp/cache/...` etc — only fire on
+    # bash/python shell files written to /tmp and then EXECUTED.
+    if re.search(r"\b(bash|sh|python3?)\s+/tmp/[A-Za-z_][\w./]*\.(sh|py)\b", text):
+        if "scripts/remote_train_bootstrap.sh" not in text:
+            violations.append(
+                f"{location}: executes a /tmp/*.{{sh,py}} script — ad-hoc "
+                f"deploy scripts in /tmp vanish across instance restarts and "
+                f"are not version-controlled. Use the canonical "
+                f"`scripts/remote_train_bootstrap.sh <profile>` instead, or "
+                f"add the path to scripts/ if it's a reusable tool."
+            )
+
+    # Self-matching `pgrep -f TOKEN` deadlock. 2026-04-26 SHIRAZ:
+    #   bash -c "while pgrep -f train_distill > /dev/null; do sleep 60; done; bash run_pipeline.sh"
+    # The bash -c argv literally contained "train_distill", so pgrep -f matched
+    # the wrapper itself and the loop never exited — burned ~21h of A100 time.
+    # Detect any `pgrep -f TOKEN` whose TOKEN appears elsewhere in the SAME
+    # text blob (file or string literal).
+    for m in re.finditer(r"pgrep\s+-[a-z]*f[a-z]*\s+['\"]?([A-Za-z0-9_./-]+)", text):
+        token = m.group(1)
+        if len(token) < 3:
+            continue
+        if text.count(token) >= 2:
+            violations.append(
+                f"{location}: `pgrep -f {token}` will SELF-MATCH — the token "
+                f"appears elsewhere in this text, so the wait loop's own argv "
+                f"matches and the loop sleeps forever. 2026-04-26 SHIRAZ "
+                f"deadlock burned ~21h of A100 time. Use a pidfile, "
+                f"`pgrep -x <executable>` (exact name), or a unique cookie."
+            )
+            break
+
+    # Blind `.pt → .bin` rename. 2026-04-26 retto wrapper did
+    #   cp $(ls *_partial.pt) /tmp/.../optimized_poses.bin
+    # Pickle masqueraded as raw fp16 buffer; auth_eval_renderer crashed after
+    # 7 min of mask extraction with `frombuffer` size mismatch.
+    for m in re.finditer(
+        r"\b(?:cp|mv|install|ln\s+-s)\s+(?:-[a-zA-Z]+\s+)*(\S+\.pt)\s+(\S+\.bin)\b",
+        text,
+    ):
+        violations.append(
+            f"{location}: `{m.group(0)}` renames a pickle .pt to raw .bin. "
+            f"This corrupts pose loaders. Use tac.submission_archive."
+            f"save_poses_binary() or have the producer emit .bin directly."
+        )
+
+    # Wrapper that SHIPS `*_partial*` files as if they were finished artifacts.
+    # `optimized_poses_partial.pt` is what optimize_poses.py writes
+    # periodically; shipping it as the final archive artifact means N pairs
+    # rather than the full 600 are present. Only fire when the reference
+    # appears near a copy/move/archive operation — a producer that natively
+    # writes or resumes from its own partial is fine (e.g. optimize_poses.py
+    # itself, --resume CLI args, docstrings).
+    has_partial_ref = bool(
+        re.search(r"\b\S*_partial\.(?:pt|bin)\b", text)
+        or re.search(r"_partial\*\.(?:pt|bin)", text)
+    )
+    if has_partial_ref:
+        ships_or_renames = re.search(
+            r"\b(?:cp|mv|install|ln\s+-s|tar|zip|aws\s+s3|scp|rsync|"
+            r"build_submission_archive|optimized_poses\.bin|/archive/)",
+            text,
+        )
+        if ships_or_renames:
+            violations.append(
+                f"{location}: ships a `*_partial*` artifact (rename/copy/"
+                f"archive). Partial files are incomplete by definition. Wait "
+                f"for the canonical final write or re-run the producer. "
+                f"2026-04-26 SHIRAZ shipped 60 of 600 poses for a contest "
+                f"eval because of this pattern."
+            )
+
+    return violations
+
+
+def _scan_python_for_forbidden(path: Path) -> list[str]:
+    """AST-scan a Python file for forbidden subprocess patterns.
+
+    Returns list of human-readable violations.
+    """
+    violations: list[str] = []
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError:
+        return [f"{path}: SyntaxError (cannot parse)"]
+
+    # R-mps-noise-rule 2026-04-25: NEW. Per CLAUDE.md "MPS auth eval is NOISE",
+    # detect any auth_eval invocation hardcoded to --device mps. Allowed only
+    # in test files / smoke tests (path contains "/tests/" or "/smoke").
+    is_test_or_smoke = ("/tests/" in str(path) or "/smoke" in str(path).lower()
+                        or "test_" in path.name)
+
+    for node in ast.walk(tree):
+        # subprocess.* / os.system with 'nohup' in args. R38 fix: extended
+        # to subprocess.check_call/check_output and os.system.
+        if isinstance(node, ast.Call):
+            func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+            if func_str in ("subprocess.run", "subprocess.Popen", "subprocess.call",
+                            "subprocess.check_call", "subprocess.check_output",
+                            "os.system", "os.popen"):
+                # Check positional args for 'nohup' string literal
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        if "nohup" in arg.value:
+                            violations.append(
+                                f"{path}:{node.lineno}: {func_str} with 'nohup' "
+                                f"— use tmux instead (binding non-negotiable per CLAUDE.md)"
+                            )
+                    elif isinstance(arg, ast.List):
+                        for elt in arg.elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                if elt.value.strip() == "nohup":
+                                    violations.append(
+                                        f"{path}:{node.lineno}: {func_str} with nohup arg — use tmux"
+                                    )
+                # R-mps-noise: detect auth_eval invocations with --device mps.
+                # Allow in test/smoke paths.
+                if not is_test_or_smoke:
+                    full = ast.unparse(node) if hasattr(ast, "unparse") else ""
+                    if "auth_eval" in full and re.search(r"--device['\"\s,]+mps", full):
+                        violations.append(
+                            f"{path}:{node.lineno}: auth_eval invocation with "
+                            f"'--device mps' — MPS auth scores are NOISE per CLAUDE.md "
+                            f"HIGHEST-EMPHASIS rule (23x PoseNet drift verified 2026-04-25). "
+                            f"Use --device cuda."
+                        )
+
+        # f-string SSH commands containing 'nohup ... &' (the killer pattern)
+        if isinstance(node, ast.JoinedStr):
+            full = ast.unparse(node) if hasattr(ast, "unparse") else ""
+            if re.search(r"nohup.*&", full) and ("ssh" in full.lower() or "/workspace" in full):
+                violations.append(
+                    f"{path}:{node.lineno}: f-string with 'nohup ... &' over SSH "
+                    f"— this is the WATCHER PATTERN that DIED on 2026-04-25. Use tmux."
+                )
+            # Pose-format and self-match scans on the unparsed f-string. This
+            # catches dynamically composed bash -c / ssh commands that never
+            # land on disk as a .sh file (the 2026-04-26 SHIRAZ root cause).
+            for v in _scan_text_for_dangerous_patterns(full, f"{path}:{node.lineno}"):
+                violations.append(v)
+
+        # Plain string constants over 40 chars also worth scanning — the
+        # `bash -c "..."` literal in deploy_vastai composes via str.join.
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if len(node.value) > 40:
+                for v in _scan_text_for_dangerous_patterns(node.value, f"{path}:{node.lineno}"):
+                    violations.append(v)
+
+    return violations
+
+
+def _scan_bash_text_for_forbidden(path: Path) -> list[str]:
+    """Scan a bash file for nohup-watcher patterns and ad-hoc python invocations."""
+    violations: list[str] = []
+    if path.is_dir() or not path.is_file():
+        return violations
+    text = path.read_text()
+    if "nohup" in text and "&" in text and "while pgrep" in text:
+        violations.append(
+            f"{path}: 'nohup ... while pgrep ...' watcher pattern. "
+            f"This DIED on all 3 A100s on 2026-04-25. Use tmux."
+        )
+    if "python3 -u experiments/train_distill.py" in text or "python experiments/train_distill.py" in text:
+        violations.append(
+            f"{path}: ad-hoc invocation of train_distill.py. "
+            f"Use 'python experiments/pipeline.py --profile <name>' (canonical entry point)."
+        )
+    violations.extend(_scan_text_for_dangerous_patterns(text, str(path)))
+    return violations
+
+
+def check_codebase_drift(strict: bool = True) -> list[str]:
+    """Run the codebase drift check. Raise CodebaseDriftError if strict and violations found."""
+    all_violations: list[str] = []
+
+    # 1. Forbidden file patterns
+    for pattern in FORBIDDEN_FILE_PATTERNS:
+        for found in REPO_ROOT.glob(pattern):
+            all_violations.append(
+                f"{found.relative_to(REPO_ROOT)}: forbidden ad-hoc launcher. "
+                f"Use scripts/deploy_vastai.py + pipeline.py instead."
+            )
+
+    # 2. Bash scripts outside whitelist
+    # Harvest bundles under experiments/results/<lane>/<bundle>/ record the
+    # exact remote command line as run_command.sh purely for audit/traceability
+    # — these are recorded artifacts, not deploy patterns, and are also
+    # gitignored. The drift rule exists to prevent ad-hoc deploy scripts
+    # creeping in alongside the canonical pipeline.py + deploy_vastai.py path,
+    # which a frozen result-bundle audit trail does not violate.
+    for sh_path in REPO_ROOT.glob("experiments/**/*.sh"):
+        if sh_path.is_dir():
+            continue  # recovered_*.sh is a directory, not a script
+        rel = str(sh_path.relative_to(REPO_ROOT))
+        if rel.startswith("experiments/results/"):
+            continue
+        if rel not in ALLOWED_BASH_PATHS:
+            all_violations.append(
+                f"{rel}: bash script in experiments/ — only contest submission "
+                f"scripts allowed (inflate.sh, compress.sh in submissions/)"
+            )
+        all_violations.extend(_scan_bash_text_for_forbidden(sh_path))
+
+    # 3. Python files with nohup or watcher patterns. R36 extended scan to
+    # src/tac/ subtrees; R37 added existence guard so a fresh checkout
+    # missing one of these dirs doesn't crash preflight (Python <3.12
+    # rglob raises FileNotFoundError on missing path).
+    drift_scan_dirs = ["scripts", "experiments",
+                       "src/tac/contrib", "src/tac/deploy",
+                       "src/tac/experiments"]
+    for d in drift_scan_dirs:
+        d_path = REPO_ROOT / d
+        if not d_path.exists():
+            continue
+        for py_path in d_path.rglob("*.py"):
+            all_violations.extend(_scan_python_for_forbidden(py_path))
+
+    if all_violations and strict:
+        msg = (
+            "CODEBASE DRIFT DETECTED — ad-hoc deployment patterns reappeared.\n"
+            "These patterns wasted real money and CO2 on 2026-04-25. "
+            "Per CLAUDE.md binding rules:\n\n"
+            + "\n".join(f"  • {v}" for v in all_violations)
+            + "\n\nFix every violation. There is no bypass — this is the gate working."
+        )
+        raise CodebaseDriftError(msg)
+    return all_violations
+
+
+# ── Arity / arg / config validation ───────────────────────────────────────────
+#
+# The bug class this catches: a launcher (pipeline.py, deploy_vastai.py, a shell
+# wrapper) invokes a target script (qat_finetune.py, train_distill.py, etc.)
+# with a list of CLI flags. If the target's argparse signature doesn't accept a
+# flag, that flag is silently dropped (or argparse errors out at runtime — way
+# too late, after $$ of GPU has been spent on the wrong thing). If the launcher
+# fails to pass a flag the target needs, the target uses the default — the
+# SHIRAZ A100 disaster: profile said motion_hidden=24, qat_finetune.py defaulted
+# to 32, so QAT silently rebuilt the wrong architecture.
+#
+# Three layers:
+#   1. Each target script's argparse signature is parsed via AST.
+#   2. Each subprocess.run([...]) call in a launcher is parsed via AST.
+#   3. We cross-validate: every flag passed must exist on the target; every
+#      target arg in ARCH_FLAGS_REQUIRED that the target accepts must be passed.
+
+# Architectural flags that, IF a target script accepts them, MUST be passed by
+# any launcher invoking that script. Missing one → silent default → wrong arch.
+# This is the SHIRAZ failure mode: trained with motion_hidden=24, QAT got 32.
+ARCH_FLAGS_REQUIRED = {
+    "--base-ch", "--mid-ch", "--motion-hidden", "--depth", "--embed-dim",
+    "--pose-dim", "--padding-mode",
+}
+# Boolean (store_true) flags whose silent default = False would corrupt the
+# experiment. Rule D fires when a target accepts one of these and the launcher
+# source NEVER mentions it (so the launcher can't even conditionally pass it).
+ARCH_FLAGS_BOOLEAN = {
+    # Architecture flags
+    "--use-dsconv", "--use-dilation", "--use-zoom-flow",
+    # Training-discipline flags whose absence violates CLAUDE.md
+    "--eval-roundtrip",
+    # Loss / optimizer modulators that profiles toggle
+    "--use-swa", "--use-per-class-weights",
+    "--use-texture-loss", "--use-linf-penalty", "--use-markov-loss",
+    "--freeze-motion-phase2", "--freeze-renderer-phase3",
+    "--beneficial-quant-noise",
+}
+
+# Launcher files that invoke target scripts via subprocess.
+LAUNCHER_FILES = [
+    "experiments/pipeline.py",
+    "scripts/deploy_vastai.py",
+]
+
+# Target script directories: every .py here is a potential subprocess target.
+# R38 fix: src/tac/experiments/ added — train_renderer.py is a de-facto
+# launcher invoked directly via `python -m tac.experiments.train_renderer`.
+TARGET_DIRS = ["experiments", "scripts", "src/tac/experiments"]
+
+
+class ArityViolation(Exception):
+    """Arity / arg-matching failure between launcher and target."""
+
+
+def _parse_argparse_signature(path: Path) -> dict[str, dict] | None:
+    """AST-parse a script's argparse calls. Returns {flag: {required, action, type, ...}}.
+
+    Indexes every `--` form across all positional args of `add_argument`, so
+    `add_argument("-m", "--motion-hidden", ...)` correctly registers
+    `--motion-hidden`.
+
+    Returns None if the script has no argparse usage. Skips silently on syntax
+    errors (caught by other preflight layers).
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return None
+
+    flags: dict[str, dict] = {}
+    has_argparse = False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        # Match `<anything>.add_argument(...)`. Common: parser.add_argument,
+        # p.add_argument, sub.add_argument.
+        if not func_str.endswith(".add_argument"):
+            continue
+        has_argparse = True
+        # Collect every `--flag` literal across ALL positional args (handles
+        # `add_argument("-m", "--motion-hidden", ...)` short-form aliases).
+        long_forms: list[str] = []
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if arg.value.startswith("--"):
+                    long_forms.append(arg.value)
+        if not long_forms:
+            continue
+        spec = {"required": False, "action": None, "type": None,
+                "has_default": False, "lineno": node.lineno}
+        for kw in node.keywords:
+            if kw.arg == "required" and isinstance(kw.value, ast.Constant):
+                spec["required"] = bool(kw.value.value)
+            elif kw.arg == "action" and isinstance(kw.value, ast.Constant):
+                spec["action"] = kw.value.value
+            elif kw.arg == "default":
+                spec["has_default"] = True
+            elif kw.arg == "type":
+                spec["type"] = ast.unparse(kw.value) if hasattr(ast, "unparse") else "?"
+        for f in long_forms:
+            flags[f] = spec
+
+    return flags if has_argparse else None
+
+
+def _statically_resolve_list(node, scope: dict) -> list | None:
+    """Try to resolve `node` to a list of AST elements (literals or names).
+
+    Handles: List literal, Name → scope lookup (which may already be a
+    resolved Python list of AST nodes), BinOp `+` of two resolvable lists
+    (R38: closes an arity-validator escape hatch). `.extend()` is tracked
+    elsewhere (in scope's list_vars).
+    """
+    # Already-resolved Python list of AST nodes (from scope's list_vars).
+    if isinstance(node, list):
+        return list(node)
+    if isinstance(node, ast.List):
+        return list(node.elts)
+    if isinstance(node, ast.Name) and node.id in scope:
+        return _statically_resolve_list(scope[node.id], scope)
+    # R38 fix: handle `cmd = ["a","b"] + extras` and `["x"] + flags` patterns.
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _statically_resolve_list(node.left, scope)
+        right = _statically_resolve_list(node.right, scope)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _extract_flag_strings(elts: list[ast.AST]) -> list[str]:
+    """From a list of AST nodes (cmd elements), extract literal `--flag` strings."""
+    flags: list[str] = []
+    for elt in elts:
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            if elt.value.startswith("--"):
+                flags.append(elt.value)
+    return flags
+
+
+def _extract_target_script(elts: list[ast.AST]) -> str | None:
+    """Find an `experiments/foo.py` or `scripts/foo.py` literal in the cmd list."""
+    for elt in elts:
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            v = elt.value
+            for d in TARGET_DIRS:
+                if v.startswith(f"{d}/") and v.endswith(".py"):
+                    return v
+    return None
+
+
+_SUBPROCESS_FUNCS = {
+    "subprocess.run", "subprocess.Popen", "subprocess.call",
+    "subprocess.check_call", "subprocess.check_output",
+}
+
+_BASH_C_TARGET_RE = re.compile(
+    r"\b(?:python\d?|\.venv/bin/python\d?)\s+(?:-\w+\s+)*((?:experiments|scripts)/[\w/]+\.py)([^&|;\n]*)"
+)
+
+
+def _extract_invocations_from_scope(
+    scope: ast.AST,
+) -> list[tuple[int, str, list[str]]]:
+    """Find subprocess.{run,Popen,...} invocations within a single scope.
+
+    A scope is a Module, FunctionDef, or AsyncFunctionDef node. Variable
+    tracking (`cmd = [...]`, `cmd.extend([...])`, `cmd.append(...)`) is
+    confined to this scope to avoid cross-function pollution.
+
+    Iterates the scope's body sequentially (in lexical order) so that
+    variable definitions are seen before their use. We descend into
+    sub-statements (if-branches, for-bodies, with-bodies) but DO NOT descend
+    into nested FunctionDef/ClassDef — those are separate scopes handled by
+    the caller.
+
+    Also detects `subprocess.run(["bash", "-c", "python experiments/foo.py ..."])`
+    by regex-parsing the inner string.
+    """
+    list_vars: dict[str, list[ast.AST]] = {}
+    invocations: list[tuple[int, str, list[str]]] = []
+
+    def visit(node: ast.AST) -> None:
+        # Don't recurse into nested function or class scopes.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if node is scope:
+                pass  # We're at the top of our scope; descend into body below.
+            else:
+                return
+
+        # Track `name = [...]` and `name = a + b` (R38 BinOp).
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                # Try the full resolver — handles List, Name, BinOp(+).
+                resolved = _statically_resolve_list(node.value, list_vars)
+                if resolved is not None:
+                    list_vars[node.targets[0].id] = resolved
+
+        # Track `name.extend([...])` and `name.append("--flag")`
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+                tname = call.func.value.id
+                meth = call.func.attr
+                if tname in list_vars and meth in ("extend", "append"):
+                    if call.args:
+                        a = call.args[0]
+                        if isinstance(a, ast.List):
+                            list_vars[tname].extend(a.elts)
+                        elif isinstance(a, ast.Constant):
+                            list_vars[tname].append(a)
+
+        # subprocess invocation
+        if isinstance(node, ast.Call):
+            func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+            if func_str in _SUBPROCESS_FUNCS and node.args:
+                cmd_node = node.args[0]
+                # R38 fix: route through _statically_resolve_list so BinOp
+                # `+` patterns (cmd = ["a"] + flags) are tracked, closing
+                # the prior arity-validator escape hatch.
+                elts: list[ast.AST] | None = _statically_resolve_list(
+                    cmd_node, list_vars
+                )
+                if elts is not None:
+                    target = _extract_target_script(elts)
+                    flags = _extract_flag_strings(elts)
+                    if target is not None:
+                        invocations.append((node.lineno, target, flags))
+                    else:
+                        # Check for `["bash", "-c", "python experiments/x.py ..."]`
+                        for elt in elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                m = _BASH_C_TARGET_RE.search(elt.value)
+                                if m:
+                                    bash_target = m.group(1)
+                                    bash_tail = m.group(2) or ""
+                                    bash_flags = [tok for tok in bash_tail.split() if tok.startswith("--")]
+                                    invocations.append((node.lineno, bash_target, bash_flags))
+
+        # Recurse into children (statements within this scope only).
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    # Descend from the scope's body, not the scope node itself.
+    if isinstance(scope, ast.Module):
+        body = scope.body
+    else:
+        body = getattr(scope, "body", [])
+    for stmt in body:
+        visit(stmt)
+
+    return invocations
+
+
+def _scope_nodes(tree: ast.Module) -> list[ast.AST]:
+    """Return the module + every FunctionDef/AsyncFunctionDef as separate scopes."""
+    scopes: list[ast.AST] = [tree]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scopes.append(node)
+    return scopes
+
+
+def _collect_all_flag_literals(tree: ast.Module) -> set[str]:
+    """Find every `--flag` string literal anywhere in the module source.
+
+    Used by Rule D: a launcher that never even mentions a target's boolean
+    arch flag (e.g., never has `--use-dsconv` in its source) cannot possibly
+    be passing it conditionally, so it has a silent-default risk.
+    """
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith("--"):
+                seen.add(node.value)
+    return seen
+
+
+def _build_target_signatures(repo_root: Path) -> dict[str, dict[str, dict]]:
+    """Parse every potential target script into {target_path: {flag: spec}}."""
+    sigs: dict[str, dict[str, dict]] = {}
+    for d in TARGET_DIRS:
+        for py in (repo_root / d).glob("*.py"):
+            rel = str(py.relative_to(repo_root))
+            sig = _parse_argparse_signature(py)
+            if sig is not None:
+                sigs[rel] = sig
+    return sigs
+
+
+def _scan_launcher_invocations(
+    launcher_path: Path,
+) -> tuple[list[tuple[int, str, list[str]]], set[str]]:
+    """Return ((lineno, target, flags) invocations, all-flag-literals-in-source).
+
+    Walks each scope (module + every FunctionDef/AsyncFunctionDef) with its
+    OWN list_vars, so cross-function `cmd` reuse cannot cause Function A's
+    list to be polluted by Function B's `.extend(...)`.
+
+    Also returns the set of every `--flag` literal appearing anywhere in the
+    file's source — used by Rule D to detect launchers that don't even
+    mention a target's boolean arch flag (silent-default risk).
+    """
+    try:
+        tree = ast.parse(launcher_path.read_text(), filename=str(launcher_path))
+    except (SyntaxError, UnicodeDecodeError):
+        return [], set()
+
+    seen: set[tuple[int, str, tuple[str, ...]]] = set()
+    out: list[tuple[int, str, list[str]]] = []
+    for scope in _scope_nodes(tree):
+        for lineno, target, flags in _extract_invocations_from_scope(scope):
+            key = (lineno, target, tuple(flags))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((lineno, target, flags))
+    all_flag_literals = _collect_all_flag_literals(tree)
+    return out, all_flag_literals
+
+
+def preflight_arity(
+    repo_root: Path | None = None,
+    launcher_files: list[str] | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Validate that every subprocess invocation matches its target's argparse.
+
+    Four rules:
+      A. Every --flag passed by a launcher MUST exist on the target script.
+         (catches typos and renamed flags)
+      B. Every required=True arg of the target MUST be passed.
+         (catches forgotten required flags)
+      C. If the target accepts an ARCH_FLAGS_REQUIRED flag and the launcher does
+         NOT pass it, that's a silent-default risk → fail. (catches the SHIRAZ
+         motion_hidden=24 vs default 32 disaster.)
+      D. If the target accepts an ARCH_FLAGS_BOOLEAN flag and the launcher's
+         source code never even mentions that flag string, the launcher cannot
+         be conditionally passing it — that's also a silent-default risk →
+         fail. (catches the SHIRAZ-class disaster for boolean flags like
+         --use-dsconv and --use-dilation.)
+
+    Returns list of human-readable violations. Raises ArityViolation if strict.
+    """
+    root = repo_root or REPO_ROOT
+    launcher_files = launcher_files or LAUNCHER_FILES
+
+    sigs = _build_target_signatures(root)
+    violations: list[str] = []
+
+    for launcher_rel in launcher_files:
+        launcher_path = root / launcher_rel
+        if not launcher_path.exists():
+            continue
+        invocations, all_flag_literals = _scan_launcher_invocations(launcher_path)
+
+        for lineno, target, flags_passed in invocations:
+            target_sig = sigs.get(target)
+            if target_sig is None:
+                # Target either has no argparse or wasn't found. Skip silently;
+                # codebase-drift check covers missing files.
+                continue
+            target_flags = set(target_sig.keys())
+            passed = set(flags_passed)
+
+            # Rule A: unknown flags
+            unknown = passed - target_flags
+            for f in sorted(unknown):
+                violations.append(
+                    f"{launcher_rel}:{lineno}: passes {f!r} to {target} "
+                    f"but target has no such argparse arg"
+                )
+
+            # Rule B: missing required
+            for flag, spec in target_sig.items():
+                if spec["required"] and flag not in passed:
+                    violations.append(
+                        f"{launcher_rel}:{lineno}: invokes {target} but does not pass "
+                        f"required arg {flag!r}"
+                    )
+
+            # Rule C: missing arch flag (silent default risk)
+            target_arch_flags = target_flags & ARCH_FLAGS_REQUIRED
+            missing_arch = target_arch_flags - passed
+            for flag in sorted(missing_arch):
+                violations.append(
+                    f"{launcher_rel}:{lineno}: invokes {target} which accepts arch "
+                    f"flag {flag!r} but launcher doesn't pass it. Silent default → "
+                    f"WRONG architecture (the SHIRAZ motion_hidden=24 vs default 32 disaster)."
+                )
+
+            # Rule D: boolean arch flag never mentioned anywhere in launcher source
+            # The launcher MAY conditionally pass a boolean flag (e.g.,
+            # `if cfg.use_dsconv: cmd.append("--use-dsconv")`). We can't tell
+            # from this single invocation site whether the conditional path is
+            # ever taken. But if the flag string never appears ANYWHERE in the
+            # launcher's source code, we know with certainty the launcher has
+            # no path to pass it. That's a silent-default risk.
+            target_bool_flags = target_flags & ARCH_FLAGS_BOOLEAN
+            never_mentioned = target_bool_flags - all_flag_literals
+            for flag in sorted(never_mentioned):
+                violations.append(
+                    f"{launcher_rel}:{lineno}: invokes {target} which accepts boolean "
+                    f"arch flag {flag!r} but launcher source NEVER mentions it. "
+                    f"Silent-default risk: target will run with {flag!r}=False even "
+                    f"if the profile sets it True. (Boolean-flag SHIRAZ class.)"
+                )
+
+    if verbose and violations:
+        print(f"  [arity] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        n_launchers = sum(1 for f in launcher_files if (root / f).exists())
+        n_targets = len(sigs)
+        print(f"  [arity] OK: {n_launchers} launchers x {n_targets} targets clean")
+
+    if violations and strict:
+        raise ArityViolation(
+            "ARITY MISMATCH between launcher(s) and target script(s):\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix every violation. Each one is a real bug class that has "
+            "burned GPU money in this repo (see CLAUDE.md SHIRAZ A100 incident)."
+        )
+    return violations
+
+
+# ── Shell-lane arity validation (Check 72) ────────────────────────────────────
+#
+# Bug class this catches: a remote_lane_*.sh file invokes
+#   "$PYBIN" -u experiments/<file>.py --some-flag VALUE \
+#       --other-flag VALUE
+# where --some-flag does not exist on <file>.py's argparse. preflight_arity
+# only walks Python launchers (subprocess.run + bash -c strings); the bare
+# shell-script invocation pattern was a structural blind spot.
+#
+# Real incident (2026-04-29, Lane MM): an INLINE Python -c regex scanner in
+# build_lane_mm_archive.py matched a comment containing "--hard" (in
+# "NEVER git pull / git reset --hard"), captured it as an "invented flag"
+# argument, and every Modal dispatch failed rc=3 in 4 seconds. Today's bug
+# was inverted (false positive) but the same scanner gap means a real
+# invented flag in a remote_lane_*.sh would silently ship.
+#
+# This scanner walks every scripts/remote_lane_*.sh, finds each python
+# invocation of an experiments/*.py target (handling backslash line
+# continuations), extracts --flag tokens, and checks them against the
+# target's argparse signature.
+
+_SHELL_INVOKE_RE = re.compile(
+    r'(?:"\$PYBIN"|\$PYBIN|python3?|/[\w/]+/python\d?)\s+(?:-\w+\s+)*'
+    r'(experiments/[\w/]+\.py)\b'
+)
+_SHELL_FLAG_RE = re.compile(r'(--[\w][\w-]*)')
+
+
+def _collapse_shell_continuations(text: str) -> str:
+    """Join shell lines ending in `\\\\\\n` into a single logical line.
+
+    This is the same convention bash uses for line continuation. Without
+    this step, multi-line lane invocations (very common pattern) would
+    have their flags split across multiple "lines" we couldn't see.
+    """
+    return re.sub(r'\\\s*\n[ \t]*', ' ', text)
+
+
+def _scan_shell_lane_invocations(
+    shell_path: Path,
+) -> list[tuple[int, str, list[str]]]:
+    """Return [(approx_lineno, target, flags_used)] for each python invocation
+    of an experiments/*.py target inside a shell script.
+
+    Only the FIRST python-experiments invocation per logical line is captured;
+    chained pipelines (`python a.py | python b.py`) are split conservatively
+    on the first pipe / redirect / semicolon / `&&` boundary so flags from
+    later commands in the same line cannot pollute the first invocation's
+    flag set.
+
+    The lineno is the line where the invocation token first appears in the
+    ORIGINAL (un-collapsed) source, so violation reports point an operator
+    at a real line in the .sh file.
+    """
+    raw = shell_path.read_text()
+    raw_lines = raw.splitlines()
+    collapsed = _collapse_shell_continuations(raw)
+
+    invocations: list[tuple[int, str, list[str]]] = []
+    for logical_line in collapsed.splitlines():
+        m = _SHELL_INVOKE_RE.search(logical_line)
+        if m is None:
+            continue
+        target = m.group(1)
+        # Find approximate lineno: first raw line that mentions the target.
+        approx_lineno = 1
+        for i, raw_line in enumerate(raw_lines, start=1):
+            if target in raw_line:
+                approx_lineno = i
+                break
+        # Conservative split: stop at the first pipe / semicolon / && / >.
+        invocation = re.split(r'(?:\|\||\||>|;|&&)', logical_line)[0]
+        target_idx = invocation.find(target)
+        tail = invocation[target_idx + len(target):]
+        flags_used = sorted(set(_SHELL_FLAG_RE.findall(tail)))
+        invocations.append((approx_lineno, target, flags_used))
+    return invocations
+
+
+def preflight_shell_lane_arity(
+    repo_root: Path | None = None,
+    shell_files: list[str] | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Validate every `experiments/*.py` invocation inside scripts/remote_lane_*.sh.
+
+    Same Rule A as preflight_arity (every --flag passed must exist on the
+    target's argparse). Rules B/C/D (required-arg / arch-flag / boolean
+    silent-default) are NOT applied here because shell-script lane scripts
+    routinely run partial experiments (e.g. inflate-only, eval-only) where
+    "missing" flags are intentional. We only catch the dead-flag bug class
+    that has actually burned GPU money in this repo.
+
+    Returns list of human-readable violations. Raises ArityViolation if strict.
+    """
+    root = repo_root or REPO_ROOT
+    if shell_files is None:
+        shell_files = sorted(
+            str(p.relative_to(root))
+            for p in (root / "scripts").glob("remote_lane_*.sh")
+        )
+
+    sigs = _build_target_signatures(root)
+    violations: list[str] = []
+
+    n_invocations = 0
+    for shell_rel in shell_files:
+        shell_path = root / shell_rel
+        if not shell_path.exists():
+            continue
+        for lineno, target, flags_used in _scan_shell_lane_invocations(shell_path):
+            n_invocations += 1
+            target_sig = sigs.get(target)
+            if target_sig is None:
+                # Target not parseable or no argparse → skip silently.
+                continue
+            target_flags = set(target_sig.keys())
+            unknown = set(flags_used) - target_flags
+            for f in sorted(unknown):
+                violations.append(
+                    f"{shell_rel}:{lineno}: passes {f!r} to {target} "
+                    f"but target has no such argparse arg "
+                    f"(BUG CLASS A — invented CLI flag in shell script)"
+                )
+
+    if verbose and violations:
+        print(f"  [shell-lane-arity] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        n_scripts = sum(1 for f in shell_files if (root / f).exists())
+        print(
+            f"  [shell-lane-arity] OK: {n_scripts} lane scripts × "
+            f"{n_invocations} invocations clean"
+        )
+
+    if violations and strict:
+        raise ArityViolation(
+            "SHELL-LANE ARITY MISMATCH between remote_lane_*.sh and "
+            "experiments/*.py target(s):\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix every violation. Each one is a Bug Class A regression "
+            "(the dead-flag-in-shell pattern that burned ~$3 of Modal time on "
+            "2026-04-29 across Lanes MM/SA-v2/SC++-v2/SO-v2)."
+        )
+    return violations
+
+
+# ── T4-OOM training-batch guard (Check 73) ────────────────────────────────────
+#
+# Bug class this catches: a remote_lane_*.sh invokes
+#   "$PYBIN" -u experiments/train_segmap.py ... [no --batch-size]
+# OR
+#   "$PYBIN" -u experiments/train_segmap.py ... --batch-size 64  (or larger)
+# and gets dispatched to a 14.56-GiB T4 where the unchunked / over-large
+# forward needs 7.03 GiB just for activations and OOMs in 126 s.
+#
+# Real incident (2026-04-29): Lane SA-v2 / SC++-v2 / SO-v2 each hit:
+#   torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.03 GiB.
+#   GPU 0 has a total capacity of 14.56 GiB of which 2.90 GiB is free.
+#   Process has 11.66 GiB memory in use.
+# The matching code-side fix is BUG CLASS B (segmap_renderer.py
+# train_epoch() now mini-batches via the batch_size kwarg). This preflight
+# guards against future scripts that forget --batch-size or set it too
+# high.
+#
+# Conservative threshold: --batch-size <= 32. With T=2 frames per pair,
+# 32 pairs = 64 scorer-forward frames per mini-batch — the activations
+# stay under ~2 GiB even at full 384x512.
+
+_T4_OOM_TRAINING_TARGETS = {
+    "experiments/train_segmap.py",
+    "experiments/train_renderer.py",
+}
+_T4_BATCH_SIZE_CAP = 32
+# When the lane script EXPORTS this env var, the dispatcher (e.g.
+# scripts/launch_lane_on_vastai.py / experiments/modal_train_lane.py) is
+# expected to refuse anything below the named GPU tier. Lane scripts that
+# SET this var opt out of the batch-size cap.
+_GPU_TIER_HINT_VAR = "GPU_TIER_HINT"
+
+
+def preflight_t4_oom_training_guard(
+    repo_root: Path | None = None,
+    shell_files: list[str] | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Refuse remote_lane_*.sh scripts that invoke a T4-OOM-prone training
+    target without either bounding --batch-size or declaring a GPU_TIER_HINT.
+
+    Two acceptable patterns:
+      1) `--batch-size N` is passed AND N <= 32 (T4-safe under the new
+         BUG-CLASS-B chunked train_epoch).
+      2) The lane script exports `GPU_TIER_HINT=A10G` (or higher), opting
+         out of T4 dispatch entirely.
+
+    Anything else is a violation.
+    """
+    root = repo_root or REPO_ROOT
+    if shell_files is None:
+        shell_files = sorted(
+            str(p.relative_to(root))
+            for p in (root / "scripts").glob("remote_lane_*.sh")
+        )
+
+    violations: list[str] = []
+    n_invocations_checked = 0
+
+    for shell_rel in shell_files:
+        shell_path = root / shell_rel
+        if not shell_path.exists():
+            continue
+        raw = shell_path.read_text()
+        # GPU_TIER_HINT export anywhere in the file → opt out.
+        has_tier_hint = bool(
+            re.search(rf'(?:^|\n)\s*export\s+{_GPU_TIER_HINT_VAR}=', raw)
+        )
+        if has_tier_hint:
+            continue
+
+        for lineno, target, flags_used in _scan_shell_lane_invocations(shell_path):
+            if target not in _T4_OOM_TRAINING_TARGETS:
+                continue
+            n_invocations_checked += 1
+            # Find the --batch-size value, if present. Re-walk the collapsed
+            # logical line to extract the literal that follows --batch-size.
+            collapsed = _collapse_shell_continuations(raw)
+            bs_value: int | None = None
+            for logical_line in collapsed.splitlines():
+                if target not in logical_line:
+                    continue
+                m = re.search(r'--batch-size\s+(\d+)', logical_line)
+                if m:
+                    bs_value = int(m.group(1))
+                    break
+            if bs_value is None:
+                violations.append(
+                    f"{shell_rel}:{lineno}: invokes {target} without "
+                    f"--batch-size N. Without explicit batch chunking the "
+                    f"unchunked forward OOMs T4 (BUG CLASS B). Pass "
+                    f"`--batch-size <= {_T4_BATCH_SIZE_CAP}` OR add "
+                    f"`export {_GPU_TIER_HINT_VAR}=A10G` to the script."
+                )
+            elif bs_value > _T4_BATCH_SIZE_CAP:
+                violations.append(
+                    f"{shell_rel}:{lineno}: invokes {target} with "
+                    f"--batch-size {bs_value} > T4 cap "
+                    f"{_T4_BATCH_SIZE_CAP}. Either reduce or add "
+                    f"`export {_GPU_TIER_HINT_VAR}=A10G` (opts out of T4)."
+                )
+
+    if verbose and violations:
+        print(f"  [t4-oom-guard] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(
+            f"  [t4-oom-guard] OK: "
+            f"{n_invocations_checked} T4-sensitive training invocations clean"
+        )
+
+    if violations and strict:
+        raise PreflightError(
+            "T4-OOM TRAINING GUARD: lane scripts invoke a T4-OOM-prone "
+            "training target without bounded --batch-size or GPU_TIER_HINT:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nMemory: BUG CLASS B (2026-04-29 Lane SA-v2/SC++-v2/SO-v2 "
+            "incident) — unchunked SegMap train_epoch needed 7.03 GiB on a "
+            "14.56-GiB T4 and OOM'd in 126 s. The chunked train_epoch fix "
+            "(Check 73) is wired but only effective when --batch-size is "
+            "passed."
+        )
+    return violations
+
+
+# ── Dead-resolver / dead-import validation ────────────────────────────────────
+#
+# Bug class this catches: code that reads a profile-derived value via
+# `getattr(args, "X", DEFAULT)` (or `args.X`) but the script never actually
+# resolves X into the argparse Namespace — so the silent default fires every
+# time and the profile's value is dead. Caught manually three times in the
+# 2026-04-27 R5 codex review:
+#   - pose_dim: every SHIRAZ/DEN/WILDE/GREEN run silently trained pose_dim=0
+#     (FiLM disabled) because parse_args never copied profile.pose_dim into
+#     the Namespace. (Lane D incidental fix, commit 0746a803.)
+#   - segnet_uncertainty_weighted_loss: imported in train_renderer but never
+#     defined in tac.losses. Hidden by stale .pyc caches; would have crashed
+#     Lane D at runtime. (Lane D R5, commit 46e2ab6d.)
+#   - args.uncertainty_loss_floor: referenced at train_renderer:1614 with no
+#     CLI flag and no resolver call. (Lane D R5.)
+#
+# This validator catches all three at preflight time so they never ship.
+
+class DeadResolverViolation(Exception):
+    """A script reads args.X with no flag + no resolver, OR imports a name
+    that does not exist in the source module."""
+
+
+def _flag_to_attr(flag: str) -> str:
+    """Convert '--motion-hidden' to 'motion_hidden' (argparse default rule)."""
+    return flag.lstrip("-").replace("-", "_")
+
+
+def _collect_assigned_args_attrs(tree: ast.Module) -> set[str]:
+    """Walk the AST for every `args.X = ...` (Assign) and `args.X += ...`
+    (AugAssign) site. Returns the set of attribute names assigned anywhere
+    in the module — this is the resolver-side ground truth."""
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if (isinstance(tgt, ast.Attribute)
+                        and isinstance(tgt.value, ast.Name)
+                        and tgt.value.id == "args"):
+                    out.add(tgt.attr)
+        elif isinstance(node, ast.AugAssign):
+            tgt = node.target
+            if (isinstance(tgt, ast.Attribute)
+                    and isinstance(tgt.value, ast.Name)
+                    and tgt.value.id == "args"):
+                out.add(tgt.attr)
+    return out
+
+
+def _scan_python_for_dead_resolvers(
+    path: Path,
+    repo_root: Path,
+) -> list[str]:
+    """Find `getattr(args, 'X', ...)` references where X has neither a
+    `--X` argparse flag in the same file nor an `args.X = ...` assignment
+    anywhere in the same file.
+
+    Conservative scope by design: only the literal getattr-with-args idiom
+    is flagged. Plain `args.X` reads are too noisy (every CLI program reads
+    its own args). The getattr form specifically encodes a silent-default
+    contract that the bug class exploits.
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    sig = _parse_argparse_signature(path) or {}
+    flag_attrs = {_flag_to_attr(f) for f in sig.keys()}
+    assigned_attrs = _collect_assigned_args_attrs(tree)
+    known_attrs = flag_attrs | assigned_attrs
+
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
+            continue
+        if len(node.args) < 2:
+            continue
+        target_node = node.args[0]
+        attr_node = node.args[1]
+        if not (isinstance(target_node, ast.Name) and target_node.id == "args"):
+            continue
+        if not (isinstance(attr_node, ast.Constant)
+                and isinstance(attr_node.value, str)):
+            continue
+        attr_name = attr_node.value
+        if attr_name.startswith("_"):
+            # Private-by-convention; usually internal helpers, skip.
+            continue
+        if attr_name in known_attrs:
+            continue
+        violations.append(
+            f"{rel}:{node.lineno}: getattr(args, {attr_name!r}, ...) but no "
+            f"--{attr_name.replace('_', '-')!r} argparse flag and no "
+            f"`args.{attr_name} = ...` assignment found anywhere in the "
+            f"file. DEAD RESOLVER: silent default reads will mask any "
+            f"profile value the operator thinks they set. "
+            f"(pose_dim / uncertainty_loss_floor bug class.)"
+        )
+    return violations
+
+
+def _module_top_level_names(mod_path: Path) -> set[str]:
+    """Return every name defined or re-exported at module top level.
+
+    Handles: function/class defs, simple assignments, AnnAssign, ImportFrom
+    re-exports, and Import. Does NOT execute the module.
+    """
+    try:
+        tree = ast.parse(mod_path.read_text(), filename=str(mod_path))
+    except (SyntaxError, UnicodeDecodeError):
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    names.add(tgt.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+
+def _resolve_tac_module_path(module: str, repo_root: Path) -> Path | None:
+    """Resolve `tac.X.Y` to the on-disk file path. Handles package __init__
+    and bare modules. Returns None if not found in this repo."""
+    if not module.startswith("tac."):
+        return None
+    rel = module.replace(".", "/")
+    candidate = repo_root / "src" / f"{rel}.py"
+    if candidate.exists():
+        return candidate
+    candidate = repo_root / "src" / rel / "__init__.py"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _is_resolvable_submodule(parent_module: str, name: str, repo_root: Path) -> bool:
+    """True if `from <parent_module> import <name>` would resolve `name` as
+    a submodule of <parent_module>. Handles e.g.
+    `from tac.lossless import next_frame_coder` where next_frame_coder is
+    a `.py` file inside src/tac/lossless/."""
+    if not parent_module.startswith("tac."):
+        return False
+    parent_rel = parent_module.replace(".", "/")
+    candidate = repo_root / "src" / parent_rel / f"{name}.py"
+    if candidate.exists():
+        return True
+    candidate = repo_root / "src" / parent_rel / name / "__init__.py"
+    return candidate.exists()
+
+
+def _import_inside_try_handler(tree: ast.Module, target: ast.ImportFrom) -> bool:
+    """True if `target` (an ImportFrom node) is lexically inside a `try:` body
+    whose handlers catch ImportError (or bare except). Such imports are
+    intentional graceful-fallback patterns and should not be flagged."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        # Walk just the try-body (not the handlers / else / finally) for the target.
+        for body_node in node.body:
+            if any(child is target for child in ast.walk(body_node)):
+                # Now check the handlers — at least one must catch ImportError
+                # (or be a bare except).
+                for handler in node.handlers:
+                    if handler.type is None:
+                        return True  # bare `except:`
+                    # Handle `except ImportError`, `except (ImportError, ...)`,
+                    # `except ModuleNotFoundError`, etc.
+                    candidates: list[ast.AST] = []
+                    if isinstance(handler.type, ast.Tuple):
+                        candidates.extend(handler.type.elts)
+                    else:
+                        candidates.append(handler.type)
+                    for c in candidates:
+                        name = ast.unparse(c) if hasattr(ast, "unparse") else ""
+                        if "ImportError" in name or "ModuleNotFoundError" in name:
+                            return True
+    return False
+
+
+def _scan_python_for_dead_imports(path: Path, repo_root: Path) -> list[str]:
+    """Find `from tac.X import Y` where Y is not defined at top level in
+    tac.X AND Y is not a resolvable submodule. Skips imports inside
+    try/except ImportError blocks (intentional graceful fallback).
+
+    Catches the segnet_uncertainty_weighted_loss class — runtime
+    NameError masked by stale .pyc caches.
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if not node.module:
+            continue
+        mod_path = _resolve_tac_module_path(node.module, repo_root)
+        if mod_path is None:
+            continue
+        if _import_inside_try_handler(tree, node):
+            continue
+        defined = _module_top_level_names(mod_path)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            if alias.name in defined:
+                continue
+            if _is_resolvable_submodule(node.module, alias.name, repo_root):
+                continue
+            violations.append(
+                f"{rel}:{node.lineno}: imports {alias.name!r} from "
+                f"{node.module} but that name is NOT defined at the top "
+                f"level of {mod_path.relative_to(repo_root)} and is not a "
+                f"resolvable submodule. DEAD IMPORT: runtime NameError when "
+                f".pyc cache is invalidated. "
+                f"(segnet_uncertainty_weighted_loss bug class.)"
+            )
+    return violations
+
+
+def preflight_dead_resolvers(
+    repo_root: Path | None = None,
+    target_dirs: list[str] | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Scan target scripts for dead-resolver and dead-import bug patterns.
+
+    Two rules:
+      A. Every `getattr(args, 'X', DEFAULT)` reference must have a corresponding
+         `--X` argparse flag OR an explicit `args.X = ...` assignment somewhere
+         in the same file. Otherwise the silent default masks profile values.
+         (pose_dim / uncertainty_loss_floor bug class.)
+      B. Every `from tac.X import Y` must resolve — Y must actually be defined
+         at top level in tac.X. Otherwise stale .pyc caches mask a runtime
+         NameError. (segnet_uncertainty_weighted_loss bug class.)
+
+    Returns list of human-readable violations. Raises DeadResolverViolation
+    if strict and any are found.
+    """
+    root = repo_root or REPO_ROOT
+    target_dirs = target_dirs or TARGET_DIRS
+
+    violations: list[str] = []
+    n_scanned = 0
+
+    for d in target_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for py in sorted(d_path.glob("*.py")):
+            n_scanned += 1
+            violations.extend(_scan_python_for_dead_resolvers(py, root))
+            violations.extend(_scan_python_for_dead_imports(py, root))
+
+    if verbose and violations:
+        print(f"  [dead-resolvers] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [dead-resolvers] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise DeadResolverViolation(
+            "DEAD-RESOLVER / DEAD-IMPORT violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix every violation. Each one is a real bug class that has "
+            "burned GPU money in this repo (pose_dim, "
+            "segnet_uncertainty_weighted_loss, uncertainty_loss_floor — "
+            "2026-04-27 R5 codex review)."
+        )
+    return violations
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _call_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return None
+
+
+def _node_uses_attr(node: ast.AST, attr_name: str) -> bool:
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Attribute)
+            and child.attr == attr_name
+            and isinstance(child.value, ast.Name)
+            and child.value.id in {"args", "cfg"}
+        ):
+            return True
+    return False
+
+
+def _node_calls_name(node: ast.AST, function_name: str) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and _call_name(child.func) == function_name:
+            return True
+    return False
+
+
+def _node_adds_to_objective(node: ast.AST, weight_attr: str) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Assign):
+            targets = [
+                t.id for t in child.targets
+                if isinstance(t, ast.Name) and t.id in {"loss", "total", "fridrich_extra"}
+            ]
+            if targets and _node_uses_attr(child.value, weight_attr):
+                return True
+        elif (
+            isinstance(child, ast.AugAssign)
+            and isinstance(child.target, ast.Name)
+            and child.target.id in {"loss", "total", "fridrich_extra"}
+            and _node_uses_attr(child.value, weight_attr)
+        ):
+            return True
+    return False
+
+
+def _scan_python_for_dead_objective_feature(
+    path: Path,
+    repo_root: Path,
+    *,
+    feature_attr: str,
+    weight_attr: str,
+    function_name: str,
+) -> list[str]:
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    guarded = False
+    live_call = False
+    objective_effect = False
+    not_implemented = False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _node_uses_attr(node.test, feature_attr):
+            guarded = True
+            live_call = live_call or _node_calls_name(node, function_name)
+            objective_effect = objective_effect or _node_adds_to_objective(node, weight_attr)
+            for child in ast.walk(node):
+                if (
+                    isinstance(child, ast.Raise)
+                    and isinstance(child.exc, ast.Call)
+                    and _call_name(child.exc.func) == "NotImplementedError"
+                ):
+                    not_implemented = True
+
+    violations: list[str] = []
+    if not guarded:
+        violations.append(
+            f"{rel}: feature flag {feature_attr!r} has no objective guard. "
+            "DEAD FEATURE: profiles may set it without changing training."
+        )
+    if not live_call:
+        violations.append(
+            f"{rel}: feature flag {feature_attr!r} does not call "
+            f"{function_name} inside its guard. DEAD FEATURE: resolved flag "
+            "does not execute the intended loss."
+        )
+    if not objective_effect:
+        violations.append(
+            f"{rel}: feature flag {feature_attr!r} does not add "
+            f"{weight_attr!r} to loss/total/fridrich_extra inside its guard. "
+            "DEAD FEATURE: helper may run without affecting the objective."
+        )
+    if not_implemented:
+        violations.append(
+            f"{rel}: feature flag {feature_attr!r} guard still raises "
+            "NotImplementedError. DEAD FEATURE: configured profile aborts "
+            "instead of training."
+        )
+    return violations
+
+
+def check_feature_flags_have_live_objective_effect(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None
+) -> list[str]:
+    """Guard profile flags that resolve but fail to affect the objective."""
+    root = repo_root or REPO_ROOT
+    checks = [
+        (
+            root / "src" / "tac" / "experiments" / "train_renderer.py",
+            "use_variance_noise",
+            "variance_noise_weight",
+            "uniward_quant_noise_loss",
+        ),
+        (
+            root / "experiments" / "train_distill.py",
+            "use_variance_noise",
+            "variance_noise_weight",
+            "uniward_quant_noise_loss",
+        ),
+    ]
+    violations: list[str] = []
+    for path, feature_attr, weight_attr, function_name in checks:
+        if not path.exists():
+            violations.append(f"{path.relative_to(root)}: missing feature-check target")
+            continue
+        violations.extend(
+            _scan_python_for_dead_objective_feature(
+                path,
+                root,
+                feature_attr=feature_attr,
+                weight_attr=weight_attr,
+                function_name=function_name,
+            )
+        )
+
+    if verbose and violations:
+        print(f"  [objective-feature] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print("  [objective-feature] OK")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "DEAD OBJECTIVE FEATURE violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Meta-bug pattern checks ───────────────────────────────────────────────────
+#
+# Each check below catches a CLAUDE.md "FORBIDDEN PATTERNS" bug class that has
+# bitten this project at least once and cost real GPU money. These are
+# additive, defensive scaffolds: each starts in warn-only mode (strict=False)
+# until it surfaces zero true-positive violations on the live codebase, then
+# is flipped strict=True at its preflight_all() call site near the top of
+# preflight_all (the previously-referenced TODO block was removed 2026-04-27
+# after every meta-bug check was promoted).
+#
+# Pattern → memory entry mapping:
+#   1. MPS-fallback device default       → feedback_default_to_convenience_trap
+#   2. set -uo pipefail (no -e)          → feedback_zip_dep_bootstrap_trap
+#   3. shell `zip` binary                → feedback_zip_dep_bootstrap_trap
+#   4. pipefail + grep -q SIGPIPE        → feedback_pipefail_grep_q_trap
+#   5. eval_roundtrip=False              → CLAUDE.md "eval_roundtrip" rule
+#   6. scorer load at inflate            → feedback_strict_scorer_rule
+#   7. training script no auth eval      → CLAUDE.md "Auth eval EVERYWHERE"
+#   8. --no-eval-roundtrip CLI flag      → Lane C R5 fix (commit 9d71ec5d)
+
+
+class MetaBugViolation(Exception):
+    """A meta-bug pattern (CLAUDE.md FORBIDDEN PATTERNS) detected."""
+
+
+def check_dispatch_cli_shell_hazards(
+    *,
+    repo_root: str | Path | None = None,
+    scan_paths: list[str] | tuple[str, ...] | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Fail closed on shell/CLI hazards that waste remote dispatch wall-clock."""
+    root = Path(repo_root or REPO_ROOT)
+    helper_path = root / "tools" / "check_dispatch_cli_shell_hazards.py"
+    if not helper_path.is_file():
+        msg = f"dispatch CLI shell hazard scanner missing: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+
+    spec = importlib.util.spec_from_file_location("_pact_dispatch_cli_shell_hazards", helper_path)
+    if spec is None or spec.loader is None:
+        msg = f"cannot import dispatch CLI shell hazard scanner: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    roots = tuple(scan_paths or module.DEFAULT_SCAN_PATHS)
+    hazards = module.scan_paths(root, scan_paths=roots)
+    violations = [
+        f"{hazard.path}:{hazard.line}: {hazard.kind}: {hazard.message}"
+        for hazard in hazards
+    ]
+    if violations and strict:
+        raise MetaBugViolation("DISPATCH CLI SHELL HAZARDS:\n" + "\n".join(violations))
+    if verbose:
+        if violations:
+            print(f"  [dispatch-cli-shell-hazards] {len(violations)} violation(s)")
+        else:
+            print("  [dispatch-cli-shell-hazards] OK")
+    return violations
+
+
+def check_lane_smoke_signal_nontrivial(
+    *,
+    repo_root: str | Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC9 — Catch lanes promoted to L2 with zero-delta smoke evidence.
+
+    Council Q2 prescription. Live count was 4 (4 PR106 sister lanes); fixed by
+    demoting them L2 -> L1 in commit 9155f0e1. Strict-flipped on 2026-05-05.
+    """
+    root = Path(repo_root or REPO_ROOT)
+    helper_path = root / "tools" / "check_lane_smoke_signal_nontrivial.py"
+    if not helper_path.is_file():
+        msg = f"lane smoke-signal scanner missing: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+
+    spec = importlib.util.spec_from_file_location("_pact_lane_smoke_signal", helper_path)
+    if spec is None or spec.loader is None:
+        msg = f"cannot import lane smoke-signal scanner: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    try:
+        flagged = module.scan_registry(root)
+    except FileNotFoundError as e:
+        msg = f"lane smoke-signal scan failed: {e}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+    violations = [
+        f"{v.lane_id}: {v.evidence_path}: {v.reason[:160]}"
+        for v in flagged
+    ]
+    if violations and strict:
+        raise MetaBugViolation("LANE SMOKE-SIGNAL VIOLATIONS:\n" + "\n".join(violations))
+    if verbose:
+        if violations:
+            print(f"  [lane-smoke-signal] {len(violations)} violation(s)")
+        else:
+            print("  [lane-smoke-signal] OK")
+    return violations
+
+
+def check_dispatch_wrapper_stages_implemented(
+    *,
+    repo_root: str | Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC11 — Catch wrapper scripts whose ``# Stage N:`` labels lack a real
+    command in the stage body (comment-only contract anti-pattern).
+
+    Council Q5-B4 prescription. Live count was 63 across 20 wrapper scripts
+    pre-tightening; reduced to 0 after dedupe-window expansion + skip-marker
+    (SKIPPED|SKIP|NO-OP|DEFERRED|DISABLED|STUB|TODO|FIXME, 'ready at',
+    'nothing additional to do', 'verified above', 'already final|done|built',
+    'manual') + first-60-lines-as-docstring filter. Strict-flipped 2026-05-05.
+    """
+    root = Path(repo_root or REPO_ROOT)
+    helper_path = root / "tools" / "check_dispatch_wrapper_stages_implemented.py"
+    if not helper_path.is_file():
+        msg = f"wrapper-stages scanner missing: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+
+    spec = importlib.util.spec_from_file_location("_pact_wrapper_stages_implemented", helper_path)
+    if spec is None or spec.loader is None:
+        msg = f"cannot import wrapper-stages scanner: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    findings = module.scan(root)
+    violations = [
+        f"{v.path}:{v.stage_lineno}: {v.stage_label[:120]}"
+        for v in findings
+    ]
+    if violations and strict:
+        raise MetaBugViolation("WRAPPER STAGE-IMPL VIOLATIONS:\n" + "\n".join(violations))
+    if verbose:
+        if violations:
+            print(f"  [wrapper-stages-implemented] {len(violations)} violation(s)")
+        else:
+            print("  [wrapper-stages-implemented] OK")
+    return violations
+
+
+def check_calibration_provenance(
+    *,
+    repo_root: str | Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC10 — Anti-arbitrariness scanner for prediction-logic magic numbers.
+
+    Council Q4 prescription. Live count was 6; fixed by tagging in commit
+    9155f0e1. Strict-flipped on 2026-05-05. Required tag forms: [contest-defined],
+    [calibration:<src>], [empirical:<artifact>], [heuristic:<reason>], [inherited:<src>].
+    """
+    root = Path(repo_root or REPO_ROOT)
+    helper_path = root / "tools" / "check_calibration_provenance.py"
+    if not helper_path.is_file():
+        msg = f"calibration provenance scanner missing: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+
+    spec = importlib.util.spec_from_file_location("_pact_calibration_provenance", helper_path)
+    if spec is None or spec.loader is None:
+        msg = f"cannot import calibration provenance scanner: {helper_path}"
+        if strict:
+            raise MetaBugViolation(msg)
+        return [msg]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    findings = module.scan(root)
+    violations = [
+        f"{f.path}:{f.lineno}: {f.target_name} = {f.literal_value}"
+        for f in findings
+    ]
+    if violations and strict:
+        raise MetaBugViolation("CALIBRATION PROVENANCE VIOLATIONS:\n" + "\n".join(violations))
+    if verbose:
+        if violations:
+            print(f"  [calibration-provenance] {len(violations)} violation(s)")
+        else:
+            print("  [calibration-provenance] OK")
+    return violations
+
+
+def check_reverse_engineering_tree_curation(
+    *,
+    repo_root: str | Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Keep reverse_engineering/ curated and force raw material into custody manifests."""
+    root = Path(repo_root or REPO_ROOT)
+    required = [
+        root / "reverse_engineering" / "README.md",
+        root / "reverse_engineering" / ".gitignore",
+    ]
+    missing = [path.relative_to(root).as_posix() for path in required if not path.is_file()]
+    violations = [f"missing required reverse-engineering surface: {rel}" for rel in missing]
+    try:
+        from comma_lab.reverse_engineering import audit_reverse_engineering_tree, blocking_records
+    except Exception as exc:  # pragma: no cover - import failure is environment-specific
+        violations.append(f"cannot import comma_lab.reverse_engineering: {exc}")
+        records = []
+        blockers = []
+    else:
+        try:
+            records = audit_reverse_engineering_tree(root)
+            blockers = blocking_records(records)
+        except Exception as exc:
+            violations.append(f"reverse-engineering audit failed: {exc}")
+            records = []
+            blockers = []
+        for record in blockers:
+            violations.append(f"{record.relpath}: {record.disposition}: {record.reason}")
+    if violations and strict:
+        raise MetaBugViolation("REVERSE ENGINEERING TREE CURATION VIOLATIONS:\n" + "\n".join(violations))
+    if verbose:
+        if violations:
+            print(f"  [reverse-engineering-curation] {len(violations)} violation(s)")
+        else:
+            print(f"  [reverse-engineering-curation] OK ({len(records)} file(s), {len(blockers)} blocker(s))")
+    return violations
+
+
+# Directories scanned for Python meta-bug patterns. Mirrors TARGET_DIRS but
+# adds scripts/ for shell-adjacent Python launchers.
+_META_PY_SCAN_DIRS = ["src/tac", "experiments", "scripts"]
+# Directories scanned for shell meta-bug patterns.
+_META_SH_SCAN_DIRS = ["scripts", "tools", "submissions/robust_current"]
+
+_COMPROMISED_LIGHTNING_VERSIONS = {"2.6.2", "2.6.3"}
+_MINI_SHAI_HULUD_IOC_SHA256 = {
+    "5f5852b5f604369945118937b058e49064612ac69826e0adadca39a357dfb5b1",
+    "8046a11187c135da6959862ff3846e99ad15462d2ec8a2f77a30ad53ebd5dcf2",
+    "d2815d425ae08cc627f1db69009442165f8bbc64b7e9157e2ff9d7aab02094d4",
+    "2d4e21d2e78d0868ce7894487e67c67f929d8d81d78c5b07a3ad225b13eae890",
+    "3071422c3294e7b61cb490c57c48c8dea569bacf12e57a078293b6547d7586d3",
+    "56070a9d8de0c0ffb1ec5c309953cf4679432df5a78df9aeb020fbb73d2be9fb",
+}
+_MINI_SHAI_HULUD_IOC_LABELS = {
+    "5f5852b5f604369945118937b058e49064612ac69826e0adadca39a357dfb5b1": "router_runtime.js payload",
+    "8046a11187c135da6959862ff3846e99ad15462d2ec8a2f77a30ad53ebd5dcf2": "lightning 2.6.2 _runtime/start.py",
+    "d2815d425ae08cc627f1db69009442165f8bbc64b7e9157e2ff9d7aab02094d4": "lightning 2.6.3 _runtime/start.py",
+    "2d4e21d2e78d0868ce7894487e67c67f929d8d81d78c5b07a3ad225b13eae890": "malicious lightning/__init__.py",
+    "3071422c3294e7b61cb490c57c48c8dea569bacf12e57a078293b6547d7586d3": "lightning 2.6.2 wheel",
+    "56070a9d8de0c0ffb1ec5c309953cf4679432df5a78df9aeb020fbb73d2be9fb": "lightning 2.6.3 wheel",
+}
+_MINI_SHAI_HULUD_PLANTED_PATHS = {
+    ".claude/router_runtime.js",
+    ".claude/setup.mjs",
+    ".claude/settings.json",
+    ".vscode/setup.mjs",
+    ".vscode/tasks.json",
+    ".github/workflows/format-check.yml",
+}
+_LIGHTNING_BAD_VERSION_RE = re.compile(
+    r"(?i)(?:^|[^A-Za-z0-9_.-])(?:lightning(?:\[[^\]]+\])?|pytorch-lightning)"
+    r"\s*(?:==|=)\s*2\.6\.[23](?:[^0-9]|$)"
+)
+_LIGHTNING_WHEEL_BAD_VERSION_RE = re.compile(
+    r"(?i)(?:lightning|pytorch_lightning|pytorch-lightning)-2\.6\.[23]"
+)
+_LIGHTNING_BAD_CACHE_ARTIFACT_RE = re.compile(
+    r"(?i)(?:lightning|pytorch_lightning|pytorch-lightning)-2\.6\.[23]"
+    r".*\.(?:whl|zip|tar\.gz|tgz)$"
+)
+_PYPI_LIGHTNING_PACKAGE_RE = re.compile(
+    r"(?i)(?<![-A-Za-z0-9_])lightning(?:\[[^\]\s]+\])?(?![-A-Za-z0-9_])"
+)
+_LIGHTNING_INSTALL_RE = re.compile(
+    r"(?i)\b(?:uv\s+pip|python\s+-m\s+pip|pip)\s+install\b[^\n#;&|]*"
+    r"(?<![-A-Za-z0-9_])lightning(?:\[[^\]\s]+\])?(?![-A-Za-z0-9_])"
+)
+_LIGHTNING_VERSION_PROBE_RE = re.compile(
+    r"""(?ix)
+    (
+        subprocess\.(?:run|call|check_call|check_output|Popen)\s*\(\s*
+        \[\s*["']lightning["']\s*,\s*["']--version["']
+    )
+    |
+    (
+        (?<![-A-Za-z0-9_])lightning(?![-A-Za-z0-9_])
+        \s+--version
+    )
+    """
+)
+_LIGHTNING_CONSOLE_SCRIPT_RE = re.compile(
+    r"""(?ix)
+    (?:
+        (?:^|[\s"'=({;&|`])
+        (?:
+            (?:\./)?\.venv/bin/
+            |
+            (?:\./)?venv/bin/
+            |
+            [./A-Za-z0-9_-]+/bin/
+        )
+        lightning
+        (?:$|[\s"')};|`])
+    )
+    |
+    (?:
+        (?:^|[;&|`(]\s*)
+        lightning
+        \s+
+        (?:connect|cp|list|run|studio|app|apps|job|jobs|open|download|upload|login|logout|--version)\b
+    )
+    """
+)
+_LIGHTNING_CONSOLE_VARIABLE_RE = re.compile(
+    r"""(?x)
+    (?:^|[\s"'({;&|`])
+    (?:\$\{LIGHTNING\}|\$LIGHTNING)
+    (?:$|[\s"')};|`])
+    """
+)
+_PACKAGE_JSON_POSTINSTALL_SETUP_RE = re.compile(
+    r'"postinstall"\s*:\s*"[^"]*(?:setup\.mjs|router_runtime\.js)[^"]*"'
+)
+_TOML_NAME_LIGHTNING_RE = re.compile(r"""(?i)\bname\s*=\s*["']lightning["']""")
+_LIGHTNING_STRICT_HOSTKEY_DISABLED_RE = re.compile(
+    r"""(?ix)
+    \bStrictHostKeyChecking
+    (?:\s*=\s*|\s+)
+    (?:no|false|off)
+    \b
+    """
+)
+_LIGHTNING_NULL_KNOWN_HOSTS_RE = re.compile(
+    r"""(?ix)
+    \bUserKnownHostsFile
+    (?:\s*=\s*|\s+)
+    /dev/null
+    \b
+    """
+)
+_LIGHTNING_BARE_PROVIDER_TARGET_RE = re.compile(
+    r"""(?ix)
+    (?<![@A-Za-z0-9_.-])
+    ssh\.lightning\.ai
+    (?![A-Za-z0-9_.-])
+    """
+)
+_PROVIDER_HOSTNAME_RE = re.compile(
+    r"""(?ix)
+    \b
+    (?:
+        ssh\.lightning\.ai
+        |
+        ssh\d*\.vast\.ai
+    )
+    \b
+    """
+)
+_SCORE_ENTRYPOINT_RE = re.compile(
+    r"""(?ix)
+    (?:
+        contest_auth_eval\.py
+        |
+        upstream/evaluate\.py
+        |
+        (?<![A-Za-z0-9_.-])evaluate\.py
+        |
+        runner\.py["'\s]+evaluate
+    )
+    """
+)
+_CPU_MPS_DEVICE_RE = re.compile(r"""(?ix)--device(?:\s+|=)(?:cpu|mps)\b""")
+
+
+def _iter_python_files(root: Path, dirs: list[str]) -> list[Path]:
+    """Collect every .py file under `dirs` (recursively). Skips __pycache__."""
+    out: list[Path] = []
+    for d in dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in d_path.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            out.append(p)
+    return sorted(out)
+
+
+def _iter_shell_files(root: Path, dirs: list[str]) -> list[Path]:
+    """Collect every .sh file under `dirs` (recursively)."""
+    out: list[Path] = []
+    for d in dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in d_path.rglob("*.sh"):
+            out.append(p)
+    return sorted(out)
+
+
+def _read_text_if_possible(path: Path) -> str:
+    try:
+        return path.read_text(errors="ignore")
+    except OSError:
+        return ""
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _is_heavy_scan_path(path: Path) -> bool:
+    return any(
+        part in {
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            "experiments",
+            "reports",
+            "workspace",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+        }
+        for part in path.parts
+    )
+
+
+def _candidate_supply_chain_manifest_files(root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    direct_names = {
+        "pyproject.toml",
+        "uv.lock",
+        "poetry.lock",
+        "setup.py",
+        "setup.cfg",
+        "Pipfile",
+        "Pipfile.lock",
+    }
+    for name in direct_names:
+        p = root / name
+        if p.exists():
+            candidates.append(p)
+    for pattern in ("requirements*.txt", "constraints*.txt", "environment*.yml", "environment*.yaml"):
+        candidates.extend(sorted(root.glob(pattern)))
+    for base in (
+        root / "scripts",
+        root / "tools",
+        root / ".github" / "workflows",
+        root / "src" / "tac" / "deploy",
+    ):
+        if not base.exists():
+            continue
+        for suffix in ("*.py", "*.sh", "*.yml", "*.yaml"):
+            candidates.extend(sorted(base.rglob(suffix)))
+    return sorted({p.resolve(): p for p in candidates if p.is_file()}.values())
+
+
+def _is_python_dependency_manifest(path: Path) -> bool:
+    name = path.name
+    suffix = path.suffix.lower()
+    return (
+        name in {
+            "pyproject.toml",
+            "uv.lock",
+            "poetry.lock",
+            "setup.py",
+            "setup.cfg",
+            "Pipfile",
+            "Pipfile.lock",
+        }
+        or name.startswith(("requirements", "constraints"))
+        or suffix in {".txt", ".in", ".toml", ".lock", ".cfg", ".yml", ".yaml"}
+    )
+
+
+def _line_refs_pypi_lightning_dependency(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    if _TOML_NAME_LIGHTNING_RE.search(stripped):
+        return True
+    if not _PYPI_LIGHTNING_PACKAGE_RE.search(stripped):
+        return False
+    # Avoid false positives for natural-language strings such as
+    # "Lightning AI deployment"; dependency specs either start with the package
+    # name, quote/list it, install it, or use a package operator/URL form.
+    return bool(
+        re.search(
+            r"""(?ix)
+            (?:^|["'\s,{[(])
+            lightning(?:\[[^\]\s]+\])?
+            (?:
+                \s*(?:==|=|!=|~=|>=|<=|>|<|@)\s*
+                |
+                \s*(?:["',#\])}]|$)
+            )
+            """,
+            stripped,
+        )
+    )
+
+
+def _scan_dependency_manifests_for_compromised_lightning(
+    repo_root: Path,
+) -> list[str]:
+    """Block known-bad Lightning releases and unsafe `pip install lightning`.
+
+    The 2026-04-30 Mini Shai-Hulud incident affected the PyPI package named
+    `lightning` versions 2.6.2 and 2.6.3. The project uses `lightning-sdk`;
+    installing bare `lightning` is unnecessary. We therefore block the PyPI
+    package named `lightning` entirely in repo install/deploy paths rather than
+    trying to preserve a fragile allowlist of known-clean versions.
+    """
+    violations: list[str] = []
+    for path in _candidate_supply_chain_manifest_files(repo_root):
+        text = _read_text_if_possible(path)
+        if not text:
+            continue
+        rel = path.relative_to(repo_root) if path.is_relative_to(repo_root) else path
+        is_manifest = _is_python_dependency_manifest(path)
+        for i, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("#"):
+                continue
+            if _LIGHTNING_BAD_VERSION_RE.search(line) or _LIGHTNING_WHEEL_BAD_VERSION_RE.search(line):
+                violations.append(
+                    f"{rel}:{i}: references compromised Lightning release "
+                    "2.6.2/2.6.3; use lightning-sdk or a verified clean pin."
+                )
+            elif _LIGHTNING_INSTALL_RE.search(line):
+                violations.append(
+                    f"{rel}:{i}: installs PyPI package `lightning`; use "
+                    "`lightning-sdk` for Lightning AI Batch Jobs/CLI."
+                )
+            elif _LIGHTNING_VERSION_PROBE_RE.search(line):
+                violations.append(
+                    f"{rel}:{i}: executes `lightning --version`; inspect "
+                    "`lightning-sdk` package metadata instead of running a "
+                    "potentially poisoned console script."
+                )
+            elif _LIGHTNING_CONSOLE_SCRIPT_RE.search(line):
+                violations.append(
+                    f"{rel}:{i}: executes the PyPI `lightning` console script; "
+                    "use SSH, `lightning-sdk`, or package metadata APIs instead."
+                )
+            elif _LIGHTNING_CONSOLE_VARIABLE_RE.search(line):
+                violations.append(
+                    f"{rel}:{i}: executes a `LIGHTNING` console-script variable; "
+                    "use SSH, `lightning-sdk`, or package metadata APIs instead."
+                )
+            elif is_manifest and _line_refs_pypi_lightning_dependency(line):
+                violations.append(
+                    f"{rel}:{i}: depends on PyPI package `lightning`; use "
+                    "`lightning-sdk` for this project."
+                )
+    return violations
+
+
+def _candidate_lightning_ssh_policy_files(repo_root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    roots = [
+        repo_root / "scripts",
+        repo_root / "tools",
+        repo_root / "docs" / "runbooks",
+        repo_root / "src" / "tac" / "deploy" / "lightning",
+    ]
+    suffixes = {".py", ".sh", ".md", ".toml", ".json", ".yaml", ".yml", ".txt", ".sshconfig"}
+    for base in roots:
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            rel = path.relative_to(repo_root)
+            rel_lower = rel.as_posix().lower()
+            if "lightning" in rel_lower:
+                candidates.append(path)
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = repo_root / name
+        if path.is_file():
+            candidates.append(path)
+    return sorted({p.resolve(): p for p in candidates}.values())
+
+
+def _line_has_bare_lightning_provider_target(line: str) -> bool:
+    if "ssh.lightning.ai" not in line:
+        return False
+    stripped = line.strip()
+    if re.search(r"(?i)\bHostName\s+ssh\.lightning\.ai\b", stripped):
+        return False
+    if re.search(r"(?i)\b(?:DEFAULT_HOST|ssh_host|host)\b[^#]*=\s*['\"]ssh\.lightning\.ai['\"]", stripped):
+        return False
+    lower = stripped.lower()
+    if "not bare ssh.lightning.ai" in lower or "bare ssh.lightning.ai" in lower and "fatal" in lower:
+        return False
+    if re.fullmatch(r"ssh\.lightning\.ai\)?", stripped):
+        return False
+    if re.search(
+        r"""(?x)(?:args\.\w+|[A-Za-z_][A-Za-z0-9_]*)\s*(?:==|!=)\s*["']ssh\.lightning\.ai["']""",
+        stripped,
+    ):
+        return False
+    # A direct Studio user target is still allowed for one-off compatibility;
+    # the unsafe static regression here is the provider host with no SSH user
+    # or alias, e.g. `--remote ssh.lightning.ai`.
+    if re.search(r"(?i)[A-Za-z0-9_.-]+@ssh\.lightning\.ai\b", stripped):
+        return False
+    return bool(_LIGHTNING_BARE_PROVIDER_TARGET_RE.search(stripped))
+
+
+def _scan_lightning_ssh_static_policy(path: Path, repo_root: Path) -> list[str]:
+    violations: list[str] = []
+    text = _read_text_if_possible(path)
+    if not text:
+        return violations
+    rel = path.relative_to(repo_root) if path.is_relative_to(repo_root) else path
+    for i, line in enumerate(text.splitlines(), start=1):
+        lower = line.lower()
+        negative_guidance = any(
+            token in lower
+            for token in (
+                "do not use",
+                "never use",
+                "forbid",
+                "reject",
+                "blocked",
+                "disallow",
+            )
+        )
+        if _LIGHTNING_STRICT_HOSTKEY_DISABLED_RE.search(line) and not negative_guidance:
+            violations.append(
+                f"{rel}:{i}: disables StrictHostKeyChecking for Lightning SSH; "
+                "use an SSH config alias with StrictHostKeyChecking accept-new or yes."
+            )
+        if _LIGHTNING_NULL_KNOWN_HOSTS_RE.search(line) and not negative_guidance:
+            violations.append(
+                f"{rel}:{i}: sends Lightning host keys to /dev/null; "
+                "use a persistent known_hosts file for custody."
+            )
+        if _line_has_bare_lightning_provider_target(line):
+            violations.append(
+                f"{rel}:{i}: uses bare ssh.lightning.ai as a Lightning target; "
+                "use an SSH config alias with HostName ssh.lightning.ai and a Studio User."
+            )
+    return violations
+
+
+def check_lightning_ssh_static_policy(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Block unsafe Lightning SSH/static-provider auth regressions.
+
+    This is deliberately narrower than the Vast SSH tooling: it only scans
+    Lightning-named scripts/tools/runbooks and durable agent guidance. Vast
+    launchers still own their separate SSH policy and are intentionally not
+    inspected by this check.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    for path in _candidate_lightning_ssh_policy_files(root):
+        violations.extend(_scan_lightning_ssh_static_policy(path, root))
+    if verbose:
+        if violations:
+            print(f"  [lightning-ssh-static-policy] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print("  [lightning-ssh-static-policy] OK: Lightning SSH scripts/runbooks are fail-closed")
+    if violations and strict:
+        raise MetaBugViolation(
+            "LIGHTNING SSH STATIC POLICY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nLightning scripts and runbooks must preserve host-key "
+            "checking and should target SSH config aliases instead of the "
+            "bare provider host. This keeps staging/harvest custody auditable "
+            "before any Batch Job or SSH artifact copy."
+        )
+    return violations
+
+
+def _candidate_submission_provider_score_surface_files(repo_root: Path) -> list[Path]:
+    """Return public/submission helper surfaces where provider or CPU score
+    shortcuts are especially dangerous.
+
+    This is intentionally narrower than the general remote-script corpus:
+    legacy Vast/Lightning launchers have their own custody checks, while files
+    under submissions/ can leak stale provider targets or CPU score commands
+    directly into public/operator workflows.
+    """
+    candidates: list[Path] = []
+    roots = [
+        repo_root / "submissions" / "robust_current",
+        repo_root / "submissions" / "pr106_stacked",
+    ]
+    suffixes = {".py", ".sh"}
+    for base in roots:
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            rel_parts = set(path.relative_to(repo_root).parts)
+            if rel_parts.intersection({"eval_runs", "__pycache__"}):
+                continue
+            candidates.append(path)
+    return sorted({p.resolve(): p for p in candidates}.values())
+
+
+def _line_is_negative_provider_guidance(line: str) -> bool:
+    lower = line.lower()
+    return any(
+        token in lower
+        for token in (
+            "do not use",
+            "never use",
+            "forbid",
+            "reject",
+            "blocked",
+            "disallow",
+            "fatal:",
+            "must not",
+        )
+    )
+
+
+def _scan_submission_for_provider_or_cpu_score_leakage(path: Path, repo_root: Path) -> list[str]:
+    violations: list[str] = []
+    text = _read_text_if_possible(path)
+    if not text:
+        return violations
+    rel = path.relative_to(repo_root) if path.is_relative_to(repo_root) else path
+    is_shell = path.suffix.lower() == ".sh"
+    scan_text = _mask_shell_heredocs(text) if is_shell else text
+    lines = scan_text.splitlines()
+
+    for i, line in enumerate(lines, start=1):
+        if _PROVIDER_HOSTNAME_RE.search(line) and not _line_is_negative_provider_guidance(line):
+            violations.append(
+                f"{rel}:{i}: submission helper embeds provider hostname; "
+                "use an operator-supplied SSH alias/target outside public custody."
+            )
+        if _LIGHTNING_STRICT_HOSTKEY_DISABLED_RE.search(line) and not _line_is_negative_provider_guidance(line):
+            violations.append(
+                f"{rel}:{i}: submission helper disables host-key checking; "
+                "use accept-new/yes and persistent known_hosts custody."
+            )
+        if _LIGHTNING_NULL_KNOWN_HOSTS_RE.search(line) and not _line_is_negative_provider_guidance(line):
+            violations.append(
+                f"{rel}:{i}: submission helper sends host keys to /dev/null; "
+                "use persistent known_hosts custody."
+            )
+
+    for i, line in enumerate(lines, start=1):
+        if not _SCORE_ENTRYPOINT_RE.search(line):
+            continue
+        window = "\n".join(lines[i - 1 : min(len(lines), i + 14)])
+        if _CPU_MPS_DEVICE_RE.search(window):
+            violations.append(
+                f"{rel}:{i}: score-path command uses --device cpu/mps; "
+                "contest score helpers must require CUDA or skip scoring."
+            )
+    return violations
+
+
+def check_no_submission_provider_or_cpu_score_leakage(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Block stale provider-host and CPU/MPS score paths in submission helpers.
+
+    This closes the `download_and_eval.sh` class: a public/operator helper
+    silently copied from a provider host with TOFU disabled and then ran the
+    scorer on CPU. Provider-specific orchestration belongs in private custody
+    scripts; submission helpers must be CUDA-scoring or package-only.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    candidates = _candidate_submission_provider_score_surface_files(root)
+    for path in candidates:
+        violations.extend(_scan_submission_for_provider_or_cpu_score_leakage(path, root))
+    if verbose:
+        if violations:
+            print(f"  [submission-provider-score-leakage] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print(f"  [submission-provider-score-leakage] OK: {len(candidates)} submission helper(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "SUBMISSION PROVIDER/CPU SCORE LEAKAGE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nSubmission helpers must not embed provider hostnames, "
+            "disable SSH host-key custody, or run contest score paths on "
+            "CPU/MPS. Use CUDA for score truth or --skip-score/package-only."
+        )
+    return violations
+
+
+def _scan_repo_for_mini_shai_hulud_iocs(repo_root: Path) -> list[str]:
+    violations: list[str] = []
+    for rel_s in sorted(_MINI_SHAI_HULUD_PLANTED_PATHS):
+        path = repo_root / rel_s
+        if path.exists():
+            violations.append(
+                f"{rel_s}: Mini Shai-Hulud planted path is present; "
+                "treat repository as compromised until reviewed."
+            )
+
+    for pkg_json in sorted(repo_root.rglob("package.json")):
+        rel_parts = pkg_json.relative_to(repo_root).parts
+        if any(part in {".git", "node_modules", ".venv", "venv", "workspace"} for part in rel_parts):
+            continue
+        text = _read_text_if_possible(pkg_json)
+        if _PACKAGE_JSON_POSTINSTALL_SETUP_RE.search(text):
+            violations.append(
+                f"{pkg_json.relative_to(repo_root)}: package.json postinstall "
+                "references setup.mjs/router_runtime.js, matching worm behavior."
+            )
+
+    names = {"router_runtime.js", "start.py", "setup.mjs", "__init__.py"}
+    for path in sorted(repo_root.rglob("*")):
+        if not path.is_file() or path.name not in names:
+            continue
+        rel = path.relative_to(repo_root)
+        if _is_heavy_scan_path(rel):
+            continue
+        digest = _sha256_file(path)
+        if digest in _MINI_SHAI_HULUD_IOC_SHA256:
+            label = _MINI_SHAI_HULUD_IOC_LABELS.get(digest, "known payload")
+            violations.append(f"{rel}: known Mini Shai-Hulud IOC {label} sha256={digest}")
+    return violations
+
+
+def _candidate_site_packages_roots(repo_root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    prefixes = {Path(sys.prefix), repo_root / ".venv"}
+    for prefix in prefixes:
+        candidates.extend(sorted(prefix.glob("lib/python*/site-packages")))
+    for item in sys.path:
+        try:
+            p = Path(item)
+        except TypeError:
+            continue
+        if p.name == "site-packages":
+            candidates.append(p)
+    return sorted({p.resolve(): p for p in candidates if p.exists()}.values())
+
+
+def _scan_site_packages_for_compromised_lightning(
+    repo_root: Path,
+    site_packages_roots: list[Path] | None = None,
+) -> list[str]:
+    violations: list[str] = []
+    roots = _candidate_site_packages_roots(repo_root) if site_packages_roots is None else site_packages_roots
+    for site in roots:
+        if not site.exists():
+            continue
+        for dist in sorted(site.glob("lightning-*.dist-info")):
+            metadata = _read_text_if_possible(dist / "METADATA")
+            name = ""
+            version = ""
+            for line in metadata.splitlines():
+                if line.startswith("Name:"):
+                    name = line.split(":", 1)[1].strip().lower().replace("_", "-")
+                elif line.startswith("Version:"):
+                    version = line.split(":", 1)[1].strip()
+            if name == "lightning":
+                if version in _COMPROMISED_LIGHTNING_VERSIONS:
+                    violations.append(
+                        f"{dist}: installed compromised PyPI package lightning=={version}; "
+                        "remove the environment and rotate credentials if imported."
+                    )
+                else:
+                    violations.append(
+                        f"{dist}: installed PyPI package lightning=={version or '<unknown>'}; "
+                        "this repo policy forbids bare `lightning` entirely. Use "
+                        "`lightning-sdk` only, and avoid importing/executing "
+                        "the PyPI `lightning` package or console script."
+                    )
+
+        runtime_dir = site / "lightning" / "_runtime"
+        if runtime_dir.exists():
+            violations.append(
+                f"{runtime_dir}: hidden Lightning _runtime payload directory present; "
+                "this matches the compromised 2.6.2/2.6.3 package structure."
+            )
+        for name in ("router_runtime.js", "start.py"):
+            for path in sorted(site.rglob(name)):
+                digest = _sha256_file(path)
+                if digest in _MINI_SHAI_HULUD_IOC_SHA256:
+                    label = _MINI_SHAI_HULUD_IOC_LABELS.get(digest, "known payload")
+                    violations.append(f"{path}: known Mini Shai-Hulud IOC {label} sha256={digest}")
+        lightning_init = site / "lightning" / "__init__.py"
+        if lightning_init.exists():
+            digest = _sha256_file(lightning_init)
+            if digest in _MINI_SHAI_HULUD_IOC_SHA256:
+                label = _MINI_SHAI_HULUD_IOC_LABELS.get(digest, "known payload")
+                violations.append(f"{lightning_init}: known Mini Shai-Hulud IOC {label} sha256={digest}")
+    return violations
+
+
+def _candidate_package_cache_roots() -> list[Path]:
+    candidates: list[Path] = []
+    for env_name in ("PIP_CACHE_DIR", "UV_CACHE_DIR"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(Path(value).expanduser())
+
+    home = Path.home()
+    xdg_cache = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache")).expanduser()
+    candidates.extend(
+        [
+            xdg_cache / "pip",
+            xdg_cache / "uv",
+            home / "Library" / "Caches" / "pip",
+            home / "Library" / "Caches" / "uv",
+        ]
+    )
+    return sorted({p.resolve(): p for p in candidates if p.exists()}.values())
+
+
+def _scan_package_caches_for_compromised_lightning(
+    package_cache_roots: list[Path] | None = None,
+) -> list[str]:
+    violations: list[str] = []
+    roots = _candidate_package_cache_roots() if package_cache_roots is None else package_cache_roots
+    bad_stems = (
+        "lightning-2.6.2*",
+        "lightning-2.6.3*",
+        "pytorch_lightning-2.6.2*",
+        "pytorch_lightning-2.6.3*",
+        "pytorch-lightning-2.6.2*",
+        "pytorch-lightning-2.6.3*",
+    )
+    for root in roots:
+        if not root.exists():
+            continue
+        for pattern in bad_stems:
+            for path in sorted(root.glob(f"**/{pattern}")):
+                if not path.is_file():
+                    continue
+                if not _LIGHTNING_BAD_CACHE_ARTIFACT_RE.search(path.name):
+                    continue
+                digest = _sha256_file(path)
+                if digest in _MINI_SHAI_HULUD_IOC_SHA256:
+                    label = _MINI_SHAI_HULUD_IOC_LABELS.get(digest, "known payload")
+                    violations.append(
+                        f"{path}: cached compromised Lightning artifact {label} sha256={digest}"
+                    )
+                else:
+                    violations.append(
+                        f"{path}: cached Lightning 2.6.2/2.6.3 artifact present; "
+                        "treat the cache/environment as suspect and remove from trusted runners."
+                    )
+    return violations
+
+
+def check_no_compromised_lightning_supply_chain(
+    repo_root: Path | None = None,
+    site_packages_roots: list[Path] | None = None,
+    package_cache_roots: list[Path] | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard against the 2026-04-30 Lightning PyPI compromise.
+
+    This check is intentionally narrow and fail-closed:
+    - forbids `lightning==2.6.2` / `lightning==2.6.3`
+    - forbids unpinned `pip install lightning` in deploy/install paths
+    - scans the active virtualenv for the compromised package shape / hashes
+    - scans package caches for cached compromised wheels/source archives
+    - scans repo-owned files for the Mini Shai-Hulud planted paths
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    violations.extend(_scan_dependency_manifests_for_compromised_lightning(root))
+    violations.extend(_scan_repo_for_mini_shai_hulud_iocs(root))
+    violations.extend(_scan_site_packages_for_compromised_lightning(root, site_packages_roots))
+    cache_roots = package_cache_roots
+    if cache_roots is None and site_packages_roots is not None:
+        cache_roots = []
+    violations.extend(_scan_package_caches_for_compromised_lightning(cache_roots))
+    if verbose:
+        if violations:
+            print(f"  [lightning-supply-chain] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print("  [lightning-supply-chain] OK: no compromised Lightning artifacts or unsafe install paths")
+    if violations and strict:
+        raise MetaBugViolation(
+            "COMPROMISED LIGHTNING SUPPLY-CHAIN RISK DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+def check_lightning_exact_eval_runner_bootstraps_dali(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard the Lightning Batch Jobs exact-eval dependency preflight.
+
+    Bug class: a promotion-grade exact CUDA eval can pass CUDA and archive
+    checks, spend inflate time, then fail inside upstream ``evaluate.py``
+    because the runner env lacks ``nvidia.dali``. The exact-eval command must
+    therefore:
+    - run the Lightning supply-chain scan before any dependency mutation,
+    - bootstrap a pinned DALI wheel for the active CUDA major if missing,
+    - run the supply-chain scan again after mutation,
+    - prove DALI and CUDA imports before archive copy / inflate / eval.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+
+    try:
+        from tac.deploy.lightning.batch_jobs import (
+            ARTIFACT_DALI_BOOTSTRAP,
+            ARTIFACT_DALI_REQUIREMENTS,
+            ARTIFACT_RUNNER_PREFLIGHT,
+            ARTIFACT_SUPPLY_CHAIN_SCAN,
+            ARTIFACT_SUPPLY_CHAIN_SCAN_PRE,
+            LightningAdjudicationSpec,
+            LightningBatchJobSpec,
+            exact_cuda_eval_command,
+        )
+    except Exception as exc:
+        violations.append(f"could not import Lightning Batch Jobs helpers: {exc!r}")
+    else:
+        command = exact_cuda_eval_command(
+            repo_dir="/repo",
+            archive_path="/archive.zip",
+            upstream_dir="/upstream",
+            output_dir="/out",
+            expected_archive_sha256="a" * 64,
+            expected_archive_size_bytes=123,
+            adjudication=LightningAdjudicationSpec(
+                baseline_score=1.2,
+                predicted_band_low=1.0,
+                predicted_band_high=1.4,
+                regression_threshold=1.6,
+                baseline_archive_size_bytes=100,
+            ),
+        )
+        required_tokens = {
+            "supply-chain scan": "scripts/scan_lightning_supply_chain.py",
+            "pre-bootstrap supply-chain artifact": ARTIFACT_SUPPLY_CHAIN_SCAN_PRE,
+            "post-bootstrap supply-chain artifact": ARTIFACT_SUPPLY_CHAIN_SCAN,
+            "DALI bootstrap artifact": ARTIFACT_DALI_BOOTSTRAP,
+            "runner preflight artifact": ARTIFACT_RUNNER_PREFLIGHT,
+            "adjudication": "scripts/adjudicate_contest_auth_eval.py",
+            "CUDA sentinel": "LIGHTNING_RUNNER_CUDA_PREFLIGHT_OK",
+            "DALI sentinel": "LIGHTNING_RUNNER_DALI_PREFLIGHT_OK",
+            "DALI import": "import nvidia.dali.fn as dali_fn",
+            "CUDA 13 DALI pin": "nvidia-dali-cuda130==1.52.0",
+            "CUDA 12 DALI pin": "nvidia-dali-cuda120==1.52.0",
+            "CUDA 13 DALI wheel URL": "https://pypi.nvidia.com/nvidia-dali-cuda130/",
+            "CUDA 13 DALI wheel hash": "37369fb30e9c66f710b29836688c90abc36793bbe757cd3ad699fac76ba07119",
+            "DALI requirements artifact": ARTIFACT_DALI_REQUIREMENTS,
+            "hash-required install": "--require-hashes",
+            "no dependency resolver drift": "--no-deps",
+            "wheel-only install": "--only-binary",
+            "uv strict install validation": "--strict",
+        }
+        for label, token in required_tokens.items():
+            if token not in command:
+                violations.append(f"exact-eval command missing {label}: {token!r}")
+        forbidden_tokens = ("--index-url", "--extra-index-url")
+        for token in forbidden_tokens:
+            if token in command:
+                violations.append(
+                    f"exact-eval DALI bootstrap must use direct hash-pinned wheels, found {token!r}"
+                )
+
+        scan_count = command.count("scripts/scan_lightning_supply_chain.py")
+        if scan_count < 2:
+            violations.append(
+                "exact-eval command must run supply-chain scan twice "
+                f"(before and after DALI bootstrap); found {scan_count}"
+            )
+
+        def _pos(token: str) -> int:
+            return command.find(token)
+
+        order = [
+            ("initial supply-chain scan", _pos("scripts/scan_lightning_supply_chain.py")),
+            ("DALI bootstrap", _pos("DALI_VERSION = '1.52.0'")),
+            ("post-bootstrap supply-chain scan", command.rfind("scripts/scan_lightning_supply_chain.py")),
+            ("runner preflight", _pos("'tool': 'lightning_exact_eval_runner_preflight'")),
+            ("archive copy", _pos("cp /archive.zip /out/archive.zip")),
+            ("contest auth eval", _pos("experiments/contest_auth_eval.py")),
+        ]
+        missing_order = [name for name, pos in order if pos < 0]
+        if missing_order:
+            violations.append(f"exact-eval command missing ordered stages: {missing_order}")
+        else:
+            positions = [pos for _, pos in order]
+            if positions != sorted(positions):
+                violations.append(
+                    "exact-eval command stages are not fail-closed before spend: "
+                    + " -> ".join(f"{name}@{pos}" for name, pos in order)
+                )
+
+        bad = LightningBatchJobSpec(
+            name="bad",
+            machine="T4",
+            command=(
+                "scripts/scan_lightning_supply_chain.py && "
+                "python experiments/contest_auth_eval.py --device cuda && "
+                "echo LIGHTNING_RUNNER_CUDA_PREFLIGHT_OK && "
+                "cp contest_auth_eval.json ."
+            ),
+            role="exact_cuda_eval",
+            expected_archive_sha256="a" * 64,
+            expected_archive_size_bytes=123,
+            adjudication=LightningAdjudicationSpec(
+                baseline_score=1.2,
+                predicted_band_low=1.0,
+                predicted_band_high=1.4,
+                regression_threshold=1.6,
+            ),
+        )
+        try:
+            bad.validate()
+        except ValueError as exc:
+            if "DALI runner preflight" not in str(exc):
+                violations.append(
+                    "exact-eval validator rejected missing-DALI command for "
+                    f"the wrong reason: {exc}"
+                )
+        else:
+            violations.append(
+                "exact-eval validator accepted a command without "
+                "LIGHTNING_RUNNER_DALI_PREFLIGHT_OK"
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [lightning-exact-eval-dali] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [lightning-exact-eval-dali] OK: DALI bootstrap and preflight are fail-closed")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LIGHTNING EXACT-EVAL DALI PREFLIGHT VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nExact CUDA eval must prove `nvidia.dali` and CUDA before "
+            "archive copy, inflate, or upstream evaluate.py. The 2026-04-30 "
+            "r3 OWV3 run failed after inflate because this dependency was "
+            "absent; this preflight prevents the same spend-before-fail class."
+        )
+    return violations
+
+
+_MCP_CONFIG_FILENAMES = {
+    "mcp.json",
+    "claude_desktop_config.json",
+    "config.toml",
+    "config.local.toml",
+    "settings.json",
+    "settings.local.json",
+}
+_MCP_CONFIG_DIRS = (".codex", ".claude", ".cursor", ".vscode")
+_MCP_PROCESS_TOKENS = (
+    "chrome-devtools-mcp",
+    "model.context",
+    "rbx-studio-mcp",
+    "roblox_studio_mcp",
+)
+_MCP_SHELL_BASENAMES = {"bash", "dash", "sh", "zsh"}
+_MCP_INSPECTION_BASENAMES = {
+    "awk",
+    "egrep",
+    "fgrep",
+    "find",
+    "grep",
+    "head",
+    "ps",
+    "rg",
+    "sed",
+    "tail",
+    "xargs",
+}
+_MCP_PACKAGE_LAUNCHER_BASENAMES = {
+    "bun",
+    "npx",
+    "pnpm",
+    "uvx",
+    "yarn",
+}
+_MCP_TOML_SECTION_RE = re.compile(r"^\s*\[\s*mcp_servers(?:[.\]\s]|$)")
+_MCP_TOML_INLINE_RE = re.compile(r"^\s*mcp_servers\s*=")
+
+
+def _candidate_mcp_config_files(repo_root: Path) -> list[Path]:
+    candidates: set[Path] = set()
+    for rel in (
+        ".codex/config.toml",
+        ".codex/config.local.toml",
+        ".claude/mcp.json",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        ".cursor/mcp.json",
+        ".cursor/settings.json",
+        ".vscode/mcp.json",
+        ".vscode/settings.json",
+        "mcp.json",
+        "claude_desktop_config.json",
+    ):
+        path = repo_root / rel
+        if path.is_file():
+            candidates.add(path)
+    for dirname in _MCP_CONFIG_DIRS:
+        base = repo_root / dirname
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if path.is_file() and path.name in _MCP_CONFIG_FILENAMES:
+                candidates.add(path)
+    return sorted(candidates)
+
+
+def _scan_mcp_config_file(path: Path, repo_root: Path) -> list[str]:
+    try:
+        rel = path.relative_to(repo_root) if path.is_absolute() else path
+    except ValueError:
+        rel = path
+    text = _read_text_if_possible(path)
+    if not text:
+        return []
+
+    violations: list[str] = []
+    if path.suffix.lower() == ".json":
+        try:
+            import json
+
+            payload = json.loads(text)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("mcpServers", "mcp_servers"):
+                servers = payload.get(key)
+                if isinstance(servers, dict) and servers:
+                    violations.append(
+                        f"{rel}: active {key} entries are present: "
+                        f"{sorted(str(name) for name in servers.keys())}. "
+                        "MCP servers are disabled for this project unless "
+                        "explicitly re-enabled by the user."
+                    )
+
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+            continue
+        if _MCP_TOML_SECTION_RE.search(line) or _MCP_TOML_INLINE_RE.search(line):
+            violations.append(
+                f"{rel}:{lineno}: active mcp_servers TOML config is present. "
+                "Remove the section or keep MCP disabled unless the user "
+                "explicitly re-enables it."
+            )
+        if any(token in line for token in _MCP_PROCESS_TOKENS):
+            violations.append(
+                f"{rel}:{lineno}: MCP helper command token is present. "
+                "MCP helper processes must not be configured for this project "
+                "unless the user explicitly re-enables them."
+            )
+    return violations
+
+
+def check_no_active_mcp_server_config(
+    repo_root: Path | None = None,
+    config_paths: list[Path] | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Block repo-owned MCP server configs from being reintroduced.
+
+    The 2026-04-30 shutdown removed active MCP server entries from local app
+    configs. This repo-level check stays intentionally narrow: it scans
+    workspace-owned `.codex`, `.claude`, `.cursor`, and explicit config files,
+    while callers can pass `config_paths` for a one-off home-config audit.
+    """
+    root = repo_root or REPO_ROOT
+    candidates = _candidate_mcp_config_files(root)
+    if config_paths:
+        candidates.extend(Path(item).expanduser().resolve() for item in config_paths)
+    candidates = sorted({p.resolve(): p for p in candidates if p.is_file()}.values())
+
+    violations: list[str] = []
+    for path in candidates:
+        violations.extend(_scan_mcp_config_file(path, root))
+
+    if verbose:
+        if violations:
+            print(f"  [mcp-config-disabled] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print(
+                f"  [mcp-config-disabled] OK: {len(candidates)} repo-owned "
+                "MCP config file(s) scanned"
+            )
+    if violations and strict:
+        raise MetaBugViolation(
+            "ACTIVE MCP SERVER CONFIG DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nMCP servers are disabled for this project unless the user "
+            "explicitly re-enables them."
+        )
+    return violations
+
+
+def _split_process_command(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _process_arg_basename(arg: str) -> str:
+    return os.path.basename(arg.rstrip("/"))
+
+
+def _process_arg_matches_mcp_token(arg: str, token: str) -> bool:
+    base = _process_arg_basename(arg)
+    if base == token or base.startswith(f"{token}@"):
+        return True
+    parts = [part for part in arg.replace("\\", "/").split("/") if part]
+    return any(part == token or part.startswith(f"{token}@") for part in parts)
+
+
+def _classify_live_mcp_helper_command(command: str, *, shell_depth: int = 0) -> str | None:
+    argv = _split_process_command(command)
+    if not argv:
+        return None
+    base = _process_arg_basename(argv[0])
+
+    if base in _MCP_SHELL_BASENAMES and shell_depth < 2 and "-c" in argv:
+        index = argv.index("-c")
+        if index + 1 < len(argv):
+            return _classify_live_mcp_helper_command(
+                argv[index + 1],
+                shell_depth=shell_depth + 1,
+            )
+        return None
+
+    if base in {"command", "exec"} and len(argv) > 1:
+        tail = " ".join(shlex.quote(part) for part in argv[1:])
+        return _classify_live_mcp_helper_command(tail, shell_depth=shell_depth)
+
+    if base in _MCP_INSPECTION_BASENAMES:
+        return None
+
+    for token in _MCP_PROCESS_TOKENS:
+        if _process_arg_matches_mcp_token(argv[0], token):
+            return token
+
+    if base == "npm":
+        launch_indices = [
+            i for i, arg in enumerate(argv[1:], start=1) if arg in {"exec", "x"}
+        ]
+        search_from = (launch_indices[0] + 1) if launch_indices else len(argv)
+        for arg in argv[search_from:]:
+            for token in _MCP_PROCESS_TOKENS:
+                if _process_arg_matches_mcp_token(arg, token):
+                    return token
+        return None
+
+    if base in _MCP_PACKAGE_LAUNCHER_BASENAMES:
+        for arg in argv[1:]:
+            if arg.startswith("-"):
+                continue
+            for token in _MCP_PROCESS_TOKENS:
+                if _process_arg_matches_mcp_token(arg, token):
+                    return token
+        return None
+
+    if base.startswith("python"):
+        for index, arg in enumerate(argv[:-1]):
+            if arg == "-m":
+                module = argv[index + 1]
+                for token in _MCP_PROCESS_TOKENS:
+                    if module == token:
+                        return token
+        return None
+
+    for arg in argv[1:]:
+        for token in _MCP_PROCESS_TOKENS:
+            if _process_arg_matches_mcp_token(arg, token):
+                return token
+    return None
+
+
+def _scan_live_mcp_process_rows(
+    rows: list[str],
+    *,
+    current_pid: int | None = None,
+) -> list[str]:
+    violations: list[str] = []
+    for raw in rows:
+        line = raw.strip()
+        if not line:
+            continue
+        pid_text, _, command = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            pid = None
+            command = line
+        if current_pid is not None and pid == current_pid:
+            continue
+        token = _classify_live_mcp_helper_command(command)
+        if token is not None:
+            label = f"pid {pid}" if pid is not None else "unknown pid"
+            violations.append(
+                f"{label}: live MCP helper process ({token}) is running: {command}. "
+                "Kill MCP helpers before contest/eval work unless the user "
+                "explicitly re-enables MCP."
+            )
+    return violations
+
+
+def check_no_live_mcp_processes(
+    *,
+    process_rows: list[str] | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Block already-running MCP helpers from silently reappearing.
+
+    Config checks catch future launches; this live-process check catches the
+    orphaned helper class that can survive after configs are emptied.
+    """
+    if process_rows is None:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        process_rows = proc.stdout.splitlines() if proc.returncode == 0 else []
+
+    violations = _scan_live_mcp_process_rows(
+        process_rows,
+        current_pid=os.getpid(),
+    )
+
+    if verbose:
+        if violations:
+            print(f"  [mcp-processes-disabled] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print("  [mcp-processes-disabled] OK: no live MCP helpers found")
+    if violations and strict:
+        raise MetaBugViolation(
+            "LIVE MCP HELPER PROCESS DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nKill MCP helper processes before contest/eval work unless "
+            "the user explicitly re-enables MCP."
+        )
+    return violations
+
+
+# Heredoc start: `<< [-]['"]?TOKEN['"]?` after a redirect-or-no-redirect operator.
+# We deliberately accept all heredoc forms: <<TOKEN, <<-TOKEN, <<"TOKEN",
+# <<'TOKEN', << TOKEN, <<- TOKEN, etc. The matched group 'token' is the bare
+# delimiter (quotes/dashes stripped). Tab/space separation between << and the
+# token is allowed by bash and by us.
+_HEREDOC_START_RE = re.compile(
+    r"""
+    <<-?\s*                  # << or <<- with optional whitespace
+    (?P<quote>['"])?         # optional opening quote
+    (?P<token>[A-Za-z_][A-Za-z0-9_]*)  # delimiter token
+    (?(quote)(?P=quote))     # closing quote (must match opener)
+    """,
+    re.VERBOSE,
+)
+
+
+def _mask_shell_heredocs(text: str) -> str:
+    """Replace bash heredoc bodies with empty lines.
+
+    Preserves total line count so reported lineno still matches the source.
+    Without this, shell scanners would treat heredoc bodies (which can
+    legitimately contain `set -uo pipefail`, `zip foo.zip bar`, `| grep -q`
+    as Python/docs/embedded snippets) as executable shell.
+
+    Behavior:
+      • Detects every `<<TOKEN`, `<<-TOKEN`, `<< TOKEN`, `<<"TOKEN"`,
+        `<<'TOKEN'` heredoc start on a non-comment line.
+      • Skips ahead until the next line whose stripped content equals TOKEN
+        (or, for `<<-TOKEN`, leading tabs are also stripped per bash).
+      • Replaces lines BETWEEN the start (exclusive) and the terminator
+        (exclusive) with empty strings. The start line itself is preserved
+        (so a violation written on the start line — unusual — is still
+        visible) and the terminator line is preserved.
+      • If multiple heredocs start on the same line (rare: `cmd <<A <<B`),
+        we mask both bodies in order, requiring A then B as terminators.
+      • A heredoc with no terminator (eof) means everything from start+1
+        to EOF is masked. This matches bash's runtime behavior of erroring,
+        but for static analysis "treat as quoted" is the safer call than
+        "treat as code".
+    """
+    lines = text.split("\n")
+    out_lines = list(lines)  # mutable copy
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Skip comment-only lines for heredoc-start detection.
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            i += 1
+            continue
+        # Find ALL heredoc starts on this line (e.g. `cmd <<A <<B`).
+        # Order matters: bash reads bodies in left-to-right order.
+        matches = list(_HEREDOC_START_RE.finditer(line))
+        if not matches:
+            i += 1
+            continue
+        # Tokens to consume in order. Track whether each was `<<-` form
+        # (which strips leading TABS — not spaces — from the terminator
+        # comparison per POSIX).
+        pending: list[tuple[str, bool]] = []
+        for m in matches:
+            token = m.group("token")
+            stripped_form = line[max(0, m.start() - 1):m.start() + 3].lstrip("<")
+            # Simpler & robust: look at the raw match text from `<<` onward.
+            raw = line[m.start():m.end()]
+            is_dash = raw.startswith("<<-")
+            pending.append((token, is_dash))
+        j = i + 1
+        while pending and j < len(lines):
+            cand = lines[j]
+            token, is_dash = pending[0]
+            cmp = cand.lstrip("\t") if is_dash else cand
+            if cmp == token:
+                # Terminator hit — pop it; stop masking this body.
+                pending.pop(0)
+                j += 1
+                continue
+            # Mask this body line (preserve line count by emitting empty).
+            out_lines[j] = ""
+            j += 1
+        # If pending non-empty here, we hit EOF without terminator.
+        # Lines i+1..end are already masked above. Continue past current.
+        i = j
+    return "\n".join(out_lines)
+
+
+# ── Check 1: MPS-fallback device default ──────────────────────────────────────
+
+
+def _scan_python_for_mps_fallback(path: Path, repo_root: Path) -> list[str]:
+    """Detect `... else "mps" ...` ternaries triggered when CUDA is missing.
+
+    Two layers:
+      A. AST: an IfExp where the test calls `.cuda.is_available()` and the
+         orelse contains the literal `"mps"` (either directly or as a nested
+         IfExp orelse leaf).
+      B. Text: a regex backup catches one-liners that span multiple ternaries,
+         covering the common `"cuda" if ... else "mps" if ... else "cpu"`.
+
+    Tests / smoke files are skipped — they may legitimately probe MPS.
+    Vendored external PR-head clones under
+    ``experiments/results/.../pr_heads/`` and other reverse-engineering /
+    forensics mirrors are also skipped — they are read-only mirrors of other
+    competitors' submissions, not our own code, and we cannot retroactively
+    fix their MPS-fallback defaults.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name or "/smoke" in rel_s.lower():
+        return []
+    # Vendored external code (PR-head mirrors, reverse-engineering snapshots,
+    # leaderboard-intel raw clones, public-frontier intake replays). These are
+    # not our code; we don't ship them; we cannot fix their device defaults.
+    _VENDORED_PATH_MARKERS = (
+        "/pr_heads/",
+        "/leaderboard_intel_",
+        "/reverse_engineering_",
+        "/public_runtime_adapters_",
+        "/raw/kaggle_ingest/",
+        "/vendored/",
+        # Mirrored external public-PR intake clones — e.g.
+        # experiments/results/public_pr*_intake_*/{source,repo,pr*_src}/...
+        "_intake_",
+        # Upstream contest baseline (av1_crf31_bicubic) — vendored from
+        # comma's organizer baseline submission, not our code.
+        "/av1_crf31_bicubic/",
+    )
+    if any(marker in rel_s for marker in _VENDORED_PATH_MARKERS):
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    violations: list[str] = []
+
+    def _orelse_mentions_mps(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and sub.value == "mps":
+                return True
+        return False
+
+    def _test_checks_cuda(node: ast.AST) -> bool:
+        s = ast.unparse(node) if hasattr(ast, "unparse") else ""
+        return "cuda.is_available" in s or "torch.cuda.is_available" in s
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.IfExp):
+            if _test_checks_cuda(node.test) and _orelse_mentions_mps(node.orelse):
+                violations.append(
+                    f"{rel}:{node.lineno}: ternary `cuda.is_available() ... "
+                    f"else \"mps\" ...` — MPS-fallback device default. "
+                    f"FORBIDDEN per CLAUDE.md (feedback_default_to_convenience_trap). "
+                    f"Default to CUDA-required; raise on no-CUDA; provide "
+                    f"explicit `--device cpu` opt-in."
+                )
+
+    # codex R5-3 #7: BoolOp (and/or) device-selection chains. Pattern:
+    #   torch.cuda.is_available() and 'cuda' or torch.backends.mps.is_available() and 'mps' or 'cpu'
+    # Has no IfExp anywhere — must AST-walk BoolOp explicitly. Rule (refined
+    # to avoid the FP class `... or str(self.device) == "mps"` where "mps"
+    # is INSIDE a Compare and never selected as a value):
+    #   1. Walk top-level BoolOps (not nested inside Compare / Subscript /
+    #      Call / etc. — only BoolOps that COULD evaluate to the string
+    #      "mps" as a result).
+    #   2. The BoolOp tree must contain a `cuda.is_available()` call.
+    #   3. A string constant "mps" must appear as a DIRECT leaf operand of
+    #      a BoolOp value subtree (i.e., reachable by following only
+    #      BoolOp.values links, not by descending into Compare/Call/etc.).
+    #      That's exactly the position where a fallback chain would put it.
+    def _bool_value_leaves(node: ast.BoolOp):
+        """Yield every node that can be the BoolOp's RESULT value."""
+        for v in node.values:
+            if isinstance(v, ast.BoolOp):
+                yield from _bool_value_leaves(v)
+            else:
+                yield v
+
+    def _tree_has_cuda_check(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                s = ast.unparse(sub.func) if hasattr(ast, "unparse") else ""
+                if "cuda.is_available" in s:
+                    return True
+        return False
+
+    seen_boolop_lines: set[int] = set()
+    # Find OUTERMOST BoolOps only (so a nested BoolOp inside another BoolOp
+    # doesn't double-count). Easiest: collect parent links once.
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BoolOp):
+            continue
+        # Skip nested BoolOps — only flag the outermost.
+        p = parents.get(id(node))
+        if isinstance(p, ast.BoolOp):
+            continue
+        if node.lineno in seen_boolop_lines:
+            continue
+        if not _tree_has_cuda_check(node):
+            continue
+        # Check leaves: is "mps" a result-position string constant?
+        # Note: an `IfExp` inside a BoolOp value is treated as a value
+        # (we recurse the IfExp body+orelse for "mps").
+        is_fallback = False
+        for leaf in _bool_value_leaves(node):
+            # leaf can itself be an IfExp / Constant / Call / etc.
+            if isinstance(leaf, ast.Constant) and leaf.value == "mps":
+                is_fallback = True
+                break
+            if isinstance(leaf, ast.IfExp):
+                for sub in ast.walk(leaf):
+                    if isinstance(sub, ast.Constant) and sub.value == "mps":
+                        is_fallback = True
+                        break
+                if is_fallback:
+                    break
+        if is_fallback:
+            violations.append(
+                f"{rel}:{node.lineno}: BoolOp chain `... cuda.is_available() "
+                f"... 'mps' ...` — MPS-fallback device default. FORBIDDEN per "
+                f"CLAUDE.md (feedback_default_to_convenience_trap). Default "
+                f"to CUDA-required; raise on no-CUDA; provide explicit "
+                f"`--device cpu` opt-in."
+            )
+            seen_boolop_lines.add(node.lineno)
+
+    # Text backup: one-line chains that AST already caught are deduped by lineno.
+    seen_lines = {int(v.split(":")[1]) for v in violations}
+    pat = re.compile(r'"cuda".*cuda\.is_available\(\).*else\s*"mps"')
+    for i, line in enumerate(text.splitlines(), start=1):
+        if i in seen_lines:
+            continue
+        if pat.search(line):
+            violations.append(
+                f"{rel}:{i}: chained ternary with `\"cuda\" if "
+                f"cuda.is_available() else \"mps\"` — MPS-fallback device "
+                f"default. FORBIDDEN per CLAUDE.md "
+                f"(feedback_default_to_convenience_trap)."
+            )
+    return violations
+
+
+def check_no_mps_fallback_default(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch the MPS-fallback device default bug class.
+
+    Reference: feedback_default_to_convenience_trap (CLAUDE.md FORBIDDEN
+    PATTERNS). Defaulting to "mps" when CUDA is unavailable produces silent
+    drift (23x PoseNet error verified 2026-04-25). Default must be
+    CUDA-required; opt-in to CPU/MPS only via explicit flag with banner.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_python_for_mps_fallback(py, root))
+
+    if verbose and violations:
+        print(f"  [no-mps-fallback] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-mps-fallback] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "MPS-FALLBACK DEFAULT violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nMPS auth eval is NOISE — see CLAUDE.md "
+            "feedback_default_to_convenience_trap. Default to CUDA-required."
+        )
+    return violations
+
+
+# ── Check 2: shell `set -uo pipefail` without `set -e` ────────────────────────
+
+
+def _scan_shell_for_missing_set_e(path: Path, repo_root: Path) -> list[str]:
+    """Find `set -` lines that include `u` or `o pipefail` but NOT `e`."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    # codex R5-3 #5: mask heredoc bodies so embedded Python/docs don't
+    # register as executable shell.
+    text = _mask_shell_heredocs(text)
+    violations: list[str] = []
+    # We accept any `set` line as long as somewhere in the file `set -e`
+    # (or set -euo / -ex etc.) is present. Track presence first.
+    has_e_anywhere = False
+    set_lines: list[tuple[int, str]] = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped.startswith("set "):
+            continue
+        # Drop comments after `#`
+        no_comment = stripped.split("#", 1)[0].strip()
+        # Detect short flags like `-e`, `-eu`, `-euo`
+        m = re.match(r"set\s+-([a-zA-Z]+)", no_comment)
+        if m and "e" in m.group(1):
+            has_e_anywhere = True
+        # Or `set -o errexit`
+        if "errexit" in no_comment:
+            has_e_anywhere = True
+        set_lines.append((i, no_comment))
+
+    if has_e_anywhere:
+        return []
+
+    for lineno, line in set_lines:
+        # Only flag lines that USE u or pipefail (the dangerous combo).
+        m = re.match(r"set\s+-([a-zA-Z]+)", line)
+        flags = m.group(1) if m else ""
+        uses_u = "u" in flags
+        uses_pipefail = "o" in flags and "pipefail" in line
+        if uses_u or uses_pipefail:
+            violations.append(
+                f"{rel}:{lineno}: `{line}` uses `u`/`pipefail` without `e`. "
+                f"Silent failure cascade: a failing command does not abort "
+                f"the script — empty captures pass to argparse and crash "
+                f"30 minutes later. Use `set -euo pipefail`. "
+                f"(feedback_zip_dep_bootstrap_trap.)"
+            )
+    return violations
+
+
+def check_shell_set_e_present(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch `set -uo pipefail` without `set -e` shell footgun.
+
+    Reference: feedback_zip_dep_bootstrap_trap. Without `-e`, a failing
+    `zip` or `python` command does not abort the script. Empty captured
+    variables flow downstream and crash auth_eval 30 minutes later.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for sh in _iter_shell_files(root, _META_SH_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_shell_for_missing_set_e(sh, root))
+
+    if verbose and violations:
+        print(f"  [set-e-required] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [set-e-required] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SHELL `set -e` MISSING violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nUse `set -euo pipefail` (feedback_zip_dep_bootstrap_trap)."
+        )
+    return violations
+
+
+# ── Check 3: shell `zip` binary use ───────────────────────────────────────────
+
+
+# Match `zip` (whitespace-bounded) but NOT `zipfile`, `unzip`, `gunzip`,
+# `gzip`, `bzip2`, `gunzip2`, etc. We require `zip` to appear after a
+# command boundary (start of line, `;`, `&&`, `||`, `|`, `(`, or `$(`)
+# OPTIONALLY preceded by env vars / sudo, and followed by whitespace.
+_ZIP_BIN_RE = re.compile(
+    r'(?:^|[;&|()`]|\$\()\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:sudo\s+)?zip(?=[\s\\])'
+)
+
+
+def _scan_shell_for_zip_binary(path: Path, repo_root: Path) -> list[str]:
+    """Find use of the shell `zip` binary (which is missing on PyTorch
+    container images). Allow `python -c '...zipfile...'` and `unzip`."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    # codex R5-3 #5: mask heredoc bodies so embedded Python (which often
+    # imports zipfile) doesn't register as a shell `zip` invocation.
+    text = _mask_shell_heredocs(text)
+    violations: list[str] = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Skip lines that are clearly invoking python with zipfile
+        if "zipfile" in stripped:
+            continue
+        if _ZIP_BIN_RE.search(stripped):
+            violations.append(
+                f"{rel}:{i}: shell `zip` binary not present on PyTorch "
+                f"container images. Use `python -c \"import zipfile; ...\"` "
+                f"instead. (feedback_zip_dep_bootstrap_trap.)"
+            )
+    return violations
+
+
+def check_no_shell_zip_binary(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch shell `zip` binary use (missing on PyTorch container images).
+
+    Reference: feedback_zip_dep_bootstrap_trap. The PyTorch base container
+    has no `zip` (but `unzip` is separate and OK). Use `python zipfile`.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for sh in _iter_shell_files(root, _META_SH_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_shell_for_zip_binary(sh, root))
+
+    if verbose and violations:
+        print(f"  [no-shell-zip] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-shell-zip] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SHELL `zip` BINARY violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nUse `python -c \"import zipfile\"` "
+            "(feedback_zip_dep_bootstrap_trap)."
+        )
+    return violations
+
+
+# ── Check 4: pipefail + `grep -q` SIGPIPE trap ────────────────────────────────
+
+
+# codex R5-3 #6: LHS commands that are SAFE upstream of `| grep -q`.
+# echo/printf are shell builtins that do not SIGPIPE meaningfully — they
+# write a fixed-size buffer once and exit. The capture-first remediation
+# (`OUT=$(cmd 2>&1); echo "$OUT" | grep -q ...`) MUST be allowed; otherwise
+# the scanner flags its own prescribed fix.
+_SAFE_GREP_Q_UPSTREAM_CMDS = ("echo", "printf")
+
+
+def _grep_q_lhs_is_safe(lhs: str) -> bool:
+    """Return True iff the pipe LHS is a safe builtin (echo/printf).
+
+    Strips leading whitespace and any inline `!`/negation chains (e.g.
+    `if ! echo "$X"`), then checks if the first token is a safe cmd.
+    """
+    s = lhs.strip()
+    # Drop common shell preludes that don't change the upstream cmd:
+    #   `if ! `, `! `, `&& `, `|| `, `; `, `then `, `do `, `{ `
+    # Accept any chain of these prefixes once, then look at the next token.
+    prefix_re = re.compile(
+        r"^(?:if\s+)?(?:then\s+)?(?:do\s+)?(?:while\s+)?"
+        r"(?:!\s+)?(?:\{?\s*)"
+    )
+    s = prefix_re.sub("", s).lstrip()
+    # Bare token check: first whitespace-separated token.
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\b", s)
+    if not m:
+        return False
+    return m.group(1) in _SAFE_GREP_Q_UPSTREAM_CMDS
+
+
+def _scan_shell_for_pipefail_grep_q(path: Path, repo_root: Path) -> list[str]:
+    """Find `... | grep -q PATTERN` lines under `set -e`/`pipefail`.
+
+    grep -q closes stdin after first match; the upstream cmd then SIGPIPEs;
+    pipefail propagates that as failure; `set -e` aborts the script.
+    Remediation: capture-first idiom (`OUT=$(cmd); echo "$OUT" | grep -q ...`).
+
+    codex R5-3 #6 exemptions:
+      • `echo "$VAR" | grep -q PAT` — echo is a builtin, no meaningful SIGPIPE.
+      • `printf "..." | grep -q PAT` — same.
+      • `grep -q PAT <<< "$VAR"` — here-string, no pipe at all.
+      These forms are the prescribed fix for the bug class — flagging them
+      would block the remediation.
+    codex R5-3 #5: heredoc bodies are masked before scanning.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    text = _mask_shell_heredocs(text)
+    # Only fire if file has set -e or pipefail somewhere.
+    has_pipefail_or_e = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("set "):
+            continue
+        no_comment = stripped.split("#", 1)[0].strip()
+        m = re.match(r"set\s+-([a-zA-Z]+)", no_comment)
+        if m and "e" in m.group(1):
+            has_pipefail_or_e = True
+        if "pipefail" in no_comment or "errexit" in no_comment:
+            has_pipefail_or_e = True
+    if not has_pipefail_or_e:
+        return []
+
+    grep_q_re = re.compile(r"\|\s*grep\s+-[a-zA-Z]*q")
+    here_string_re = re.compile(r"grep\s+-[a-zA-Z]*q\b[^|]*<<<")
+    violations: list[str] = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        # Skip comments
+        if line.lstrip().startswith("#"):
+            continue
+        # Here-string form `grep -q PAT <<< "$VAR"` is exempt.
+        if here_string_re.search(line):
+            continue
+        m = grep_q_re.search(line)
+        if not m:
+            continue
+        # Inspect the LHS (everything before this `|`). If it ends with
+        # `echo ...` or `printf ...`, exempt. Use rfind to handle chains
+        # like `cmd1 | cmd2 | grep -q ...`: only the IMMEDIATE upstream
+        # matters for SIGPIPE on grep -q.
+        # m.start() points at the `|` of the `| grep -q` pattern; the
+        # upstream cmd is whatever follows the previous pipe (or line start).
+        upstream_end = m.start()
+        prev_pipe = line.rfind("|", 0, upstream_end)
+        upstream_start = prev_pipe + 1 if prev_pipe >= 0 else 0
+        lhs = line[upstream_start:upstream_end]
+        if _grep_q_lhs_is_safe(lhs):
+            continue
+        violations.append(
+            f"{rel}:{i}: `| grep -q` under `set -e`/`pipefail` triggers "
+            f"SIGPIPE on the upstream command — pipeline aborts the "
+            f"script. Capture-first idiom: "
+            f"`OUT=$(cmd 2>&1); echo \"$OUT\" | grep -q ...`. "
+            f"(feedback_pipefail_grep_q_trap.)"
+        )
+    return violations
+
+
+def check_no_pipefail_grep_q_trap(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch `pipefail + grep -q` SIGPIPE trap.
+
+    Reference: feedback_pipefail_grep_q_trap. `cmd | grep -q PAT` under
+    `set -euo pipefail` SIGPIPEs the upstream when grep stops reading
+    after first match. Whole pipeline reports failure → script aborts.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for sh in _iter_shell_files(root, _META_SH_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_shell_for_pipefail_grep_q(sh, root))
+
+    if verbose and violations:
+        print(f"  [no-pipefail-grep-q] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-pipefail-grep-q] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PIPEFAIL + GREP -Q violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nUse capture-first idiom (feedback_pipefail_grep_q_trap)."
+        )
+    return violations
+
+
+# ── Check 5: eval_roundtrip=False anywhere ────────────────────────────────────
+
+
+def _scan_python_for_eval_roundtrip_false(path: Path, repo_root: Path) -> list[str]:
+    """Detect:
+      A. `eval_roundtrip=False` keyword in any call.
+      B. `def foo(..., eval_roundtrip: bool = False, ...)` default.
+      C. `def foo(..., eval_roundtrip = False, ...)` default (untyped).
+    Test/smoke files are exempt.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name:
+        return []
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    violations: list[str] = []
+
+    # A. Keyword-arg call sites: foo(..., eval_roundtrip=False, ...)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "eval_roundtrip" and isinstance(kw.value, ast.Constant) \
+                        and kw.value.value is False:
+                    violations.append(
+                        f"{rel}:{node.lineno}: call passes "
+                        f"`eval_roundtrip=False`. NON-NEGOTIABLE per CLAUDE.md: "
+                        f"every training path must use eval_roundtrip. Only "
+                        f"escape hatch is env var TAC_ALLOW_NO_ROUNDTRIP=1."
+                    )
+
+    # B/C. Function defaults
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        args = node.args
+        # Combine positional and keyword-only with their defaults.
+        all_args = list(args.args) + list(args.kwonlyargs)
+        # positional defaults align to the TAIL of args.args
+        pos_defaults = [None] * (len(args.args) - len(args.defaults)) + list(args.defaults)
+        kw_defaults = list(args.kw_defaults)
+        all_defaults = pos_defaults + kw_defaults
+        for a, d in zip(all_args, all_defaults):
+            if a.arg != "eval_roundtrip" or d is None:
+                continue
+            if isinstance(d, ast.Constant) and d.value is False:
+                violations.append(
+                    f"{rel}:{node.lineno}: function `{node.name}` defaults "
+                    f"`eval_roundtrip=False`. NON-NEGOTIABLE per CLAUDE.md: "
+                    f"default must be True; only escape hatch is env var "
+                    f"TAC_ALLOW_NO_ROUNDTRIP=1."
+                )
+    return violations
+
+
+def check_no_eval_roundtrip_false(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch eval_roundtrip=False anywhere (call site or function default).
+
+    Reference: CLAUDE.md "eval_roundtrip — NON-NEGOTIABLE". Without
+    eval_roundtrip, proxy-auth gap is 2-6x on PoseNet. Every training run
+    without it is a wasted run.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_python_for_eval_roundtrip_false(py, root))
+
+    if verbose and violations:
+        print(f"  [no-eval-roundtrip-false] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-eval-roundtrip-false] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "eval_roundtrip=False violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\neval_roundtrip is non-negotiable (CLAUDE.md)."
+        )
+    return violations
+
+
+# ── Check 6: scorer load at inflate time ──────────────────────────────────────
+
+
+# Patterns indicating a scorer is being loaded at inflate time. Per
+# feedback_strict_scorer_rule, NO scorers may be loaded at inflate.
+_SCORER_LOAD_NAMES = (
+    "load_scorers", "load_posenet", "load_segnet",
+    "load_differentiable_scorers",
+    "PoseNet(", "SegNet(",  # direct instantiation
+)
+_SCORER_NAME_LITERALS_RE = re.compile(r"\b(posenet|segnet)\b", re.IGNORECASE)
+
+# 2026-04-27 codex R5-4 #2: the previous scanner only matched static
+# `from tac.scorer import ...` and call names ending with known loader
+# function names. Live inflate scripts deliberately bypassed this with
+# `importlib.import_module("tac.scorer")` + `getattr(mod, "load_scorers")`,
+# producing a FALSE-clean strict scan while real scorer-at-inflate code
+# remained env-gated in production. The scanner now AST-walks for:
+#   1. importlib.import_module("tac.scorer*")
+#   2. importlib.util.find_spec("tac.scorer*")
+#   3. __import__("tac.scorer*")
+#   4. getattr(<expr>, "load_scorers"|"load_posenet"|...)
+# AND respects an explicit `# SCORER_AT_INFLATE_WAIVED:<reason>` comment
+# marker (SAME LINE only — codex R5-r6 #1 tightened this from a 6-line
+# lookback because nearby markers could waive unrelated calls). Waived
+# violations are counted separately and surfaced to the operator so the
+# gate cannot be silently bypassed — strict means "no UNWAIVED violations".
+_DYNAMIC_IMPORT_FUNCS = (
+    "importlib.import_module",
+    "importlib.util.find_spec",
+    "__import__",
+)
+_GETATTR_LOADER_NAMES = frozenset({
+    "load_scorers", "load_posenet", "load_segnet",
+    "load_differentiable_scorers", "load_posenet_targets",
+    "extract_gt_pose_targets",
+})
+_SCORER_MODULE_PREFIX = "tac.scorer"  # matches tac.scorer, tac.scorer_targets, …
+_WAIVER_MARKER = "SCORER_AT_INFLATE_WAIVED"
+# 2026-04-27 codex R5-r6 #1 fix: lookback is now SAME-LINE ONLY.
+# The previous 6-line lookback meant a marker intended for one specific
+# pending-ruling import could waive an UNRELATED scorer load inserted
+# nearby (or above, in the same try-block). The failure message even
+# said "3 lines" while the constant was 6 — operators couldn't audit
+# what a marker actually covered. Same-line policy:
+#   - Marker MUST be in a comment on the SAME line as the offending call.
+#   - For multi-line statements (e.g., a getattr(...) split across lines),
+#     each call on each line needs its own same-line marker because the
+#     AST records lineno per-call.
+#   - The legacy `# noqa: scorer-at-inflate` form is also recognised, but
+#     ONLY on the same line.
+# Same-line enforcement is the only policy that is auditable without a
+# walker — every waiver is structurally attached to the specific call
+# being waived. Block-style waivers (a marker comment above a try-block)
+# are no longer recognised by the scanner; existing block markers must be
+# moved onto each offending call line.
+_WAIVER_LOOKBACK_LINES = 0  # SAME-LINE ONLY (was 6 → bug → fixed in R5-r6 #1)
+
+
+def _line_is_waived(lines: list[str], lineno: int) -> bool:
+    """Return True if `lineno` (1-based) carries an explicit waiver marker
+    on the SAME line.
+
+    A waiver is recognised only on the same line as the offending call
+    (codex R5-r6 #1). The marker must appear inside a comment (`#`-anywhere
+    on that line is fine; we never match inside a string literal because
+    we only scan the post-# segment). We also accept the legacy
+    `# noqa: scorer-at-inflate (...)` form so existing inflate scripts
+    keep working — but only when it's on the same line.
+    """
+    if lineno <= 0 or lineno > len(lines):
+        return False
+    # Same-line only: do NOT walk preceding lines.
+    line = lines[lineno - 1]
+    if "#" not in line:
+        return False
+    comment = line[line.index("#"):]
+    if _WAIVER_MARKER in comment:
+        return True
+    if "noqa: scorer-at-inflate" in comment:
+        return True
+    return False
+
+
+def _string_constant_arg(call: ast.Call) -> str | None:
+    """Return the first positional arg of `call` if it is a string literal,
+    else None. Handles `import_module("tac.scorer")` and `getattr(m, "x")`
+    forms — for getattr we want the SECOND arg (index 1), so callers
+    pass `call.args[idx]` instead."""
+    if not call.args:
+        return None
+    a = call.args[0]
+    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+        return a.value
+    return None
+
+
+def _scan_inflate_for_scorer_load(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect scorer-load patterns in inflate*.py files. Returns UNWAIVED
+    violations only — waived hits are reported separately by the caller
+    (see `_scan_inflate_for_scorer_load_with_waivers`)."""
+    unwaived, _waived = _scan_inflate_for_scorer_load_with_waivers(path, repo_root)
+    return unwaived
+
+
+def _scan_inflate_for_scorer_load_with_waivers(
+    path: Path, repo_root: Path,
+) -> tuple[list[str], list[str]]:
+    """Detect scorer-load patterns in inflate*.py files.
+
+    Returns (unwaived_violations, waived_violations). Unwaived violations
+    fail strict-mode preflight; waived violations are surfaced to the
+    operator so the count of pending-ruling waivers is visible.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        # .sh files won't parse — fall back to text scan.
+        text = ""
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, FileNotFoundError):
+            return [], []
+        tree = None
+
+    unwaived: list[str] = []
+    waived: list[str] = []
+    lines = text.splitlines()
+
+    def _record(lineno: int, msg: str) -> None:
+        full = f"{rel}:{lineno}: {msg}"
+        if _line_is_waived(lines, lineno):
+            waived.append(full)
+        else:
+            unwaived.append(full)
+
+    if tree is not None:
+        # AST walk: detect static imports, dynamic imports, getattr-loaders,
+        # and direct loader-call patterns.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if (_SCORER_MODULE_PREFIX in node.module
+                        or node.module == _SCORER_MODULE_PREFIX):
+                    for alias in node.names:
+                        _record(
+                            node.lineno,
+                            f"imports {alias.name!r} from {node.module} at "
+                            f"inflate time. Strict scorer rule (CLAUDE.md "
+                            f"feedback_strict_scorer_rule): NO scorer load "
+                            f"at inflate; ~73MB destroys the rate term.",
+                        )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name and _SCORER_MODULE_PREFIX in alias.name:
+                        _record(
+                            node.lineno,
+                            f"imports module {alias.name!r} at inflate time. "
+                            f"Strict scorer rule (feedback_strict_scorer_rule).",
+                        )
+            if isinstance(node, ast.Call):
+                func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+
+                # 1. Direct loader call (load_scorers, load_posenet, …).
+                for name in ("load_scorers", "load_posenet", "load_segnet",
+                             "load_differentiable_scorers"):
+                    if func_str.endswith(name) and func_str != f"_{name}":
+                        # Skip the helper-name shadows like `_resolve_scorers`
+                        # (renamed in inflate_postfilter.py to avoid the
+                        # static endswith match — those are now caught via
+                        # the getattr path below).
+                        _record(
+                            node.lineno,
+                            f"calls `{func_str}(...)` at inflate time. "
+                            f"Strict scorer rule (feedback_strict_scorer_rule): "
+                            f"NO scorer load at inflate.",
+                        )
+                        break
+
+                # 2. Dynamic imports: importlib.import_module("tac.scorer*"),
+                #    importlib.util.find_spec("tac.scorer*"),
+                #    __import__("tac.scorer*").
+                if (func_str.endswith("import_module")
+                        or func_str.endswith("find_spec")
+                        or func_str == "__import__"
+                        or func_str.endswith(".__import__")):
+                    s = _string_constant_arg(node)
+                    if s and _SCORER_MODULE_PREFIX in s:
+                        _record(
+                            node.lineno,
+                            f"dynamic import `{func_str}({s!r})` at inflate "
+                            f"time. Strict scorer rule "
+                            f"(feedback_strict_scorer_rule). Add an explicit "
+                            f"`# {_WAIVER_MARKER}:<reason>` marker if this is "
+                            f"an env-gated pending-ruling path.",
+                        )
+
+                # 3. getattr(<x>, "load_scorers"|"load_posenet"|...) — the
+                #    canonical companion to importlib.import_module that
+                #    used to slip through the scanner.
+                if (func_str == "getattr" or func_str.endswith(".getattr")):
+                    if len(node.args) >= 2 and isinstance(
+                        node.args[1], ast.Constant,
+                    ) and isinstance(node.args[1].value, str):
+                        attr = node.args[1].value
+                        if attr in _GETATTR_LOADER_NAMES:
+                            _record(
+                                node.lineno,
+                                f"getattr(..., {attr!r}) at inflate time "
+                                f"resolves a scorer loader. Strict scorer rule "
+                                f"(feedback_strict_scorer_rule). Add "
+                                f"`# {_WAIVER_MARKER}:<reason>` if env-gated.",
+                            )
+    else:
+        # Shell file fallback: any line mentioning posenet.bin / segnet.bin
+        # / safetensors.load near scorer keywords.
+        for i, line in enumerate(text.splitlines(), start=1):
+            low = line.lower()
+            if "scorer" in low and ("load" in low or "import" in low):
+                msg = (
+                    f"{rel}:{i}: shell line references scorer load at "
+                    f"inflate time (CLAUDE.md feedback_strict_scorer_rule)."
+                )
+                if _line_is_waived(lines, i):
+                    waived.append(msg)
+                else:
+                    unwaived.append(msg)
+    return unwaived, waived
+
+
+def check_no_scorer_load_at_inflate(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch any scorer load at inflate time.
+
+    Reference: feedback_strict_scorer_rule (CLAUDE.md "Strict scorer rule").
+    NO PoseNet/SegNet load at inflate — those weights would have to live
+    in archive.zip per Yousfi PR #35, destroying the rate term.
+
+    Scans `submissions/*/inflate*.py` and `submissions/*/inflate.sh`.
+    Returns list of UNWAIVED violations. Raises MetaBugViolation if strict
+    and any unwaived hits remain. Waived hits (those marked with
+    `# SCORER_AT_INFLATE_WAIVED:<reason>`) are surfaced in verbose output
+    but do NOT block strict mode — operators can see exactly how many
+    pending-ruling paths exist.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    waived: list[str] = []
+    n_scanned = 0
+    submissions = root / "submissions"
+    if submissions.exists():
+        for sub_dir in sorted(submissions.iterdir()):
+            if not sub_dir.is_dir():
+                continue
+            for p in sorted(sub_dir.glob("inflate*.py")):
+                n_scanned += 1
+                u, w = _scan_inflate_for_scorer_load_with_waivers(p, root)
+                violations.extend(u)
+                waived.extend(w)
+            for p in sorted(sub_dir.glob("inflate*.sh")):
+                n_scanned += 1
+                u, w = _scan_inflate_for_scorer_load_with_waivers(p, root)
+                violations.extend(u)
+                waived.extend(w)
+
+    if verbose and violations:
+        print(f"  [no-scorer-at-inflate] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-scorer-at-inflate] OK: {n_scanned} inflate files scanned")
+    if verbose and waived:
+        print(
+            f"  [no-scorer-at-inflate] {len(waived)} WAIVED hit(s) "
+            f"(env-gated, pending-ruling — visible to operator):"
+        )
+        for v in waived:
+            print(f"    ◇ {v}")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SCORER LOAD AT INFLATE violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nNo scorer at inflate time (feedback_strict_scorer_rule). "
+            + "If this is an env-gated pending-ruling path, add an explicit "
+            + f"`# {_WAIVER_MARKER}:<reason>` comment marker on the SAME "
+            + "line as the offending call (codex R5-r6 #1: block-level / "
+            + "lookback markers are no longer recognised — every waiver must "
+            + "be structurally attached to its specific call site)."
+        )
+    return violations
+
+
+# ── Check 7: training scripts MUST end with auth eval ─────────────────────────
+
+
+# codex R5-3 #8: tokens that mark a path string (literal) as referring to a
+# RENDERER artifact (the only thing that requires auth-eval — LoRA adapters,
+# postfilters, statistics tensors, etc. do not). Match is case-insensitive
+# on the path basename. We deliberately exclude generic "best"/"state_dict"
+# from this list — those are too broad and produced FPs (lora_best.pt
+# was misclassified as a renderer in the regex era).
+_RENDERER_PATH_TOKENS = ("renderer", "checkpoint", "fp4")
+# Generic "model" matches lora_*.pt / postfilter_*.pt FALSELY less often
+# than expected, but we keep "model" because a path like `model_best.pt`
+# IS likely a renderer. To minimize FPs the renderer-detector ALSO requires
+# the dict being saved to look like a model state (handled below).
+_RENDERER_PATH_TOKENS_GENERIC = ("model",)
+
+
+def _path_string_looks_like_renderer(s: str) -> bool:
+    """Return True if a string literal references a renderer artifact path.
+
+    Strict tokens (renderer/checkpoint/fp4) are sufficient on their own.
+    The 'model' token is generic and only counts if combined with a
+    typical artifact extension (.pt/.pth/.bin).
+    """
+    s_low = s.lower()
+    if any(tok in s_low for tok in _RENDERER_PATH_TOKENS):
+        return True
+    if any(tok in s_low for tok in _RENDERER_PATH_TOKENS_GENERIC):
+        if s_low.endswith((".pt", ".pth", ".bin")):
+            return True
+    return False
+
+
+def _node_references_renderer_path(node: ast.AST) -> bool:
+    """True if this AST subtree contains any string constant that matches
+    `_path_string_looks_like_renderer`. Handles f-strings, joinedstr,
+    Path() chains, and `output_dir / "renderer.bin"` BinOp expressions."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            if _path_string_looks_like_renderer(sub.value):
+                return True
+        # f-strings: ast.JoinedStr containing FormattedValue + Constant parts.
+        if isinstance(sub, ast.JoinedStr):
+            for part in sub.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    if _path_string_looks_like_renderer(part.value):
+                        return True
+    return False
+
+
+def _call_is_auth_eval_subprocess(node: ast.Call) -> bool:
+    """True if `node` is `subprocess.run([..., "auth_eval_renderer.py", ...])`
+    or `subprocess.Popen(...)` / `subprocess.check_call(...)` with the same
+    auth-eval script as a list element."""
+    func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+    if not (func_str.endswith("subprocess.run") or func_str.endswith("subprocess.Popen")
+            or func_str.endswith("subprocess.check_call") or func_str.endswith("subprocess.check_output")
+            or func_str == "run" or func_str == "Popen"
+            or func_str == "check_call" or func_str == "check_output"):
+        return False
+    for arg in node.args:
+        if isinstance(arg, ast.List):
+            for elt in arg.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    if "auth_eval_renderer" in elt.value:
+                        return True
+        # Single-string form: subprocess.run("python auth_eval_renderer.py ...", shell=True)
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            if "auth_eval_renderer" in arg.value:
+                return True
+    return False
+
+
+def _call_is_auth_eval_helper(node: ast.Call) -> bool:
+    """True if `node` calls `auth_eval_renderer.main(...)`, `run_auth_eval(...)`,
+    `auth_eval(...)`, or any function whose unparse ends with these names."""
+    func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+    targets = ("auth_eval_renderer.main", "run_auth_eval", "auth_eval",
+               "auth_eval_renderer", "auth_eval_on_best")
+    for t in targets:
+        if func_str == t or func_str.endswith("." + t):
+            return True
+    return False
+
+
+def _argparse_defines_no_auth_eval_optout(tree: ast.Module) -> bool:
+    """True if the script defines `--no-auth-eval-on-best` argparse flag
+    (operator's explicit opt-out — satisfies the rule)."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        if not func_str.endswith(".add_argument"):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if arg.value == "--no-auth-eval-on-best":
+                    return True
+    return False
+
+
+def _script_imports_auth_eval(tree: ast.Module) -> bool:
+    """True if the script `import`s the auth_eval module (any form). An
+    import without a CALL is dead code — the rule requires an actual
+    invocation, but we keep this distinction so the violation message can
+    say 'imported but never called' for clarity."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if "auth_eval" in node.module:
+                return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if "auth_eval" in alias.name:
+                    return True
+    return False
+
+
+def _scan_training_script_for_auth_eval(path: Path, repo_root: Path) -> list[str]:
+    """Flag a training script that saves a renderer checkpoint but does not
+    invoke auth_eval after it.
+
+    codex R5-3 #8: AST-based replacement of the regex token-grep. Old form
+    counted any token-anywhere (comment, help string, dead import) as
+    satisfying. New rule:
+      • Find every torch.save() call. If args reference a path matching
+        `_path_string_looks_like_renderer`, mark script as "saves a renderer".
+      • Find every subprocess.run([..., "auth_eval_renderer.py", ...])
+        OR direct call to auth_eval_renderer.main()/run_auth_eval()/etc.
+      • If --no-auth-eval-on-best is defined, satisfied (operator opt-out).
+      • A script that imports auth_eval but never calls it → violation
+        (dead-import-class).
+      • A script that saves a non-renderer (lora_best.pt, postfilter.pt,
+        masks.pt, posenet_targets.bin, stats.pt) → no violation.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    saves_renderer = False
+    has_auth_eval_call = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+            # Detect `torch.save(...)` (the canonical form). Aliased forms
+            # like `from torch import save; save(...)` are intentionally NOT
+            # supported — the codebase uses `torch.save(...)` exclusively
+            # and the broader pattern would produce FPs (e.g. `model.save()`).
+            if func_str == "torch.save":
+                # Inspect args for renderer-like path string.
+                for arg in node.args:
+                    if _node_references_renderer_path(arg):
+                        saves_renderer = True
+                        break
+            if _call_is_auth_eval_subprocess(node) or _call_is_auth_eval_helper(node):
+                has_auth_eval_call = True
+
+    if not saves_renderer:
+        return []
+    if has_auth_eval_call:
+        return []
+    if _argparse_defines_no_auth_eval_optout(tree):
+        return []
+    # Dead-import refinement: distinguish "imports but never calls" from
+    # "no reference at all" so the operator's fix is obvious.
+    if _script_imports_auth_eval(tree):
+        return [
+            f"{rel}: training script saves a renderer checkpoint and "
+            f"IMPORTS auth_eval but never CALLS it (dead import). Per "
+            f"CLAUDE.md \"Auth eval EVERYWHERE\": every chained experiment "
+            f"MUST end with a CUDA auth eval. Add an explicit "
+            f"`subprocess.run([..., 'auth_eval_renderer.py', ...])` or "
+            f"`run_auth_eval(...)` after the best save."
+        ]
+    return [
+        f"{rel}: training script saves a renderer checkpoint but never "
+        f"invokes auth_eval (no `subprocess.run([..., 'auth_eval_renderer.py', "
+        f"...])`, no `run_auth_eval(...)`, no `auth_eval_renderer.main()`, "
+        f"and no `--no-auth-eval-on-best` opt-out flag). Per CLAUDE.md "
+        f"\"Auth eval EVERYWHERE\": every chained experiment MUST end with "
+        f"a CUDA auth eval against its best checkpoint. Tracking only proxy "
+        f"is a wasted run (proxy-auth gap can be 100-350x even on CUDA-CUDA)."
+    ]
+
+
+def check_training_scripts_have_auth_eval(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch training scripts that save a model but never auth-eval it.
+
+    Reference: CLAUDE.md "Auth eval EVERYWHERE — NON-NEGOTIABLE". Scans
+    `experiments/train_*.py` and `src/tac/experiments/train_*.py`.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    candidates: list[Path] = []
+    for d in ("experiments", "src/tac/experiments"):
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in sorted(d_path.glob("train_*.py")):
+            candidates.append(p)
+    for p in candidates:
+        n_scanned += 1
+        violations.extend(_scan_training_script_for_auth_eval(p, root))
+
+    if verbose and violations:
+        print(f"  [training-needs-auth-eval] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [training-needs-auth-eval] OK: {n_scanned} training scripts scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "TRAINING SCRIPT MISSING AUTH EVAL violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nAuth eval EVERYWHERE (CLAUDE.md non-negotiable)."
+        )
+    return violations
+
+
+# ── Check 8: --no-eval-roundtrip CLI flag definition ──────────────────────────
+
+
+def _scan_python_for_disable_eval_roundtrip_flag(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect `add_argument("--no-eval-roundtrip"...)` literals."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name:
+        return []
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        if not func_str.endswith(".add_argument"):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if arg.value == "--no-eval-roundtrip":
+                    violations.append(
+                        f"{rel}:{node.lineno}: defines `--no-eval-roundtrip` "
+                        f"argparse flag. FORBIDDEN per CLAUDE.md: eval_roundtrip "
+                        f"is non-negotiable; the only escape hatch is env var "
+                        f"TAC_ALLOW_NO_ROUNDTRIP=1. Remove the flag."
+                    )
+    return violations
+
+
+def check_no_disable_eval_roundtrip_flag(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch `--no-eval-roundtrip` argparse definitions.
+
+    Reference: Lane C R5 fix (commit 9d71ec5d removed --no-eval-roundtrip
+    from optimize_uniward_delta.py). The only escape hatch is env var.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_python_for_disable_eval_roundtrip_flag(py, root))
+
+    if verbose and violations:
+        print(f"  [no-disable-eval-roundtrip-flag] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-disable-eval-roundtrip-flag] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "--no-eval-roundtrip CLI FLAG violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nRemove the flag (CLAUDE.md non-negotiable)."
+        )
+    return violations
+
+
+# ── Check 9: pack_sparse_delta(compliance_status='approved') outside promo ───
+#
+# Reference: codex R5-3 finding #2. The library function
+# `tac.uniward_delta.pack_sparse_delta` accepts `compliance_status='approved'`
+# only when paired with the constant-time-HMAC `_internal_promotion_token`.
+# The runtime check exists, but a static scan catches the same bug class
+# earlier (preflight time vs runtime). Any caller passing the literal
+# 'approved' (or the COMPLIANCE_APPROVED constant) outside the canonical
+# promotion tool / test-fixture surface is a violation: the operator-controlled
+# attestation flow goes exclusively through `tools/promote_lane_c_to_approved.py`,
+# which patches the wire header in-place rather than re-packing.
+
+# The single permitted non-test caller. Anything else passing the approved
+# literal/constant to pack_sparse_delta is a violation.
+_PACK_SPARSE_DELTA_APPROVED_PROMO_FILE = "tools/promote_lane_c_to_approved.py"
+# Token names that mean "approved" to pack_sparse_delta. We accept both the
+# string literal "approved" and references to the constant COMPLIANCE_APPROVED
+# (which equals "approved"). Both must be considered violations outside the
+# canonical promotion tool.
+_APPROVED_LITERAL = "approved"
+_APPROVED_CONST_NAMES = {"COMPLIANCE_APPROVED"}
+
+
+def _resolve_pack_sparse_delta_aliases(tree: ast.AST) -> set[str]:
+    """Collect every name `pack_sparse_delta` is bound to in this module.
+
+    Handles:
+      - `from tac.uniward_delta import pack_sparse_delta` → {"pack_sparse_delta"}
+      - `from tac.uniward_delta import pack_sparse_delta as pkt` → {"pkt"}
+      - `import tac.uniward_delta as uwd` → {"uwd.pack_sparse_delta"} (we
+        track the module alias and match `<alias>.pack_sparse_delta`)
+      - bare `pack_sparse_delta(` calls (defensive: also include the literal
+        name even if the import is somewhere else / wildcard / re-export)
+    Returns a set of acceptable callable string forms.
+    """
+    aliases: set[str] = {"pack_sparse_delta"}
+    module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if "uniward_delta" in mod or mod.endswith("tac"):
+                for alias in node.names:
+                    if alias.name == "pack_sparse_delta":
+                        aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ("tac.uniward_delta", "tac"):
+                    module_aliases.add(alias.asname or alias.name)
+    # Also accept attribute calls like `<module_alias>.pack_sparse_delta(...)`.
+    aliases.update(f"{m}.pack_sparse_delta" for m in module_aliases)
+    return aliases
+
+
+def _call_func_str(call: ast.Call) -> str:
+    """Render the function expression of a Call to its source-level string,
+    handling Name + Attribute chains. Best-effort, returns "" on failure."""
+    try:
+        if hasattr(ast, "unparse"):
+            return ast.unparse(call.func)
+    except Exception:
+        pass
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        # Walk chain to root Name.
+        parts: list[str] = [call.func.attr]
+        cur: ast.AST = call.func.value
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _kwarg_value_is_approved(kw: ast.keyword) -> bool:
+    """True if kw.value is the string literal 'approved' OR a Name whose
+    id is in `_APPROVED_CONST_NAMES`. Conservative: anything we can't
+    constant-fold (function call, ternary, formatted string) is treated as
+    NOT approved (would otherwise be caught by the runtime gate).
+    """
+    v = kw.value
+    if isinstance(v, ast.Constant) and isinstance(v.value, str):
+        return v.value == _APPROVED_LITERAL
+    if isinstance(v, ast.Name) and v.id in _APPROVED_CONST_NAMES:
+        return True
+    if isinstance(v, ast.Attribute) and v.attr in _APPROVED_CONST_NAMES:
+        return True
+    return False
+
+
+def _scan_python_for_pack_sparse_delta_approved(
+    path: Path, repo_root: Path
+) -> list[str]:
+    """Find every call to pack_sparse_delta(..., compliance_status='approved'/COMPLIANCE_APPROVED, ...)
+    in `path`. The promotion-tool / test-fixture filter is applied by the
+    caller (since this function returns ALL hits; the caller decides which
+    are exempt)."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    try:
+        tree = ast.parse(text, filename=str(rel))
+    except SyntaxError:
+        return []
+    aliases = _resolve_pack_sparse_delta_aliases(tree)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = _call_func_str(node)
+        if func_str not in aliases:
+            continue
+        for kw in node.keywords:
+            if kw.arg == "compliance_status" and _kwarg_value_is_approved(kw):
+                violations.append(
+                    f"{rel}:{node.lineno}: pack_sparse_delta(compliance_status="
+                    f"'approved' | COMPLIANCE_APPROVED) outside the canonical "
+                    f"promotion tool ({_PACK_SPARSE_DELTA_APPROVED_PROMO_FILE}). "
+                    f"Lane C δ.bin promotion goes through "
+                    f"tools/promote_lane_c_to_approved.py, which patches the "
+                    f"wire header in-place after attestation verification — "
+                    f"NOT by re-packing with compliance_status='approved'. "
+                    f"(codex R5-3 #2.)"
+                )
+                break
+    return violations
+
+
+_PACK_APPROVED_FIXTURE_MARKER = "PACK_APPROVED_FIXTURE_OK"
+
+
+def _is_test_or_fixture_path(rel: Path) -> bool:
+    """Return True if `rel` (path relative to repo root) is a test or
+    pytest-conftest file ANYWHERE in the tree.
+
+    2026-04-27 codex R5-4 #3: previously the exemption for fixtures was
+    `src/tac/tests/test_*.py` only. With the strict scanner now scanning
+    `experiments/`, `scripts/`, and `tools/`, a legitimate
+    integration-test fixture under any of those dirs that constructs an
+    approved blob with the internal promotion token would block strict
+    preflight. We now recognise tests broadly:
+      • basename matches test_*.py / *_test.py
+      • basename is conftest.py
+      • path contains a `/tests/` segment
+    """
+    name = rel.name
+    if name == "conftest.py":
+        return True
+    if name.startswith("test_") and name.endswith(".py"):
+        return True
+    if name.endswith("_test.py"):
+        return True
+    parts = rel.parts
+    if "tests" in parts or "test" in parts:
+        return True
+    return False
+
+
+def _file_has_pack_approved_fixture_marker(path: Path) -> bool:
+    """Return True if `path` contains a `# PACK_APPROVED_FIXTURE_OK` comment
+    anywhere — the explicit waiver mechanism for legitimate fixtures that
+    don't live in a recognised test directory.
+    """
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return False
+    for line in text.splitlines():
+        if "#" not in line:
+            continue
+        if _PACK_APPROVED_FIXTURE_MARKER in line[line.index("#"):]:
+            return True
+    return False
+
+
+def check_no_pack_sparse_delta_approved_outside_promotion_tool(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch pack_sparse_delta(compliance_status='approved') outside the
+    canonical promotion tool.
+
+    Reference: codex R5-3 finding #2 + tac.lane_c_compliance INTERNAL_PROMOTION_TOKEN
+    + tools/promote_lane_c_to_approved.py. The runtime check refuses to
+    write 'approved' without a constant-time HMAC token; this static scan
+    catches the same bug class at preflight time.
+
+    Test fixtures that construct approved blobs (with the internal token)
+    are permitted via two complementary mechanisms:
+      1. Path-based: any `test_*.py` / `*_test.py` / `conftest.py` file,
+         or any path containing a `/tests/` segment, is exempt (broader
+         than the previous `src/tac/tests/` only filter — codex R5-4 #3).
+      2. Marker-based: any file containing
+         `# PACK_APPROVED_FIXTURE_OK` (anywhere) is exempt — explicit
+         operator waiver for fixtures outside the standard test layout.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    # Scan both the standard meta dirs AND tools/ (the promotion tool lives
+    # in tools/ and any future tools-side caller would be covered there too).
+    scan_dirs = list(_META_PY_SCAN_DIRS) + ["tools"]
+    for py in _iter_python_files(root, scan_dirs):
+        n_scanned += 1
+        rel = py.relative_to(root) if py.is_absolute() else py
+        rel_str = rel.as_posix()
+        # Exempt the canonical promotion tool itself.
+        if rel_str == _PACK_SPARSE_DELTA_APPROVED_PROMO_FILE:
+            continue
+        # Exempt any test file (broad detection — codex R5-4 #3).
+        if _is_test_or_fixture_path(rel):
+            continue
+        # Exempt any file with the explicit waiver marker.
+        if _file_has_pack_approved_fixture_marker(py):
+            continue
+        violations.extend(_scan_python_for_pack_sparse_delta_approved(py, root))
+
+    if verbose and violations:
+        print(
+            f"  [no-pack-sparse-delta-approved] {len(violations)} violation(s) "
+            f"across {n_scanned} files:"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-pack-sparse-delta-approved] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PACK_SPARSE_DELTA APPROVED OUTSIDE PROMOTION TOOL violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane C promotion uses tools/promote_lane_c_to_approved.py "
+            "(codex R5-3 #2)."
+        )
+    return violations
+
+
+# ── Check 10: inflate.sh handles .br centrally before PYTHON_INFLATE dispatch ─
+#
+# Reference: codex R5-3 finding #11 + commit a1128fd9. Every PYTHON_INFLATE
+# branch must see the archive in fully-decompressed form. The fix added a
+# Stage 0 brotli decompression block BEFORE branch dispatch. This scanner
+# enforces the block exists and is positioned correctly for any inflate.sh
+# that performs PYTHON_INFLATE branch dispatch.
+
+# Markers that identify the centralized brotli stage.
+_BROTLI_BLOCK_MARKERS = ("brotli stage 0", "Stage 0")
+# The brotli pull token: `--with brotli` is what the centralized block uses
+# in the `uv run` invocation. This identifies the actual decompression path
+# (vs a comment that mentions brotli without acting on it).
+_BROTLI_WITH_TOKEN = "--with brotli"
+# The br-file glob detector that triggers the block. Either the literal
+# `compgen -G ...*.br` form OR a `*.br` file-test guard counts.
+_BROTLI_BR_GLOB_TOKEN_RE = re.compile(r"\.br\b")
+# Identifies the branch-dispatch line. Matches `if [ "$PYTHON_INFLATE" = ...`,
+# `case "$PYTHON_INFLATE"`, etc.
+_PYTHON_INFLATE_DISPATCH_RE = re.compile(
+    r"""
+    (
+        \[\s*"\$PYTHON_INFLATE"   # if [ "$PYTHON_INFLATE" = ...
+        |
+        case\s+"\$PYTHON_INFLATE" # case "$PYTHON_INFLATE" in
+    )
+    """,
+    re.VERBOSE,
+)
+
+
+def _scan_inflate_sh_for_centralized_brotli(
+    path: Path, repo_root: Path
+) -> list[str]:
+    """Validate that path is either (a) a trivial passthrough with no
+    PYTHON_INFLATE dispatch (PASS), or (b) contains a centralized brotli
+    Stage 0 block BEFORE the PYTHON_INFLATE dispatch line (PASS), else
+    a violation."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    lines = text.splitlines()
+    # Locate first PYTHON_INFLATE dispatch line.
+    dispatch_lineno: int | None = None
+    for i, line in enumerate(lines, start=1):
+        if _PYTHON_INFLATE_DISPATCH_RE.search(line):
+            dispatch_lineno = i
+            break
+
+    if dispatch_lineno is None:
+        # No branch dispatch → trivial passthrough. Skip.
+        return []
+
+    # Find the centralized brotli block. Three signals must all be present
+    # AND must precede the dispatch line:
+    #   1. A `Stage 0`/`brotli stage 0` marker (comment or echo).
+    #   2. A `*.br` glob/file-test (compgen / [ -e ...*.br ] / similar).
+    #   3. An `--with brotli` invocation of `uv run`.
+    marker_lineno: int | None = None
+    br_glob_lineno: int | None = None
+    with_brotli_lineno: int | None = None
+    for i, line in enumerate(lines, start=1):
+        if i >= dispatch_lineno:
+            break
+        if marker_lineno is None and any(
+            m.lower() in line.lower() for m in _BROTLI_BLOCK_MARKERS
+        ):
+            # Confirm it's a brotli marker (not e.g. "Stage 0" referring to
+            # something else — require co-occurrence with "brotli" within ±10
+            # lines OR on the same line).
+            if "brotli" in line.lower():
+                marker_lineno = i
+            else:
+                # Check ±10 line window for "brotli".
+                window = "\n".join(
+                    lines[max(0, i - 10): min(len(lines), i + 10)]
+                ).lower()
+                if "brotli" in window:
+                    marker_lineno = i
+        if br_glob_lineno is None and _BROTLI_BR_GLOB_TOKEN_RE.search(line):
+            br_glob_lineno = i
+        if with_brotli_lineno is None and _BROTLI_WITH_TOKEN in line:
+            with_brotli_lineno = i
+
+    violations: list[str] = []
+    if marker_lineno is None or br_glob_lineno is None or with_brotli_lineno is None:
+        # Block missing entirely. Determine which signal(s) are absent for
+        # a precise diagnostic.
+        missing: list[str] = []
+        if marker_lineno is None:
+            missing.append("'Stage 0'/'brotli stage 0' marker comment")
+        if br_glob_lineno is None:
+            missing.append("'*.br' file-glob guard")
+        if with_brotli_lineno is None:
+            missing.append("'--with brotli' uv-run invocation")
+        violations.append(
+            f"{rel}:{dispatch_lineno}: PYTHON_INFLATE dispatch present but "
+            f"centralized brotli Stage 0 block is incomplete (missing: "
+            f"{', '.join(missing)}). Every PYTHON_INFLATE branch must see "
+            f"the archive in fully-decompressed form. Add the Stage 0 block "
+            f"BEFORE the dispatch (codex R5-3 #11, commit a1128fd9)."
+        )
+        return violations
+
+    # All three signals present BEFORE dispatch → PASS. Position is implicitly
+    # validated by the loop (we stop at dispatch_lineno).
+
+    # ALSO: detect the after-dispatch case. If a brotli block ALSO appears
+    # AFTER dispatch (e.g. inside a branch arm) without the centralized one
+    # before, the loop above already caught the centralized-missing case.
+    # The spec calls out "probe-too-late" as a violation; the symmetric
+    # check here is "brotli-block-too-late". We flag any --with brotli that
+    # appears AFTER dispatch UNLESS a centralized one also exists before.
+    # (Centralized-before passes; we have it, so no further work.)
+
+    return violations
+
+
+def check_inflate_sh_handles_br_centrally(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch inflate.sh files where .br decompression is missing or runs
+    AFTER the PYTHON_INFLATE branch dispatch.
+
+    Reference: codex R5-3 finding #11 + commit a1128fd9. Without the
+    centralized Stage 0 block, any non-renderer PYTHON_INFLATE branch on
+    a Lane B-alt archive fails later as a missing renderer.bin / masks.mkv
+    with no actionable hint. Trivial passthrough inflate.sh (no
+    PYTHON_INFLATE dispatch) is a soft pass — the block is unnecessary.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    submissions = root / "submissions"
+    if submissions.exists():
+        for sub_dir in sorted(submissions.iterdir()):
+            if not sub_dir.is_dir():
+                continue
+            for p in sorted(sub_dir.glob("inflate.sh")):
+                n_scanned += 1
+                violations.extend(_scan_inflate_sh_for_centralized_brotli(p, root))
+
+    if verbose and violations:
+        print(
+            f"  [inflate-br-central] {len(violations)} violation(s) across "
+            f"{n_scanned} inflate.sh file(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [inflate-br-central] OK: {n_scanned} inflate.sh file(s) scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "INFLATE.SH BROTLI CENTRALIZATION violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nAdd Stage 0 brotli block before PYTHON_INFLATE dispatch "
+            "(codex R5-3 #11, commit a1128fd9)."
+        )
+    return violations
+
+
+# ── Check 11: scripts/remote_*.sh must run NVDEC probe at Stage 0 ────────────
+#
+# Reference: feedback_vastai_nvdec_host_variation + commit eef64293. NVDEC
+# host availability is host-dependent on Vast.ai 4090s — same image, same
+# driver, different host = `CUDA_ERROR_NO_DEVICE` from DALI's video MIXED
+# operator. The probe catches the bad-host case in 5 seconds. Every remote
+# script that does GPU work MUST run `scripts/probe_nvdec.sh` BEFORE any
+# GPU spend (training, pose TTO, archive build, evaluate.py, nvidia-smi
+# query against driver).
+
+# Token strings that identify a probe invocation. We match all three
+# documented forms in the spec.
+_NVDEC_PROBE_TOKENS = (
+    "scripts/probe_nvdec.sh",  # bash $WORKSPACE/scripts/probe_nvdec.sh
+    "probe_nvdec.sh",          # bash probe_nvdec.sh (relative)
+)
+# Comment header that explicitly opts out of the requirement. Operator's
+# declaration that this script does no DALI / NVDEC video work.
+_NVDEC_OPT_OUT_TOKEN = "NO_NVDEC_NEEDED"
+# GPU-work markers: presence of any of these tokens means a probe call MUST
+# precede them in the file. We accept partial substrings (e.g.
+# `train_renderer.py` matches both `train_renderer.py` and
+# `src/tac/experiments/train_renderer.py`).
+_NVDEC_GPU_WORK_MARKERS = (
+    "train_renderer.py",
+    "optimize_poses.py",
+    "experiments/build_baseline_archive.py",
+    "build_baseline_archive.py",
+    "train_distill.py",
+    "auth_eval_renderer.py",
+    "evaluate.py",
+    "nvidia-smi",
+)
+
+
+def _scan_remote_script_for_nvdec_probe(
+    path: Path, repo_root: Path
+) -> list[str]:
+    """Validate that path either opts out via NO_NVDEC_NEEDED OR contains
+    a probe call BEFORE any GPU-work marker."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    lines = text.splitlines()
+
+    # Opt-out: search the first 30 lines for the NO_NVDEC_NEEDED comment
+    # header. Anywhere in the file would also work, but a header makes the
+    # operator's intent reviewable.
+    header = "\n".join(lines[:30])
+    if _NVDEC_OPT_OUT_TOKEN in header:
+        return []
+
+    # Find earliest GPU-work marker line (1-indexed; None if no GPU work).
+    # Refinement (2026-04-27):
+    #   - `nvidia-smi --query-gpu=...` is a 100ms info read, NOT GPU spend.
+    #   - Descriptive log/echo/printf lines (e.g. `log "=== Stage 3:
+    #     evaluate.py ..."`) frequently mention marker names without
+    #     actually invoking them. Exempt these.
+    gpu_work_lineno: int | None = None
+    for i, line in enumerate(lines, start=1):
+        # Skip comment-only lines for marker detection.
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Exempt `nvidia-smi --query-...` info queries (sub-100ms, no spend).
+        if "nvidia-smi --query-" in line:
+            continue
+        # Exempt descriptive log/echo/printf lines (operator-readable text
+        # mentioning marker names doesn't run them).
+        first_token = stripped.split(None, 1)[0] if stripped else ""
+        if first_token in ("log", "echo", "printf"):
+            continue
+        if any(tok in line for tok in _NVDEC_GPU_WORK_MARKERS):
+            gpu_work_lineno = i
+            break
+
+    # Find earliest probe-call line.
+    probe_lineno: int | None = None
+    for i, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if any(tok in line for tok in _NVDEC_PROBE_TOKENS):
+            probe_lineno = i
+            break
+
+    violations: list[str] = []
+
+    if gpu_work_lineno is None:
+        # Script does no GPU work and didn't opt out. If the probe is also
+        # absent that's fine — nothing to probe FOR. PASS.
+        return []
+
+    if probe_lineno is None:
+        violations.append(
+            f"{rel}:{gpu_work_lineno}: GPU-work marker present but no NVDEC "
+            f"probe call. Add `bash \"$WORKSPACE/scripts/probe_nvdec.sh\"` "
+            f"as Stage 0 (BEFORE any GPU spend), OR add a "
+            f"`# {_NVDEC_OPT_OUT_TOKEN}` comment header to opt out. "
+            f"(feedback_vastai_nvdec_host_variation, commit eef64293.)"
+        )
+        return violations
+
+    if probe_lineno >= gpu_work_lineno:
+        violations.append(
+            f"{rel}:{probe_lineno}: NVDEC probe call appears AFTER first "
+            f"GPU-work marker (line {gpu_work_lineno}). Probe MUST run "
+            f"BEFORE any GPU spend so a bad-host case is caught in 5s "
+            f"instead of after $0.20+ of work. Move the probe to the top "
+            f"of the script, BEFORE the first GPU-work invocation. "
+            f"(feedback_vastai_nvdec_host_variation, commit eef64293.)"
+        )
+
+    return violations
+
+
+def check_remote_scripts_have_nvdec_probe(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch scripts/remote_*.sh that do GPU work without an NVDEC probe.
+
+    Reference: feedback_vastai_nvdec_host_variation memory entry + commit
+    eef64293. The probe catches bad Vast.ai hosts in 5 seconds; without
+    it, training proceeds successfully and only fails at the eval stage,
+    burning $0.20-$10 per occurrence (this happened TWICE on 2026-04-27).
+    Scripts that do no DALI / NVDEC work can opt out via a
+    `# NO_NVDEC_NEEDED` comment header.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    scripts_dir = root / "scripts"
+    if scripts_dir.exists():
+        for p in sorted(scripts_dir.glob("remote_*.sh")):
+            n_scanned += 1
+            violations.extend(_scan_remote_script_for_nvdec_probe(p, root))
+
+    if verbose and violations:
+        print(
+            f"  [remote-nvdec-probe] {len(violations)} violation(s) across "
+            f"{n_scanned} remote_*.sh file(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [remote-nvdec-probe] OK: {n_scanned} remote_*.sh file(s) scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE NVDEC PROBE violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nAdd Stage 0 NVDEC probe (feedback_vastai_nvdec_host_variation, "
+            "commit eef64293)."
+        )
+    return violations
+
+
+# NOTE: 2026-04-27 codex R5-3 Finding #4 — all 8 meta-bug checks are wired
+# into preflight_all() above (warn-only). See the codex R5-3 #4 comment block
+# in preflight_all() for live-violation counts and per-check promotion plan.
+# The 3 follow-on checks (codex R5-3 #2 + #11 + NVDEC probe gap, commits
+# a1128fd9 / eef64293 + this commit) are wired in the same block.
+
+
+# ── Filename contract validation ──────────────────────────────────────────────
+#
+# Bug class this catches: a consumer script (pipeline.py) constructs a path
+# like `iter_dir / "renderer_qat_best.pt"` and reads/exists-checks it, but
+# the producer script (qat_finetune.py) actually saves it as
+# `qat_best_float.pt`. The mismatch is silent — exists() returns False, the
+# fallback branch fires, and the pipeline silently uses the wrong artifact.
+#
+# Caught manually in R33 (renderer_qat_best.pt → qat_best_float.pt) and R34
+# (renderer_qat.bin → renderer_fp4.bin). This validator automates the check.
+
+class FilenameContractError(Exception):
+    """A consumer-side filename literal is never produced by any script."""
+
+
+# Filename suffixes that represent artifacts (versus, e.g., test fixtures or
+# config files). Anything matching these suffixes that's read in a launcher
+# but never written anywhere is a phantom path.
+# .amrc = Yousfi council #8 lossless argmax-RLE mask codec (2026-04-26).
+_ARTIFACT_SUFFIXES = (".bin", ".pt", ".pth", ".mkv", ".mp4", ".raw",
+                      ".zip", ".tar", ".tar.gz", ".tgz", ".amrc")
+
+# Filenames that are deliberately external (not produced by our code) — they
+# come from upstream data, the contest archive, third-party tools, etc.
+_EXTERNAL_FILENAMES = {
+    "0.mkv",  # upstream/videos/0.mkv (contest GT)
+    "masks.mkv", "masks.amrc",  # mask artifacts (av1 + lossless argmax-RLE)
+    "poses.pt", "renderer.bin",  # contest-required submission filenames
+    "video_names.txt",  # contest input
+    "submission.zip", "archive.zip",  # contest output filenames (built by submission_archive)
+    "pretrained.pth",  # pretrained model weights
+}
+
+
+def _extract_artifact_filenames(path: Path) -> set[str]:
+    """AST-extract every artifact-suffix string literal from a Python file.
+
+    Returns names like {"renderer_fp4.bin", "qat_best_float.pt"}. Skips
+    non-artifact strings (URLs, log file names, fixture paths).
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return set()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            v = node.value
+            if v.endswith(_ARTIFACT_SUFFIXES):
+                # Take just the basename; we don't care about the directory.
+                base = v.split("/")[-1]
+                # Skip glob patterns and obvious non-literal hints.
+                if "*" in base or "{" in base:
+                    continue
+                # Skip suffix-fragments used in f-string concat
+                # (e.g., `for suffix in ["_int4lzma2.bin", ".bin"]`).
+                # Real basenames have a non-empty stem before the suffix.
+                stem = base
+                for suf in _ARTIFACT_SUFFIXES:
+                    if stem.endswith(suf):
+                        stem = stem[:-len(suf)]
+                        break
+                if not stem or stem.startswith(("_", ".")):
+                    continue
+                # Skip very generic names that are too noisy to validate.
+                if base in _EXTERNAL_FILENAMES:
+                    continue
+                found.add(base)
+    return found
+
+
+def _extract_write_literals(path: Path) -> set[str]:
+    """AST-extract artifact filenames that appear in WRITE contexts.
+
+    Detects two layers:
+
+    Direct (literal IS the call argument):
+      - `torch.save(_, "X.pt")` — second arg literal
+      - `open("X", "w"|"a"|"wb"|"ab")` — first arg literal with write mode
+      - `<expr>.write_bytes(_)` / `.write_text(_)` / `.touch()` — receiver
+        path expression containing an artifact literal
+      - `os.replace(_, "X")` / `shutil.copy(_, "X")` — target literal
+
+    Indirect (literal is in a Path-assignment, then the variable is used
+    in a write context):
+      - `out_path = iter_dir / "X.bin"`
+        `torch.save(model, str(out_path))` or
+        `export_fn(_, str(out_path))` or
+        `out_path.write_bytes(...)` etc.
+      This catches the common pipeline.py pattern.
+
+    Returns just basenames.
+    """
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return set()
+    found: set[str] = set()
+
+    def _collect_artifact_literals_in(node: ast.AST) -> set[str]:
+        out: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                v = sub.value
+                if v.endswith(_ARTIFACT_SUFFIXES):
+                    base = v.split("/")[-1]
+                    if "*" not in base and "{" not in base:
+                        out.add(base)
+        return out
+
+    # Pass 1a: collect Name → set of artifact basenames assigned to that name.
+    # Tracks `name = <expr-containing-artifact-literal>` for later write-context
+    # cross-linking.
+    name_to_literals: dict[str, set[str]] = {}
+    # Map FunctionDef → its name (so we can scope Return tracking).
+    WRITE_FN_PREFIXES = (
+        "export_", "save_", "write_", "encode_", "build_",
+        "pack_", "dump_", "emit_", "serialize_",
+    )
+
+    def _is_write_named_fn(fn_node: ast.AST) -> bool:
+        if isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return fn_node.name.startswith(WRITE_FN_PREFIXES)
+        return False
+
+    # Build parent-pointer map so we can walk up from a Return to find its
+    # enclosing function.
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def _enclosing_fn(node: ast.AST) -> ast.AST | None:
+        cur = parents.get(id(node))
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return cur
+            cur = parents.get(id(cur))
+        return None
+
+    # Pass 1a: build name_to_literals BEFORE any Return-tracking pass so
+    # the lookup is complete (ast.walk order isn't guaranteed; a Return
+    # could be visited before its Assign otherwise).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            t = node.targets[0]
+            if isinstance(t, ast.Name):
+                lits = _collect_artifact_literals_in(node.value)
+                if lits:
+                    name_to_literals.setdefault(t.id, set()).update(lits)
+
+    # Pass 1b: process Return statements. R36: only count when enclosing
+    # function has a write-prefix name. R37: also follow Name indirection
+    # (`return path` where path = dir / "X.bin" was assigned earlier).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return) and node.value is not None:
+            fn = _enclosing_fn(node)
+            if fn is not None and _is_write_named_fn(fn):
+                lits = _collect_artifact_literals_in(node.value)
+                if lits:
+                    found.update(lits)
+                for nm in {sub.id for sub in ast.walk(node.value)
+                           if isinstance(sub, ast.Name)}:
+                    if nm in name_to_literals:
+                        found.update(name_to_literals[nm])
+
+    def _names_referenced(node: ast.AST) -> set[str]:
+        return {sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)}
+
+    def _record_write(arg_node: ast.AST) -> None:
+        """Record literals from arg_node, including via Name indirection."""
+        found.update(_collect_artifact_literals_in(arg_node))
+        for nm in _names_referenced(arg_node):
+            if nm in name_to_literals:
+                found.update(name_to_literals[nm])
+
+    # Pass 2: detect write-context calls and extract literals (direct or via Name).
+    WRITE_FUNCS_2ND_ARG = {"torch.save", "os.replace", "shutil.copy",
+                           "shutil.copyfile", "shutil.move", "os.rename"}
+    WRITE_METHOD_SUFFIXES = (".write_bytes", ".write_text", ".touch",
+                             ".save", ".dump")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        # torch.save / os.replace / shutil.copy: 2nd positional arg is the target
+        if func_str in WRITE_FUNCS_2ND_ARG and len(node.args) >= 2:
+            _record_write(node.args[1])
+        # open(target, "w"/"a"/"x")
+        if func_str == "open" and node.args:
+            mode_arg = None
+            if len(node.args) >= 2:
+                mode_arg = node.args[1]
+            for kw in node.keywords:
+                if kw.arg == "mode":
+                    mode_arg = kw.value
+            if isinstance(mode_arg, ast.Constant) and isinstance(mode_arg.value, str):
+                if any(c in mode_arg.value for c in ("w", "a", "x")):
+                    _record_write(node.args[0])
+        # x.write_bytes(...) / x.write_text(...) / x.touch() / x.save() / x.dump()
+        if any(func_str.endswith(suf) for suf in WRITE_METHOD_SUFFIXES):
+            if isinstance(node.func, ast.Attribute):
+                _record_write(node.func.value)
+        # export/save/write/encode/build/dump/emit/serialize/pack helpers:
+        # any function whose name starts with these prefixes — treat
+        # 2nd-or-later arg as target. Includes encoder funcs (encode_masks,
+        # encode_video) and serializer funcs (dump_state, emit_archive).
+        if func_str.split(".")[-1].startswith(
+            ("export_", "save_", "write_", "encode_", "build_",
+             "pack_", "dump_", "emit_", "serialize_")
+        ):
+            for arg in node.args[1:]:
+                _record_write(arg)
+    return found
+
+
+def preflight_build_renderer_signature(strict: bool = True, verbose: bool = True) -> list[str]:
+    """Validate that build_renderer() accepts every arch knob set by any
+    renderer training profile. The 2026-04-26 DEN arch drift bug existed
+    because build_renderer() didn't accept use_zoom_flow/use_dsconv/
+    padding_mode/use_dilation/pose_dim — the resolver in train_renderer
+    set the args.* fields correctly but the build_renderer call silently
+    dropped them. Result: 1.2h of wasted GPU on a checkpoint that
+    consumers couldn't load.
+
+    This rule introspects build_renderer's signature and confirms every
+    profile-declared arch field has a matching kwarg. Catches the bug
+    at lint time, not 1 hour into a $0.30 GPU run.
+    """
+    violations: list[str] = []
+    try:
+        import inspect
+        from tac.renderer import build_renderer
+        from tac.profiles import PROFILES
+    except ImportError as e:
+        msg = f"  [build_renderer_sig] cannot import: {e}"
+        if verbose:
+            print(msg)
+        return [msg]
+
+    sig = inspect.signature(build_renderer)
+    accepted = set(sig.parameters.keys())
+
+    arch_flags = (
+        "use_zoom_flow", "use_dsconv", "padding_mode", "use_dilation",
+        "pose_dim", "base_ch", "mid_ch", "embed_dim", "motion_hidden", "depth",
+    )
+    for prof_name, prof in PROFILES.items():
+        if prof.get("experiment_type") != "renderer_training":
+            continue
+        for flag in arch_flags:
+            if flag in prof and flag not in accepted:
+                violations.append(
+                    f"profile {prof_name!r} declares arch flag {flag!r} but "
+                    f"build_renderer() does NOT accept it as a kwarg. The "
+                    f"value is silently dropped at the call site, causing "
+                    f"arch drift between profile spec and saved checkpoint. "
+                    f"Add {flag!r} to build_renderer's signature + forward "
+                    f"to MaskRenderer/MotionPredictor/AsymmetricPairGenerator."
+                )
+
+    if verbose and violations:
+        print(f"  [build_renderer_sig] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [build_renderer_sig] OK: build_renderer accepts all "
+              f"{len(arch_flags)} arch kwargs")
+
+    if violations and strict:
+        raise PreflightError(
+            "BUILD_RENDERER SIGNATURE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def preflight_canonical_checkpoints(strict: bool = True, verbose: bool = True) -> list[str]:
+    """Validate that every training producer's emitted checkpoint name is
+    in the canonical registry (tac.checkpoint_names.canonical_checkpoint_names).
+
+    Without this, deploys aborted at Stage 4 of the bootstrap because the
+    producer wrote `renderer_<profile>_best_fp32.pt` but the consumer probe
+    only had `distill_*.pt`. We wasted a full DEN training run on 2026-04-26
+    before realising this. Now: any new training script that emits a
+    different name MUST be added to PRODUCER_OUTPUTS in checkpoint_names.py
+    AND its filename MUST appear in canonical_checkpoint_names() output.
+    """
+    violations: list[str] = []
+    try:
+        from tac.checkpoint_names import (
+            PRODUCER_OUTPUTS,
+            canonical_checkpoint_names,
+        )
+    except ImportError as e:
+        msg = f"  [canonical_checkpoints] cannot import tac.checkpoint_names: {e}"
+        if verbose:
+            print(msg)
+        return [msg]
+
+    # Build the set of all canonical names across all known profiles. Each
+    # profile-specific name has a placeholder so we strip the profile and
+    # check the suffix pattern.
+    try:
+        from tac.profiles import PROFILES
+        profiles = sorted(PROFILES.keys())
+    except ImportError:
+        profiles = []
+
+    all_canonical: set[str] = set(canonical_checkpoint_names(profile=None))
+    for prof in profiles:
+        all_canonical.update(canonical_checkpoint_names(profile=prof))
+
+    for producer_path, expected_name in PRODUCER_OUTPUTS.items():
+        # Substitute <profile> placeholder if present.
+        if "<profile>" in expected_name:
+            # Match against any profile-instantiated form.
+            matched = any(
+                name.startswith("renderer_") and name.endswith("_best_fp32.pt")
+                for name in all_canonical
+            )
+        else:
+            matched = expected_name in all_canonical
+        if not matched:
+            violations.append(
+                f"checkpoint_names.PRODUCER_OUTPUTS[{producer_path!r}] = "
+                f"{expected_name!r} but that name is NOT in "
+                f"canonical_checkpoint_names() output. Update either the "
+                f"producer's output naming or canonical_checkpoint_names() "
+                f"to match. 2026-04-26 hardening: this catches the "
+                f"renderer_<profile>_best_fp32.pt vs distill_*.pt mismatch "
+                f"that wasted a DEN training run."
+            )
+
+    if verbose and violations:
+        print(f"  [canonical_checkpoints] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [canonical_checkpoints] OK: {len(PRODUCER_OUTPUTS)} producer(s) "
+              f"validated against {len(all_canonical)} canonical name(s)")
+
+    if violations and strict:
+        raise PreflightError(
+            "CANONICAL CHECKPOINT NAMES VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def preflight_filename_contract(
+    repo_root: Path | None = None,
+    consumer_files: list[str] | None = None,
+    producer_dirs: list[str] | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Validate that every artifact filename READ by a consumer is WRITTEN
+    by some producer script.
+
+    Consumer = pipeline.py and other launchers. They read filenames via
+        Path expressions and check existence / load weights / pass to subprocess.
+    Producer = anything in experiments/ or src/tac/ that writes the file via
+        torch.save, file.write_*, ffmpeg subprocess, etc.
+
+    AST-level approach: extract every artifact-suffixed string literal from
+    consumer files. Extract the same from producer files. The set difference
+    {consumer_literals} - {producer_literals} - {external} is the violation set.
+
+    This is conservative: a literal appearing in producer source is treated
+    as "produced" even if the producer code path is dead. Catches the
+    obvious filename-typo bug class (R33, R34) without false positives on
+    legitimate refactors.
+    """
+    root = repo_root or REPO_ROOT
+    consumer_files = consumer_files or LAUNCHER_FILES + [
+        "experiments/pipeline.py",  # also a producer (step_export, etc.)
+    ]
+    producer_dirs = producer_dirs or ["experiments", "src/tac",
+                                       "submissions/robust_current"]
+
+    consumer_literals: dict[str, set[str]] = {}
+    consumer_paths_resolved: set[Path] = set()
+    for cf in consumer_files:
+        cp = (root / cf).resolve()
+        if cp.exists():
+            consumer_literals[cf] = _extract_artifact_filenames(cp)
+            consumer_paths_resolved.add(cp)
+
+    # Producer scan: every script EXCEPT the consumer files. A consumer that
+    # is also a producer (e.g., pipeline.py writes renderer.bin) would
+    # otherwise self-validate every typo. We collect a separate set of
+    # "consumer self-writes" via AST write-context detection; those literals
+    # ARE legitimate (the file produces what it consumes).
+    producer_literals: set[str] = set(_EXTERNAL_FILENAMES)
+    producer_literals.discard("renderer.bin")  # we DO produce this
+    n_producer_files = 0
+    for pd in producer_dirs:
+        for py in (root / pd).rglob("*.py"):
+            if py.resolve() in consumer_paths_resolved:
+                continue  # skip consumer files in producer scan
+            n_producer_files += 1
+            producer_literals.update(_extract_artifact_filenames(py))
+        for sh in (root / pd).rglob("*.sh"):
+            try:
+                text = sh.read_text()
+                for token in re.findall(
+                    r'[\w./_-]+\.(?:bin|pt|pth|mkv|mp4|raw|zip|tar\.gz|tar|tgz)', text):
+                    producer_literals.add(token.split("/")[-1])
+            except (OSError, UnicodeDecodeError):
+                pass
+
+    # Also scan consumer files themselves for explicit WRITE-context literals
+    # (torch.save target, open(..., "w") arg, .write_bytes/.write_text receiver
+    # path with the literal). Those are legitimate self-produced names.
+    for cp in consumer_paths_resolved:
+        producer_literals.update(_extract_write_literals(cp))
+
+    violations: list[str] = []
+    for consumer, lits in consumer_literals.items():
+        phantoms = lits - producer_literals
+        for ph in sorted(phantoms):
+            violations.append(
+                f"{consumer}: reads {ph!r} but no producer in "
+                f"{producer_dirs} ever writes that name. "
+                f"R33/R34 bug class — verify the producer's actual output filename."
+            )
+
+    if verbose and violations:
+        print(f"  [filenames] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        n_consumer = sum(1 for cf in consumer_files if (root / cf).exists())
+        print(f"  [filenames] OK: {n_consumer} consumers x {n_producer_files} "
+              f"producer files clean ({len(producer_literals)} known artifacts)")
+
+    # ── AMRC mask-file validation hook ──
+    # If any archive directory under the repo has a masks.amrc artifact,
+    # validate its magic + header. This catches a future regression where
+    # a producer writes a malformed AMRC blob without anyone noticing.
+    amrc_violations = _validate_amrc_artifacts(root)
+    violations.extend(amrc_violations)
+    if amrc_violations and verbose:
+        for v in amrc_violations:
+            print(f"    • [amrc] {v}")
+
+    if violations and strict:
+        raise FilenameContractError(
+            "FILENAME CONTRACT VIOLATIONS — consumer reads a filename no "
+            "producer writes:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nThis is the R33/R34 bug class. Either:\n"
+            "  1. Fix the consumer to use the actual producer filename\n"
+            "  2. Add the filename to a producer that should write it\n"
+            "  3. Add it to _EXTERNAL_FILENAMES if it's contest/upstream data"
+        )
+    return violations
+
+
+def _validate_amrc_artifacts(root: Path) -> list[str]:
+    """Walk the repo for any *.amrc files in archive-like directories and
+    validate they begin with the AMRC magic bytes + a current version.
+
+    Searches: submissions/robust_current/**/*.amrc and
+    experiments/results/**/*.amrc (the conventional archive output dirs).
+    Skips directories that don't exist (this preflight is non-fatal in
+    those cases).
+    """
+    findings: list[str] = []
+    candidate_dirs = [
+        root / "submissions" / "robust_current",
+        root / "experiments" / "results",
+    ]
+    try:
+        from tac.lossless.argmax_codec import validate_amrc_file
+    except ImportError as e:
+        # Codec module not yet built — skip the check rather than fail
+        # the whole preflight. The contract violation list will still
+        # surface if a consumer reads masks.amrc but no producer writes it.
+        findings.append(
+            f"argmax_codec not importable ({e}); skipping AMRC validation"
+        )
+        return findings
+    for d in candidate_dirs:
+        if not d.exists():
+            continue
+        for amrc in d.rglob("*.amrc"):
+            try:
+                validate_amrc_file(amrc)
+            except (ValueError, OSError) as e:
+                findings.append(
+                    f"{amrc}: invalid AMRC header — {e}"
+                )
+    return findings
+
+
+# ── Loader format safety ──────────────────────────────────────────────────────
+#
+# Bug class this catches: a consumer (engineered_quant_noise.py,
+# pair_difficulty_map.py, kaggle_auth_eval_renderer.py, etc.) imports a
+# `load_renderer` helper that does a bare `torch.load(path, weights_only=False)`
+# on a path whose actual on-disk format is one of our binary exports
+# (FP4A/ASYM/DPSM/I4LZ). torch.load tries to interpret the magic bytes as
+# pickle, fails, and crashes with "could not convert string to float: 'P4AV'"
+# (DEN-V2 2026-04-26).
+#
+# Permanent fix: every `load_renderer`-style helper in the codebase MUST
+# content-detect the format. This validator AST-scans for the unsafe pattern.
+
+
+class LoaderFormatSafetyError(Exception):
+    """A consumer would torch.load a file path that might be a non-pickle
+    binary export (FP4A/ASYM/DPSM/I4LZ)."""
+
+
+# Module-relative names of canonical content-detecting loaders. A function
+# call resolved (statically) to one of these is treated as safe.
+_SAFE_LOADER_QUALNAMES = frozenset({
+    # Renderer loaders
+    "load_renderer",  # the canonical one in precompute_gradient_corrections
+    "load_any_renderer_checkpoint",
+    "load_asymmetric_checkpoint_fp4",
+    "load_asymmetric_checkpoint",
+    "load_renderer_checkpoint",
+    "detect_checkpoint_type",
+    "load_int4_lzma2",
+    # NWCS sensitivity-aware container loader — does NWCS1 magic-byte
+    # validation at neural_weight_codec_sensitivity.py:230 before parsing.
+    # Functions that delegate to this then torch.load on the codec_blob
+    # extracted from inside the verified container (a known-pickle field,
+    # not a user-supplied file path) are content-safe by construction.
+    "load_nwcs_renderer_container",
+    # Pose loaders (use the same content-detect pattern; see submission_archive)
+    "load_optimized_poses",
+    "load_poses_binary",
+})
+
+
+def _scan_python_for_unsafe_renderer_loader(path: Path) -> list[str]:
+    """AST-scan a Python file for two related anti-patterns:
+
+      1. `def load_renderer(...)` whose body calls `torch.load(...)` directly
+         on the checkpoint argument WITHOUT a content-magic dispatch beforehand.
+         (Producer-side: the loader is unsafe.)
+      2. Bare `torch.load(<some>.bin / "*.bin" / a variable spelled "checkpoint*")`
+         outside of a function known to be content-detecting.
+         (Consumer-side: the call site is unsafe.)
+
+    Returns a list of human-readable violations. Empty if clean.
+    """
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return [f"{path}: SyntaxError (cannot parse)"]
+
+    violations: list[str] = []
+
+    # --- Pattern 1: any function whose name matches a known loader-shape
+    # MUST content-detect the format (or delegate to a safe loader). Original
+    # rule only matched `load_renderer*`; Contrarian R2 V3 (2026-04-26)
+    # showed a refactor to `load_checkpoint`/`load_model`/`load_weights`/
+    # `_load_ckpt`/`restore_model` would silently bypass the gate. The
+    # expanded set catches the realistic rename surface.
+    SAFE_MAGIC_TOKENS = (
+        "FP4A",
+        "ASYM",
+        "DPSM",
+        "I4LZ",
+        "QH0",
+        "QM0",
+        "QH1",
+        "QZS3",
+        "MQZ1",
+        "QBF1",
+        "QFAI",
+        "PK\\x03\\x04",
+    )
+
+    def _is_loader_name(name: str) -> bool:
+        """Pattern 1 trigger: function names that are likely renderer/model
+        loaders. Intentionally broad — a false positive is a 1-line magic
+        check; a false negative is a DEN-V2-class production crash.
+
+        Contrarian R2 V3 (2026-04-26): expanded from `load_renderer*` only
+        to also catch `load_*`/`_load_*`/`restore_*` on model/renderer/
+        checkpoint/ckpt/weights/net suffixes — i.e. the realistic rename
+        surface that would silently bypass the original gate.
+
+        Exclusions: training-state and optimizer-state loaders are NOT
+        renderer artifacts (they're always pickle by construction —
+        optimizer state isn't tensor-only), so we exempt those names to
+        avoid noise.
+        """
+        n = name.lower()
+        # Any `load_*` / `_load_*` / `restore_*` / `_restore_*`
+        # whose suffix names a model/checkpoint-shaped object.
+        loader_prefixes = ("load_", "_load_", "restore_", "_restore_")
+        if not any(n.startswith(p) for p in loader_prefixes):
+            return False
+        # Explicitly NOT renderer loaders (they're always pickle by design).
+        non_renderer_suffixes = (
+            "training_state",
+            "optimizer_state",
+            "optimizer",
+            "scheduler",
+            "trainer_state",
+        )
+        if any(tok in n for tok in non_renderer_suffixes):
+            return False
+        # 2026-04-26 Mario R2 CRITICAL #1: explicit allowlist for known
+        # non-renderer loaders that the broad pattern (#1 below) would
+        # false-positive on. These are TRUSTED — they don't load the FP4
+        # renderer artifact format. Adding here exempts the function from
+        # Pattern 1 scan but consumers will still be caught by the call-site
+        # scan (Pattern 2) if they ever pass a renderer.bin path.
+        TRUSTED_NON_RENDERER_LOADERS = frozenset({
+            "load_checkpoint_weights",     # train_distill.py — training resume
+            "load_network_codec",          # network_codec.py — NeRV codec, not renderer
+            "load_checkpoint_state_dict",  # ensemble.py — ensemble combiner
+            "load_compressed_weights",     # generic int-quant deserializer
+            "load_postfilter",             # postfilter (different artifact class)
+        })
+        if name in TRUSTED_NON_RENDERER_LOADERS:
+            return False
+        # Suffix must look model/renderer/checkpoint-shaped.
+        loader_suffix_tokens = (
+            "renderer",
+            "model",
+            "checkpoint",
+            "ckpt",
+            "weights",
+            "net",
+        )
+        return any(tok in n for tok in loader_suffix_tokens)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _is_loader_name(node.name):
+            continue
+        body_src = ast.unparse(node) if hasattr(ast, "unparse") else ""
+        if not body_src:
+            continue
+        # Safe iff (a) the body mentions a known magic token, OR (b) the body
+        # delegates to one of the canonical safe loaders.
+        has_magic = any(tok in body_src for tok in SAFE_MAGIC_TOKENS)
+        delegates = any(
+            f"{nm}(" in body_src for nm in _SAFE_LOADER_QUALNAMES
+            if nm != node.name  # don't credit self-recursion
+        )
+        # Also consider it safe if it explicitly content-checks via a magic
+        # variable name pattern (e.g., `magic = raw[:4]`).
+        does_magic_read = bool(
+            re.search(r"\.read\(\s*4\s*\)", body_src)
+            or re.search(r"\[\s*:\s*4\s*\]", body_src)
+            or re.search(r"\b_PICKLE_MAGICS\b", body_src)
+            or re.search(r"\b_RENDERER_PICKLE_MAGICS\b", body_src)
+            or re.search(r"\b_looks_like_pytorch_pickle\b", body_src)
+            or re.search(r"\b_looks_like_pickle\b", body_src)
+        )
+        if has_magic or delegates or does_magic_read:
+            continue
+        # Otherwise, look for a torch.load call in the body. If found AND
+        # it uses weights_only=False (DEN-V2's exact failure mode — the
+        # legacy pickle path that crashes cryptically on FP4A magic), the
+        # function is unsafe. Calls with weights_only=True are tensor-only
+        # state-dict loads and cannot trigger the FP4A pickle crash, so
+        # they are not the DEN-V2 bug class.
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            fn_str = ast.unparse(sub.func) if hasattr(ast, "unparse") else ""
+            if fn_str not in ("torch.load", "torch.frombuffer"):
+                continue
+            # Check weights_only=False (the DEN-V2 failure mode).
+            uses_legacy_pickle = False
+            for kw in sub.keywords:
+                if kw.arg == "weights_only" and isinstance(kw.value, ast.Constant):
+                    if kw.value.value is False:
+                        uses_legacy_pickle = True
+                        break
+            if not uses_legacy_pickle:
+                continue
+            violations.append(
+                f"{path}:{node.lineno}: function `{node.name}` calls "
+                f"`{fn_str}(..., weights_only=False)` without "
+                f"content-detecting the file format first. This is the "
+                f"2026-04-26 DEN-V2 bug pattern: torch.load on an "
+                f"FP4A/ASYM/DPSM/I4LZ .bin file crashes with 'could not "
+                f"convert string to float'. (Detected via expanded "
+                f"loader-name match — load_*/restore_*/_load_*/_restore_* "
+                f"over renderer/model/checkpoint/ckpt/weights/state/net; "
+                f"Contrarian R2 V3 fix.) Either add a magic-byte dispatch "
+                f"(read first 4 bytes, branch on FP4A/ASYM/DPSM/I4LZ vs "
+                f"PyTorch pickle) OR delegate to "
+                f"experiments.precompute_gradient_corrections.load_renderer "
+                f"(the canonical content-detecting loader)."
+            )
+            break  # one violation per function is enough
+
+    # --- Pattern 2: any module-level (NOT inside a safe-named function) call
+    # like `torch.load(<arg>)` where the arg is a Name spelled like a
+    # checkpoint path. Skip calls that are inside a function we already know
+    # is safe (i.e., one whose body had the magic check above).
+
+    # Build a parent-pointer map.
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def _enclosing_fn(node: ast.AST) -> ast.FunctionDef | None:
+        cur = parents.get(id(node))
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return cur
+            cur = parents.get(id(cur))
+        return None
+
+    # Pattern 2 is intentionally NARROW: only flag when the FIRST positional
+    # arg looks SPECIFICALLY like a renderer-checkpoint variable (not just any
+    # "ckpt" — that's a TTO batch checkpoint, an optimizer state, etc.) AND
+    # the call uses `weights_only=False` (DEN-V2's exact failure mode — the
+    # legacy pickle path).
+    #
+    # The Contrarian forced this narrowing: an over-broad rule that flags
+    # every torch.load in the repo gets disabled, defeating the whole point.
+    # The tight rule stays on, catches the real DEN-V2 class without
+    # false-positing TTO checkpoint resume, training-state loads, etc.
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        if fn_str != "torch.load":
+            continue
+        if not node.args:
+            continue
+
+        # Require weights_only=False (or absent → defaults vary; tighten by
+        # requiring explicit False since that's the DEN-V2 failure mode).
+        has_weights_only_false = False
+        for kw in node.keywords:
+            if kw.arg == "weights_only" and isinstance(kw.value, ast.Constant):
+                if kw.value.value is False:
+                    has_weights_only_false = True
+        if not has_weights_only_false:
+            continue
+
+        # The first positional must be a "renderer-like" reference:
+        #   - a Name spelled with "renderer" (NOT just "checkpoint" / "ckpt"
+        #     which is too broad)
+        #   - OR a literal `.bin` filename
+        #   - OR a Call whose unparsed text contains "renderer"
+        first = node.args[0]
+        looks_renderer = False
+        if isinstance(first, ast.Name):
+            ident = first.id.lower()
+            if "renderer" in ident:
+                looks_renderer = True
+        elif isinstance(first, ast.Constant) and isinstance(first.value, str):
+            if first.value.endswith(".bin"):
+                looks_renderer = True
+        elif isinstance(first, ast.Call):
+            sub_str = ast.unparse(first) if hasattr(ast, "unparse") else ""
+            if "renderer" in sub_str.lower():
+                looks_renderer = True
+        if not looks_renderer:
+            continue
+
+        # If it's inside a function whose body has a magic check (covered by
+        # Pattern 1's safe-classification logic), let Pattern 1 own it.
+        enc = _enclosing_fn(node)
+        if enc is not None:
+            enc_src = ast.unparse(enc) if hasattr(ast, "unparse") else ""
+            if any(tok in enc_src for tok in SAFE_MAGIC_TOKENS):
+                continue
+            if any(f"{nm}(" in enc_src for nm in _SAFE_LOADER_QUALNAMES):
+                continue
+
+        # Test files are allowed to construct intentionally-wrong inputs.
+        if "/tests/" in str(path) or "test_" in path.name:
+            continue
+
+        violations.append(
+            f"{path}:{node.lineno}: bare `torch.load(<renderer-like>, "
+            f"weights_only=False)` with no content-magic dispatch. "
+            f"Use experiments.precompute_gradient_corrections.load_renderer "
+            f"(the canonical content-detecting loader) or "
+            f"tac.renderer_export.load_any_renderer_checkpoint instead. "
+            f"(Bug pattern: DEN-V2 2026-04-26 — torch.load on FP4A .bin "
+            f"crashes cryptically.)"
+        )
+
+    return violations
+
+
+def preflight_loader_format_safety(
+    repo_root: Path | None = None,
+    scan_dirs: list[str] | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Validate that every renderer checkpoint loader in the repo is
+    content-detecting (NOT bare torch.load).
+
+    Two scans per file:
+      1. Every `def load_renderer*` body must do magic-byte dispatch OR
+         delegate to a known safe loader.
+      2. No bare `torch.load(<checkpoint-like>)` outside a safe loader.
+
+    Skips test/smoke files (they construct intentionally-wrong inputs).
+
+    Returns the list of violations found. If `strict` and non-empty, raises
+    LoaderFormatSafetyError.
+    """
+    root = repo_root or REPO_ROOT
+    scan_dirs = scan_dirs or [
+        "experiments",
+        "src/tac",
+        "submissions/robust_current",
+    ]
+
+    all_violations: list[str] = []
+    n_scanned = 0
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for py_path in d_path.rglob("*.py"):
+            n_scanned += 1
+            all_violations.extend(_scan_python_for_unsafe_renderer_loader(py_path))
+
+    if verbose:
+        if all_violations:
+            print(f"  [loader-format] {len(all_violations)} violation(s) "
+                  f"across {n_scanned} files:")
+            for v in all_violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [loader-format] OK: {n_scanned} files clean — every "
+                  f"renderer loader is content-detecting")
+
+    if all_violations and strict:
+        raise LoaderFormatSafetyError(
+            "LOADER FORMAT SAFETY VIOLATIONS — a consumer would torch.load a "
+            "path that might be a non-pickle binary export. This is the "
+            "2026-04-26 DEN-V2 bug class:\n"
+            + "\n".join(f"  • {v}" for v in all_violations)
+            + "\n\nFix: use experiments.precompute_gradient_corrections."
+            "load_renderer (the canonical content-detecting loader) or add "
+            "magic-byte dispatch to your local helper. Suffix-based dispatch "
+            "is forbidden — it is what burned us in DEN-V2 (FP4 .bin) and "
+            "SHIRAZ (pickle .bin)."
+        )
+    return all_violations
+
+
+# ── Profile-vs-ArchConfig field consistency ───────────────────────────────────
+#
+# Bug class this catches: a profile sets `use_dscovn: True` (typo of
+# use_dsconv) and the model is built without DSConv silently — same SHIRAZ
+# class but at the profile-key level instead of the CLI-flag level.
+#
+# preflight_arity catches CLI flag drift (--use-dsconv missing). This new
+# validator catches profile-key drift (profile says `use_dscovn` but
+# ArchConfig has `use_dsconv` — close-match Levenshtein typo).
+
+
+def preflight_arch_consistency(strict: bool = True, verbose: bool = True) -> list[str]:
+    """Cross-validate every renderer-training PROFILES entry's arch keys
+    against tac.renderer.ArchConfig fields.
+
+    Two checks:
+      A. Every profile arch-like key (matches Levenshtein cutoff 0.85 to an
+         ArchConfig field) MUST exactly match an ArchConfig field name.
+         Otherwise it's a likely typo.
+      B. Every required ArchConfig field that profiles typically override
+         (PROFILE_REQUIRED_ARCH_KEYS) must be present in the profile.
+    """
+    import difflib
+    violations: list[str] = []
+    try:
+        from tac.profiles import PROFILES
+        from tac.renderer import ArchConfig
+    except ImportError as e:
+        msg = f"  [arch_consistency] cannot import: {e}"
+        if verbose:
+            print(msg)
+        return [msg]
+    arch_field_names = {
+        f.name for f in __import__("dataclasses").fields(ArchConfig)
+    }
+    n_profiles = 0
+    for name, prof in PROFILES.items():
+        if prof.get("experiment_type") != "renderer_training":
+            continue
+        n_profiles += 1
+        for key in prof.keys():
+            if key in arch_field_names:
+                continue
+            # Is it close to any ArchConfig field name?
+            close = difflib.get_close_matches(key, arch_field_names, n=1, cutoff=0.85)
+            if close:
+                violations.append(
+                    f"profile {name!r}: key {key!r} is close to ArchConfig "
+                    f"field {close[0]!r} but not an exact match. Likely typo. "
+                    f"If intentional (training-script-only key), rename to "
+                    f"something distinct from ArchConfig fields."
+                )
+    if verbose and violations:
+        print(f"  [arch_consistency] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [arch_consistency] OK: {n_profiles} renderer profile(s) "
+              f"× {len(arch_field_names)} ArchConfig fields clean")
+    if violations and strict:
+        raise PreflightError(
+            "ARCH CONSISTENCY VIOLATIONS — profile keys close to but not "
+            "matching ArchConfig fields:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Profile validation ────────────────────────────────────────────────────────
+
+PROFILE_REQUIRED_ARCH_KEYS = {
+    "base_ch", "mid_ch", "depth", "pose_dim", "padding_mode", "eval_roundtrip",
+    # 2026-04-26 hardening: every renderer profile MUST declare seed +
+    # deterministic explicitly. tools/check_determinism.py refuses to run
+    # without them. SHIRAZ launch crashed mid-deploy on this exact missing
+    # key on 2026-04-26.
+    "seed", "deterministic",
+}
+PROFILE_RECOMMENDED_KEYS = {
+    "embed_dim", "motion_hidden", "use_dsconv", "use_dilation",
+}
+
+
+def preflight_profiles(strict: bool = True, verbose: bool = True) -> list[str]:
+    """Validate every PROFILES entry against architectural and binding constraints.
+
+    Catches:
+      - Missing required arch keys (would crash training silently with defaults).
+      - eval_roundtrip != True (CLAUDE.md non-negotiable).
+      - Typo'd keys (warns: not in the recommended/known set).
+      - padding_mode not in (zeros, replicate, reflect, circular).
+    """
+    violations: list[str] = []
+    try:
+        from tac.profiles import PROFILES
+    except ImportError as e:
+        msg = f"  [profiles] cannot import tac.profiles: {e}"
+        if verbose:
+            print(msg)
+        return [msg]
+
+    # Profiles whose experiment_type is renderer training (the ones that flow
+    # through pipeline.py + qat_finetune.py + optimize_poses.py). Other profile
+    # families (e.g., the legacy "training" CPU lane) have different schemas.
+    RENDERER_TYPES = {"renderer_training"}
+
+    KNOWN_TYPES = RENDERER_TYPES | {
+        "training",         # legacy CPU lane
+        "smoke_test",       # quick correctness checks, no arch contract
+        "eval",             # contest-compliant evaluation profiles
+        "gpu_lane",         # constrained-gen / variational / ensemble lanes
+        "self_compress",    # self-compression eureka profiles
+        "entropy_archive",  # entropy-coded archive experiments
+        "network_codec",    # learned codec profiles
+    }
+    for name, prof in PROFILES.items():
+        etype = prof.get("experiment_type")
+        if etype is None:
+            violations.append(
+                f"profile {name!r} missing 'experiment_type' key — would be "
+                f"silently skipped by validation. Set to 'training' or 'renderer_training'."
+            )
+            continue
+        if etype not in KNOWN_TYPES:
+            violations.append(
+                f"profile {name!r} has unknown experiment_type={etype!r}. "
+                f"Expected one of {sorted(KNOWN_TYPES)}."
+            )
+            continue
+        # R38 fix: enforce eval_roundtrip=True on ALL training profile types
+        # ("training" + "renderer_training"), not just renderer_training.
+        # CLAUDE.md non-negotiable applies to every training path.
+        if etype in ("training", "renderer_training"):
+            if "eval_roundtrip" in prof and prof.get("eval_roundtrip") is not True:
+                violations.append(
+                    f"profile {name!r} has eval_roundtrip={prof.get('eval_roundtrip')!r}, "
+                    f"must be True (CLAUDE.md non-negotiable)"
+                )
+        if etype not in RENDERER_TYPES:
+            continue
+        for key in PROFILE_REQUIRED_ARCH_KEYS:
+            if key not in prof:
+                violations.append(f"profile {name!r} missing required arch key {key!r}")
+        # eval_roundtrip on renderer profiles is REQUIRED to be True (not just
+        # "if present, True").
+        if prof.get("eval_roundtrip") is not True:
+            violations.append(
+                f"profile {name!r} has eval_roundtrip={prof.get('eval_roundtrip')!r}, "
+                f"must be True (CLAUDE.md non-negotiable)"
+            )
+        pm = prof.get("padding_mode")
+        if pm is not None and pm not in {"zeros", "replicate", "reflect", "circular"}:
+            violations.append(f"profile {name!r} invalid padding_mode={pm!r}")
+        # R38 fix: catch non-int depth before int() raises ValueError.
+        depth = prof.get("depth")
+        if depth is not None:
+            if not isinstance(depth, int):
+                violations.append(
+                    f"profile {name!r} depth={depth!r} type {type(depth).__name__}, expected int"
+                )
+            elif not (1 <= depth <= 4):
+                violations.append(f"profile {name!r} depth={depth} out of range [1,4]")
+
+        # Fridrich council #1 (2026-04-26): dct_quant_weight bounds check.
+        # Catches typo'd huge values (e.g. 50.0) that would dominate the loss
+        # stack and starve the scorer signal. Reasonable range: 0 (off) to
+        # 10.0 (heavy weight, larger than any other Fridrich aux loss in DEN).
+        dqw = prof.get("dct_quant_weight")
+        if dqw is not None:
+            if not isinstance(dqw, (int, float)):
+                violations.append(
+                    f"profile {name!r} dct_quant_weight={dqw!r} type "
+                    f"{type(dqw).__name__}, expected float"
+                )
+            elif not (0.0 <= float(dqw) <= 10.0):
+                violations.append(
+                    f"profile {name!r} dct_quant_weight={dqw} out of range "
+                    f"[0.0, 10.0] — values >10 would overwhelm scorer signal "
+                    f"and starve PoseNet/SegNet gradients."
+                )
+
+        # Lane D2: mask_half_sim_prob requires use_zoom_flow=True. The
+        # training-side simulation derives the warp from RadialZoomWarp via
+        # tac.lane_mark_speed.zoom_from_masks; with use_zoom_flow=False the
+        # renderer doesn't accept the flow signal and the simulation is dead
+        # weight (consumes compute, doesn't shift the trained distribution).
+        msp = prof.get("mask_half_sim_prob", 0.0)
+        if msp is not None and msp > 0:
+            if not isinstance(msp, (int, float)) or not (0 <= msp <= 1):
+                violations.append(
+                    f"profile {name!r} mask_half_sim_prob={msp!r} must be in [0, 1]"
+                )
+            if not prof.get("use_zoom_flow"):
+                violations.append(
+                    f"profile {name!r} sets mask_half_sim_prob={msp} but "
+                    f"use_zoom_flow={prof.get('use_zoom_flow')!r}. The "
+                    f"training-side mask-half simulation only matches inflate "
+                    f"behaviour when use_zoom_flow=True (the inflate side warps "
+                    f"odd-frame masks via RadialZoomWarp). Either enable "
+                    f"use_zoom_flow=True or set mask_half_sim_prob=0."
+                )
+
+    if verbose and violations:
+        print(f"  [profiles] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        n_renderer = sum(1 for p in PROFILES.values() if p.get("experiment_type") in RENDERER_TYPES)
+        print(f"  [profiles] OK: {n_renderer} renderer profile(s) validated")
+
+    if violations and strict:
+        raise PreflightError(
+            "PROFILE VALIDATION FAILED:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def preflight_bootstrap_safety(
+    scripts_dir: str | Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Scan scripts/*_bootstrap.sh for the silent-failure cascade patterns
+    that nuked LANE-B (2026-04-26, 6.5h + ~$2 wasted).
+
+    The LANE-B kill chain (post-mortem in feedback_zip_dep_bootstrap_trap.md):
+      1. PyTorch container has no `zip` binary; shell `zip` failed.
+      2. `set -uo pipefail` (no `-e`) didn't abort on the failure.
+      3. Empty ARCHIVE_BYTES crashed auth_eval at the very end.
+
+    This preflight catches #1 and #2 statically by reading every bootstrap
+    script's source. Patterns enforced:
+
+      A. `set -euo pipefail` (or any -e* form) — `-e` is non-negotiable.
+      B. No bare `zip` shell command (use python `zipfile.ZipFile` instead).
+
+    Each violation explains what went wrong and the canonical fix.
+
+    Args:
+        scripts_dir: directory containing *_bootstrap.sh (defaults to repo
+            scripts/). Pass a different path for testing.
+        strict: raise PreflightError on any violation.
+        verbose: print summary.
+
+    Returns:
+        list of violation strings (may be empty).
+    """
+    import re
+    from pathlib import Path as _Path
+
+    if scripts_dir is None:
+        # Repo root resolution — preflight.py lives in src/tac/, so up two.
+        scripts_dir = _Path(__file__).resolve().parents[2] / "scripts"
+    scripts_dir = _Path(scripts_dir)
+
+    violations: list[str] = []
+    if not scripts_dir.is_dir():
+        msg = f"  [bootstrap] scripts dir not found: {scripts_dir}"
+        if verbose:
+            print(msg)
+        return [msg]
+
+    bootstraps = sorted(scripts_dir.glob("*_bootstrap.sh"))
+    if not bootstraps:
+        if verbose:
+            print(f"  [bootstrap] no *_bootstrap.sh found in {scripts_dir}")
+        return []
+
+    # Match `set -e`, `set -eu`, `set -euo`, `set -ue`, etc. — any combination
+    # that includes a literal `-e` flag (with or without -u / -o / pipefail).
+    SET_E_RE = re.compile(r"^\s*set\s+-[a-z]*e[a-z]*(\s|$)", re.MULTILINE)
+
+    for path in bootstraps:
+        text = path.read_text()
+
+        # Strip comments + heredocs lazily — we want code-line analysis only.
+        code_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            code_lines.append(line)
+        code = "\n".join(code_lines)
+
+        # A. set -e flag present
+        if not SET_E_RE.search(code):
+            violations.append(
+                f"{path.name}: missing `set -e` (any -e* flag) — silent "
+                f"command failures will cascade. LANE-B died this way: "
+                f"`zip` failed, script kept running, 6.5h of pose TTO "
+                f"output got crashed at the very end. Use "
+                f"`set -euo pipefail` (matches the other bootstraps)."
+            )
+
+        # B. No `zip` shell binary (PyTorch container doesn't ship it).
+        # Match `zip ` at command position, not `zipfile`/`unzip`/`gzip`.
+        bad = re.search(r"(^|[\s;&|`\(])zip\s+(?!file)", code)
+        if bad:
+            violations.append(
+                f"{path.name}: invokes `zip` shell binary (match: "
+                f"{bad.group(0).strip()!r}). The PyTorch CUDA container "
+                f"`pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel` does NOT "
+                f"ship `zip` — the command will silently fail. Use python "
+                f"`zipfile.ZipFile` instead (no apt dep, deterministic)."
+            )
+
+    if verbose and violations:
+        print(f"  [bootstrap] {len(violations)} violation(s) across {len(bootstraps)} script(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [bootstrap] OK: {len(bootstraps)} bootstrap script(s) clean")
+
+    if violations and strict:
+        raise PreflightError(
+            "BOOTSTRAP SCRIPT SAFETY FAILED (LANE-B kill chain):\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-04-27 codex R5-r6: 5 new preflight checks for the round-6 findings.
+# Each check guards against a regression of the matching finding fix:
+#
+#   A. check_no_brittle_six_line_waiver_lookback  — Finding #1 (waiver)
+#   B. check_kl_distill_uses_roundtripped_frames   — Finding #2 (KL roundtrip)
+#   C. check_eval_roundtrip_gate_called_after_output_dir_resolution
+#                                                  — Finding #3 (gate ordering)
+#   D. check_nvdec_probe_has_error_classification  — Finding #4 (probe)
+#   E. check_archive_builders_use_deterministic_zip — Finding #5 (det. zip)
+#
+# All wired warn-only initially in preflight_all() (per the established
+# Lane A → strict promotion pattern); flip to strict=True once live counts
+# are zero and codex has signed off.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+# ── Check A: waiver lookback must NOT exceed 1 line ──────────────────────────
+def check_no_brittle_six_line_waiver_lookback(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard Finding #1: scanner waiver lookback constant must be 0 or 1.
+
+    The previous lookback was 6 lines, which let a waiver intended for one
+    pending-ruling import suppress an UNRELATED scorer load inserted
+    nearby. The auditable fix is same-line-only (lookback 0). This check
+    inspects `_WAIVER_LOOKBACK_LINES` in `src/tac/preflight.py` (this
+    file) and refuses anything > 1.
+    """
+    root = repo_root or REPO_ROOT
+    pf = root / "src" / "tac" / "preflight.py"
+    violations: list[str] = []
+    if not pf.exists():
+        return violations
+    text = pf.read_text()
+    # Extract the `_WAIVER_LOOKBACK_LINES = N` literal via simple regex.
+    m = re.search(
+        r"_WAIVER_LOOKBACK_LINES\s*=\s*(\d+)", text,
+    )
+    if m is None:
+        violations.append(
+            f"{pf.relative_to(root)}: missing `_WAIVER_LOOKBACK_LINES` "
+            f"constant (the waiver-lookback scanner can no longer be audited)."
+        )
+    else:
+        n = int(m.group(1))
+        if n > 1:
+            violations.append(
+                f"{pf.relative_to(root)}: _WAIVER_LOOKBACK_LINES = {n} "
+                f"(must be 0 or 1 per codex R5-r6 #1; the previous 6-line "
+                f"lookback let unrelated nearby loads ride a single waiver)."
+            )
+
+    if verbose and violations:
+        print(
+            f"  [waiver-lookback] {len(violations)} violation(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [waiver-lookback] OK")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "WAIVER LOOKBACK violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check B: kl_distill_segnet_only must NOT receive raw renderer pairs ─────
+_KL_DISTILL_FORBIDDEN_FIRST_ARGS = frozenset({"pairs", "rendered_pair", "rendered_pair_hwc"})
+
+
+def _scan_python_for_kl_distill_raw_pairs(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect call sites of kl_distill_segnet_only(...) whose FIRST positional
+    arg is a raw renderer-output variable (one of `pairs`, `rendered_pair`,
+    `rendered_pair_hwc`). The contract requires the same eval-roundtripped
+    frames the SegNet scoring path consumes (codex R5-r6 #2).
+
+    The check is intentionally STRICT on naming — the in-repo recipe is
+    `rendered_pair_hwc_rt` (or any name with `_rt` / `roundtripped` in it).
+    Add a `# KL_RAW_PAIRS_OK:<reason>` marker on the call line if the
+    raw pairs are intentional (e.g., a unit test verifying the contract).
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+    lines = text.splitlines()
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        if not func_str.endswith("kl_distill_segnet_only"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        # Extract simple name; skip complex expressions (which already permute
+        # / view → presumed roundtripped).
+        if not isinstance(first, ast.Name):
+            continue
+        if first.id not in _KL_DISTILL_FORBIDDEN_FIRST_ARGS:
+            continue
+        # Same-line waiver opt-out.
+        ln = node.lineno
+        if 0 < ln <= len(lines):
+            comment_idx = lines[ln - 1].find("#")
+            if comment_idx >= 0 and "KL_RAW_PAIRS_OK" in lines[ln - 1][comment_idx:]:
+                continue
+        violations.append(
+            f"{rel}:{node.lineno}: `kl_distill_segnet_only({first.id}, ...)` "
+            f"passes raw renderer output to the KL helper. Codex R5-r6 #2: "
+            f"feed the SAME eval-roundtripped frames the SegNet scoring "
+            f"path consumes (typical name: `rendered_pair_hwc_rt`). If "
+            f"intentional, add `# KL_RAW_PAIRS_OK:<reason>` on this line."
+        )
+    return violations
+
+
+def check_kl_distill_uses_roundtripped_frames(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard Finding #2: KL distillation must operate on roundtripped frames.
+
+    Live failure mode: optimize_poses.py passed `pairs` (raw renderer
+    output) to `kl_distill_segnet_only(...)`, while the SegNet scoring
+    path used `simulate_eval_roundtrip(frames_chw, ...)` first. Lane G
+    KL gradients pulled the renderer in the wrong direction relative to
+    the scored loss path.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for sub in ("experiments", "src/tac/experiments"):
+        d = root / sub
+        if not d.exists():
+            continue
+        for p in d.rglob("*.py"):
+            # Skip __pycache__, tests live in src/tac/tests not here.
+            if "__pycache__" in p.parts:
+                continue
+            n_scanned += 1
+            violations.extend(_scan_python_for_kl_distill_raw_pairs(p, root))
+    # SegMapTrainer is a library-side KL caller, not an experiment script.
+    # Keep it in this guard so trainer refactors cannot silently pass raw
+    # renderer pairs while experiments stay clean.
+    segmap_renderer = root / "src/tac/segmap_renderer.py"
+    if segmap_renderer.exists():
+        n_scanned += 1
+        violations.extend(_scan_python_for_kl_distill_raw_pairs(segmap_renderer, root))
+
+    if verbose and violations:
+        print(
+            f"  [kl-roundtrip] {len(violations)} violation(s) across "
+            f"{n_scanned} script(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [kl-roundtrip] OK: {n_scanned} script(s) scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "KL DISTILL ROUNDTRIP violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFeed the SegNet path's simulate_eval_roundtrip output, "
+            + "not raw renderer pairs (codex R5-r6 #2)."
+        )
+    return violations
+
+
+# ── Check C: _enforce_eval_roundtrip(args) must follow output_dir resolution ─
+def _scan_python_for_gate_before_output_dir(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Find scripts where `_enforce_eval_roundtrip(args)` is called BEFORE
+    any line that writes to `args.output_dir = ...` or first reads
+    `args.output_dir` (codex R5-r6 #3).
+
+    Heuristic: scan for the first line that calls
+    `_enforce_eval_roundtrip(args)` AND the first line that ASSIGNS
+    `args.output_dir = ...` (which means the script is computing a default
+    output dir at runtime). If the gate call comes first, the sidecar
+    write is dropped (output_dir is None at gate time).
+
+    Files that never assign args.output_dir (CLI default suffices) pass
+    trivially.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    lines = text.splitlines()
+    gate_lineno: int | None = None
+    output_dir_assign_lineno: int | None = None
+    for i, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Match a CALL of _enforce_eval_roundtrip(args), not its def.
+        if "_enforce_eval_roundtrip(args" in line and not stripped.startswith("def "):
+            if gate_lineno is None:
+                gate_lineno = i
+        # Match `args.output_dir = ...` assignments (default-resolution).
+        # Use a simple substring; precise AST walk would be overkill here.
+        if "args.output_dir = " in line or "args.output_dir=" in line:
+            if output_dir_assign_lineno is None:
+                output_dir_assign_lineno = i
+    if gate_lineno is None or output_dir_assign_lineno is None:
+        return []
+    if gate_lineno < output_dir_assign_lineno:
+        return [
+            f"{rel}:{gate_lineno}: `_enforce_eval_roundtrip(args)` called "
+            f"BEFORE `args.output_dir` resolution at line "
+            f"{output_dir_assign_lineno}. Sidecar JSON will land at None / be "
+            f"silently dropped. Move the gate call AFTER output_dir "
+            f"resolution (codex R5-r6 #3)."
+        ]
+    return []
+
+
+def check_eval_roundtrip_gate_called_after_output_dir_resolution(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard Finding #3: gate call must follow `args.output_dir = ...`."""
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for sub in ("experiments", "src/tac/experiments"):
+        d = root / sub
+        if not d.exists():
+            continue
+        for p in d.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            n_scanned += 1
+            violations.extend(_scan_python_for_gate_before_output_dir(p, root))
+
+    if verbose and violations:
+        print(
+            f"  [gate-ordering] {len(violations)} violation(s) across "
+            f"{n_scanned} script(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [gate-ordering] OK: {n_scanned} script(s) scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "GATE ORDERING violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nMove the _enforce_eval_roundtrip(args) call AFTER any "
+            + "args.output_dir = ... default-resolution (codex R5-r6 #3)."
+        )
+    return violations
+
+
+# ── Check D: NVDEC probe must have error classification ─────────────────────
+def check_nvdec_probe_has_error_classification(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard Finding #4: probe_nvdec.sh must classify failures, not exit-2-all.
+
+    Insists on the presence of the PROBE_CLASSIFICATION marker AND at least
+    2 distinct exit codes for non-OK paths (so a fixture/dependency error
+    cannot be misclassified as a missing-NVDEC host).
+    """
+    root = repo_root or REPO_ROOT
+    probe = root / "scripts" / "probe_nvdec.sh"
+    violations: list[str] = []
+    if not probe.exists():
+        violations.append(
+            "scripts/probe_nvdec.sh: missing — no NVDEC probe at all. "
+            "Restore the file (feedback_vastai_nvdec_host_variation)."
+        )
+    else:
+        text = probe.read_text()
+        if "PROBE_CLASSIFICATION:" not in text:
+            violations.append(
+                "scripts/probe_nvdec.sh: missing PROBE_CLASSIFICATION marker. "
+                "Codex R5-r6 #4: the probe must print a classification token "
+                "so bash can dispatch on NVDEC vs DALI vs FIXTURE failure."
+            )
+        # Look for at least 2 distinct exit codes besides 0 and 1 (1 == DALI
+        # missing). Specifically expect 2 (NVDEC), 3 (DALI build), 4
+        # (fixture), 5 (unknown). Settle for any 3 distinct from {2,3,4,5}.
+        exits = set()
+        for m in re.finditer(r"\bexit\s+([0-9]+)\b", text):
+            n = int(m.group(1))
+            if n in (2, 3, 4, 5):
+                exits.add(n)
+        if len(exits) < 2:
+            violations.append(
+                f"scripts/probe_nvdec.sh: only {len(exits)} distinct "
+                f"non-NVDEC exit codes found (need >= 2). Add separate "
+                f"exit codes for FIXTURE / DALI_BUILD / UNKNOWN (codex "
+                f"R5-r6 #4)."
+            )
+
+    if verbose and violations:
+        print(
+            f"  [probe-classification] {len(violations)} violation(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [probe-classification] OK")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "NVDEC PROBE CLASSIFICATION violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check E: archive builders must use deterministic zip ────────────────────
+_DET_ZIP_OPT_OUT = "DETERMINISTIC_ZIP_OK"
+_DET_ZIP_HINT_FNS = (
+    "_deterministic_zip_write",
+    "deterministic_zip_directory",
+    "write_deterministic_zip_file",
+    "write_deterministic_zip_member",
+    "writestr",
+    "ZipInfo",
+)
+
+
+def _scan_python_for_nondeterministic_zip(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Find archive builders that call `ZipFile.write(...)` without a
+    deterministic-zip helper (codex R5-r6 #5). Files with the explicit
+    `# DETERMINISTIC_ZIP_OK` marker or a wrapper helper opt out."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if _DET_ZIP_OPT_OUT in text:
+        return []
+    # If the file uses the deterministic helper OR uses ZipInfo+writestr
+    # AT LEAST ONCE alongside any .write() calls, consider it OK.
+    has_helper_or_zipinfo = any(h in text for h in _DET_ZIP_HINT_FNS)
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return []
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        # Match `<x>.write(<path>, arcname=...)`-style calls, not just
+        # `<x>.write(<path>)` since the latter is also bad. The signature
+        # is `ZipFile.write(filename, arcname=None, compress_type=None, ...)`,
+        # so the FIRST positional arg is a path-like (str or Path).
+        if not func_str.endswith(".write"):
+            continue
+        # Only flag if this call is inside a `with ZipFile(...) as <x>` and
+        # the receiver matches. Approximate: look for `zipfile.ZipFile`
+        # imported in file. Skip otherwise.
+        if "ZipFile" not in text:
+            continue
+        if has_helper_or_zipinfo:
+            continue
+        violations.append(
+            f"{rel}:{node.lineno}: `{func_str}(...)` inside a ZipFile "
+            f"context — non-deterministic (embeds source mtime + perm bits). "
+            f"Codex R5-r6 #5: use a fixed-timestamp ZipInfo + writestr() "
+            f"OR add `# DETERMINISTIC_ZIP_OK` marker if intentional."
+        )
+    return violations
+
+
+def check_archive_builders_use_deterministic_zip(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard Finding #5: archive-build scripts produce byte-identical zips."""
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    # Cover experiments/*build*.py + experiments/results/lane_*_*/build*.py
+    candidates: list[Path] = []
+    if (root / "experiments").exists():
+        candidates.extend(sorted((root / "experiments").rglob("build*.py")))
+        candidates.extend(sorted((root / "experiments").rglob("*build_archive*.py")))
+    for rel in (
+        "scripts/compress_archive.py",
+        "submissions/robust_current/compress_archive.py",
+    ):
+        candidate = root / rel
+        if candidate.exists():
+            candidates.append(candidate)
+    # Dedupe
+    candidates = sorted({p for p in candidates if p.is_file()})
+    for p in candidates:
+        if "__pycache__" in p.parts:
+            continue
+        n_scanned += 1
+        violations.extend(_scan_python_for_nondeterministic_zip(p, root))
+
+    compress_sh = root / "submissions" / "robust_current" / "compress.sh"
+    if compress_sh.exists():
+        n_scanned += 1
+        text = compress_sh.read_text()
+        if (
+            "zipfile.ZipFile" in text
+            and ".write(" in text
+            and not any(h in text for h in _DET_ZIP_HINT_FNS)
+            and _DET_ZIP_OPT_OUT not in text
+        ):
+            violations.append(
+                "submissions/robust_current/compress.sh: inline Python "
+                "ZipFile.write(...) fallback is non-deterministic. Use "
+                "tac.submission_archive.deterministic_zip_directory()."
+            )
+
+    if verbose and violations:
+        print(
+            f"  [det-zip] {len(violations)} violation(s) across "
+            f"{n_scanned} archive-build script(s):"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [det-zip] OK: {n_scanned} archive-build script(s) scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "DETERMINISTIC ZIP violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nUse fixed-timestamp ZipInfo + writestr (codex R5-r6 #5)."
+        )
+    return violations
+
+
+_RAW_EXTRACTALL_ALLOWED = {
+    "src/tac/submission_archive.py",
+}
+
+
+def check_no_raw_zip_extractall(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Block raw ZipFile.extractall outside the canonical safe extractor."""
+    root = repo_root or REPO_ROOT
+    scan_roots = ("src", "tools", "scripts", "experiments", "submissions")
+    violations: list[str] = []
+    needle = "." + "extractall("
+    for rel_root in scan_roots:
+        base = root / rel_root
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            if rel in _RAW_EXTRACTALL_ALLOWED:
+                continue
+            if any(part in path.parts for part in ("__pycache__", ".pytest_cache", "tests")):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if needle in line:
+                    violations.append(
+                        f"{rel}:{lineno}: raw ZipFile.extractall is forbidden; "
+                        "use tac.submission_archive.safe_extract_zip"
+                    )
+    if verbose and violations:
+        print(f"  [safe-zip-extract] {len(violations)} raw extractall violation(s):")
+        for violation in violations:
+            print(f"    • {violation}")
+    elif verbose:
+        print("  [safe-zip-extract] OK")
+    if violations and strict:
+        raise MetaBugViolation(
+            "RAW ZIP EXTRACTALL violations:\n"
+            + "\n".join(f"  • {violation}" for violation in violations)
+        )
+    return violations
+
+
+# ── Check F: public release docs must not leak private ops state ────────────
+_PUBLIC_RELEASE_SCAN_PATHS = (
+    "README.md",
+    "AGENTS.md",
+    "docs",
+    "notebooks",
+    "reports/latest.md",
+    "reports/writeup_working.md",
+    "reports/yousfi_fridrich_observability_20260502",
+)
+
+_PUBLIC_RELEASE_EXEMPT_PREFIXES = (
+    ".omx/",
+    "docs/superpowers/",
+    "experiments/results/",
+    "reports/raw/",
+    "reports/private/",
+    "submissions/robust_current/eval_runs/",
+)
+
+_PUBLIC_RELEASE_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "local absolute operator path",
+        re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+(?:/[^\s)\"'<>`]*)?"),
+    ),
+    (
+        "private-key material",
+        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+    ),
+    (
+        "OpenAI-style API token",
+        re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    ),
+    (
+        "GitHub personal access token",
+        re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    ),
+    (
+        "Hugging Face token",
+        re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    ),
+    (
+        "explicit secret environment assignment",
+        re.compile(r"\b(?:VAST_API_KEY|LIGHTNING_API_KEY|CLOUDFLARE_API_TOKEN|OPENAI_API_KEY)\s*="),
+    ),
+    (
+        "concrete Vast SSH endpoint",
+        re.compile(r"\bssh\d+\.vast\.ai(?::\d+)?\b"),
+    ),
+    (
+        "private Lightning Studio app link",
+        re.compile(r"https://lightning\.ai/[^/\s)]+/[^/\s)]+/studios/"),
+    ),
+    (
+        "raw Modal call id",
+        re.compile(r"\bfc-[A-Z0-9]{20,}\b"),
+    ),
+    (
+        "raw Modal app id",
+        re.compile(r"\bap-[A-Za-z0-9]{10,}\b"),
+    ),
+)
+
+
+def _public_release_rel(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _public_release_path_exempt(rel: str) -> bool:
+    rel = rel.replace("\\", "/")
+    return any(rel == prefix.rstrip("/") or rel.startswith(prefix) for prefix in _PUBLIC_RELEASE_EXEMPT_PREFIXES)
+
+
+def _iter_public_release_scan_files(root: Path, scan_paths: list[str | Path] | None) -> list[Path]:
+    selected = scan_paths if scan_paths is not None else list(_PUBLIC_RELEASE_SCAN_PATHS)
+    files: list[Path] = []
+    for raw in selected:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = root / path
+        if not path.exists():
+            continue
+        if path.is_file():
+            rel = _public_release_rel(path, root)
+            if not _public_release_path_exempt(rel):
+                files.append(path)
+            continue
+        for candidate in sorted(path.rglob("*")):
+            if not candidate.is_file():
+                continue
+            rel = _public_release_rel(candidate, root)
+            if _public_release_path_exempt(rel):
+                continue
+            if any(part in {"__pycache__", ".git", ".venv"} for part in candidate.parts):
+                continue
+            files.append(candidate)
+    return sorted({p.resolve() for p in files})
+
+
+def check_public_release_hygiene(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_paths: list[str | Path] | None = None,
+) -> list[str]:
+    """Guard public docs/site/notebook surfaces against private ops leakage.
+
+    This is intentionally a publish-surface check, not a research-ledger scrub.
+    Raw `.omx/state`, harvested manifests, and forensic logs may contain local
+    paths or provider identifiers for custody, but those files are not public
+    supplement inputs. Use placeholders such as `${LIGHTNING_SUPPLEMENT_URL}`
+    and `${CLOUDFLARE_PAGES_URL}` until a public release manifest deliberately
+    records the final URLs.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    files = _iter_public_release_scan_files(root, scan_paths)
+    for path in files:
+        rel = _public_release_rel(path, root)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for label, pattern in _PUBLIC_RELEASE_SECRET_PATTERNS:
+                if pattern.search(line):
+                    violations.append(
+                        f"{rel}:{lineno}: public release hygiene violation: "
+                        f"{label}. Redact into a placeholder, local manifest, "
+                        f"or private custody artifact before GitHub/site publish."
+                    )
+
+    if verbose and violations:
+        print(
+            f"  [public-release-hygiene] {len(violations)} violation(s) "
+            f"across {len(files)} scanned public file(s):"
+        )
+        for v in violations[:20]:
+            print(f"    • {v}")
+        if len(violations) > 20:
+            print(f"    • ... {len(violations) - 20} more")
+    elif verbose:
+        print(f"  [public-release-hygiene] OK: {len(files)} public file(s) scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PUBLIC RELEASE HYGIENE violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nDo not publish local paths, provider job surfaces, or "
+            + "secrets. Use sanitized public manifests for Lightning.ai and "
+            + "Cloudflare Pages supplement URLs."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ADDITIVE META-BUG SECTION (2026-04-27, post-R5-r6)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 12 new static-detectable preflight checks for meta-bug classes that have
+# bitten this project but were NOT covered by checks 1-18 (existing meta-bug
+# section + R5-r6 codex-fix subagent additions).
+#
+# These checks live in their own additive section to avoid merge conflict with
+# past codex-fix subagents that edited checks 14-18. As of 2026-04-27 they are
+# all wired into preflight_all() at strict=True (call sites near the top of
+# preflight_all). New additive checks should land here too, then promoted.
+#
+# Pattern → memory entry mapping:
+#   A. vastai-create-no-label                → orphan-instance prevention (today)
+#   B. vastai-create-no-tracker              → cost-tracker registration
+#   C. subagent-prompt-allows-cpu-fallback   → CLAUDE.md device-required rule
+#   D. score-without-cuda-tag                → CLAUDE.md auth-eval-everywhere
+#   E. waiver-marker-no-env-gate-name        → strict-scorer-rule auditability
+#   F. half-frame-archive-without-trained    → feedback_half_frame_breaks_posenet
+#   G. profile-key-no-resolver-bidirectional → extends dead-resolver scanner
+#   H. inflate-scorer-load-no-runtime-banner → CLAUDE.md strict-scorer-rule
+#   I. test-files-broken-imports             → test-coverage hygiene
+#   J. subagent-prompt-no-cost-cap           → feedback_vastai_cost_paranoia
+#   K. uniward-delta-no-attestation-flag     → Lane C R5 attestation gate
+#   L. remote-script-no-provenance-write     → canonical pipeline standard
+#
+# All twelve start strict=False and must be promoted manually after the live
+# violation count is verified clean (per the established Lane A → strict
+# promotion pattern documented in commit 7f2740e4).
+
+
+# ── Check 81: silent-default override audit must produce 0 CRITICAL ───────
+#
+# CATCHES: the KL distill bug class — a non-None argparse default in a
+# profile-using script silently overrides the profile's value when the
+# resolver doesn't special-case it. Today's session found 3 real bugs of
+# this shape in train_renderer.py (--fp4-codebook silently using 'default'
+# instead of profile's 'residual' for 14 profiles, --grad-clip 1.0 vs
+# profile's 10.0, --wall-clock-timeout 0 vs profile's 39600). The Lane GP
+# fit_pose_gp:33 baseline_poses bug was a sister class.
+#
+# Memory: feedback_silent_default_bug_class_findings_20260429.md.
+# Memory: feedback_silent_default_bug_class_findings_20260429.md.
+
+
+def check_silent_default_audit_clean(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Wrap tools/audit_silent_defaults.py — fail strict if CRITICAL > 0.
+
+    The audit tool already filters scripts without a profile mechanism,
+    scripts using _resolve()/_apply_profile()/_user_provided_flags(), and
+    structurally-correct action="store_true"+default=False patterns. After
+    those filters, any CRITICAL finding is a real silent-override bug.
+
+    Live count after today's commits (4eeb6452 audit hardening + 256c5e42
+    train_renderer.py fixes): 0 CRITICAL. Lands strict at 0.
+    """
+    root = repo_root or REPO_ROOT
+    audit_script = root / "tools" / "audit_silent_defaults.py"
+    if not audit_script.is_file():
+        if verbose:
+            print(
+                "  [silent-default-audit] WARN: tools/audit_silent_defaults.py "
+                "not found — skipping check"
+            )
+        return []
+    # Run audit as subprocess to avoid coupling preflight to its imports.
+    import subprocess
+    try:
+        result = subprocess.run(
+            [sys.executable, str(audit_script)],
+            cwd=root, capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        if verbose:
+            print(f"  [silent-default-audit] WARN: audit failed to run: {exc}")
+        return []
+    output = (result.stdout or "") + (result.stderr or "")
+    # Audit prints e.g. "(0 critical, 0 suspicious, 1189 safe)".
+    m = re.search(r"\((\d+)\s+critical", output)
+    if not m:
+        if verbose:
+            print(
+                "  [silent-default-audit] WARN: could not parse audit output: "
+                + output[:200]
+            )
+        return []
+    n_critical = int(m.group(1))
+    violations: list[str] = []
+    if n_critical > 0:
+        violations.append(
+            f"{n_critical} CRITICAL silent-default override(s) — see "
+            f"reports/silent_defaults.md. Pattern: argparse default=X with "
+            f"matching profile key silently overrides profile values. Fix: "
+            f"change default to None and resolve in body via profile."
+        )
+    if verbose:
+        if violations:
+            print(
+                f"  [silent-default-audit] {len(violations)} violation(s)"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [silent-default-audit] OK: 0 CRITICAL")
+    if violations and strict:
+        raise MetaBugViolation(
+            "SILENT-DEFAULT OVERRIDE DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check 82 (Round 3 council): callsite contracts for dangerous helpers ─────
+#
+# Sister bug class to silent-default-audit (Check 81). Where Check 81 catches
+# `argparse default=X` overriding profile values, this check catches
+# "kwarg omitted at call site → defaults to a stale baked-in value".
+#
+# Incident (2026-04-29): Lane GP added `baseline_poses=` kwarg to
+# `tac.pose_gaussian_process.reconstruct_poses` so dims 1-5 would be preserved
+# instead of zero-padded. The helper change landed in src/tac. The call site
+# at experiments/fit_pose_gp.py:33 (now :41) was NEVER updated to pass the
+# kwarg — for ~2 weeks the pipeline silently produced zero-padded poses,
+# CATASTROPHICALLY degrading Lane GP scores. Finally fixed in commit 8746793e.
+#
+# Memory: feedback_three_active_bug_classes_needing_strict_checks_20260429.md.
+
+# Registry of (module.callable, required_kwargs_set). Add entries as the
+# class of bug is rediscovered. Each entry guards future regressions.
+CALLSITE_CONTRACTS: dict[str, set[str]] = {
+    "reconstruct_poses": {"baseline_poses"},
+}
+
+# Files that are EXEMPT (intentional negative-path tests, etc.).
+_CALLSITE_CONTRACT_EXEMPT_FILES: set[str] = {
+    "src/tac/tests/test_pose_gaussian_process.py",  # tests the no-baseline path
+}
+
+
+def _scan_python_for_callsite_contract_violations(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """AST-scan a Python file for callers of contract-registered helpers
+    that omit any of the required kwargs."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if rel_s in _CALLSITE_CONTRACT_EXEMPT_FILES:
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Resolve the callable's short name (Attribute or Name).
+        callee_name: str | None = None
+        if isinstance(node.func, ast.Name):
+            callee_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            callee_name = node.func.attr
+        if callee_name is None or callee_name not in CALLSITE_CONTRACTS:
+            continue
+        required = CALLSITE_CONTRACTS[callee_name]
+        provided = {kw.arg for kw in node.keywords if kw.arg is not None}
+        # If **kwargs is splatted, treat as opaque — assume satisfied.
+        if any(kw.arg is None for kw in node.keywords):
+            continue
+        missing = required - provided
+        if missing:
+            line = getattr(node, "lineno", "?")
+            violations.append(
+                f"{rel_s}:{line}: {callee_name}(...) missing required "
+                f"kwarg(s) {sorted(missing)} — see CALLSITE_CONTRACTS."
+            )
+    return violations
+
+
+def check_callsite_contracts_satisfied(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Verify every caller of a contract-registered helper passes its
+    required kwargs. Catches the Lane-GP-style "fix lands in helper but
+    not at call site" bug class."""
+    root = repo_root or REPO_ROOT
+    scan_dirs = ["src/tac", "experiments", "scripts", "submissions"]
+    violations: list[str] = []
+    for sd in scan_dirs:
+        sd_path = root / sd
+        if not sd_path.is_dir():
+            continue
+        for py in sd_path.rglob("*.py"):
+            violations.extend(
+                _scan_python_for_callsite_contract_violations(py, root)
+            )
+    if verbose:
+        if violations:
+            print(
+                f"  [callsite-contracts] {len(violations)} violation(s)"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [callsite-contracts] OK: 0 violations across "
+                f"{len(CALLSITE_CONTRACTS)} contract(s)"
+            )
+    if violations and strict:
+        raise MetaBugViolation(
+            "CALLSITE-CONTRACT VIOLATION DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix: pass the listed kwarg(s) at every call site, OR "
+            "remove the entry from CALLSITE_CONTRACTS if the contract is "
+            "no longer required."
+        )
+    return violations
+
+
+# ── Check 83 (Round 3 council): MPS-derived strategic decisions ──────────────
+#
+# Sister bug class to "scores have lane tag" (Check D). That check catches
+# untagged scores; this one catches DECISIONS based on MPS-tagged scores.
+#
+# Incident (2026-04-29): STC clean-source pipeline was declared FALSIFIED
+# based on local MPS encoder argmax. User correctly objected: "MPS is trash
+# and nowhere close to auth eval." FALSIFICATION withdrawn (commit cc1ba193).
+# CLAUDE.md non-negotiable: PoseNet drift on MPS is 23×, score drift 2.5×.
+#
+# A `[contest-CUDA]` artifact reference must appear within ±10 lines of any
+# decision verb (GREEN, RED, KILL, killed, promote, promoted, FALSIFIED,
+# FALSIFICATION, dispatched, blessed) when MPS / CPU / [MPS-PROXY] also
+# appears in the same paragraph. Without it, fail loud.
+#
+# Memory: feedback_three_active_bug_classes_needing_strict_checks_20260429.md.
+
+_MPS_DECISION_VERBS = re.compile(
+    r"\b(GREEN|RED|KILL|killed|promote|promoted|"
+    r"FALSIFIED|FALSIFICATION|dispatched|blessed)\b"
+)
+_MPS_PROXY_TOKENS = re.compile(
+    r"\b(\[MPS-PROXY\]|MPS-PROXY|MPS-derived|MPS\b|CPU\b|advisory only)"
+)
+_CONTEST_CUDA_TAG = re.compile(r"\[contest-CUDA\]|contest-CUDA")
+
+# Files that are EXEMPT from this check:
+# - the canonical extinction list itself (CLAUDE.md FORBIDDEN PATTERNS)
+# - the check definition + its own memory pointer
+# - the canonical no-MPS rule memory file (defines the rule, not violates it)
+_MPS_DECISION_EXEMPT_FILES: set[str] = {
+    "CLAUDE.md",
+    "src/tac/preflight.py",
+    "src/tac/tests/test_callsite_contracts.py",
+    "src/tac/tests/test_no_mps_decision_check.py",
+    "src/tac/tests/test_callsite_contracts_and_no_mps_decision.py",
+}
+_MPS_DECISION_EXEMPT_PATH_PARTS: tuple[str, ...] = (
+    "/.claude/projects/",   # user-private memory, not deployable
+    "/memory/",             # auto-memory directory
+    "MEMORY.md",            # auto-memory index
+    ".omx/context/",        # frozen historical context snapshots
+    ".omx/research/",       # research findings (catalog, not decisions)
+    ".omx/auto_memory_snapshot_",  # frozen memory-file backups (operator-side, not deployable)
+    ".omx/state/orphans_preserved/",  # preserved orphan scripts/configs (signal-loss prevention)
+    "reports/graphs/",      # judging surface; figure captions cite history
+    "/uv_project_env/",     # vendored Python deps in remote eval workspaces (numpy/distutils ccompiler_opt etc.)
+    "/site-packages/",      # vendored Python deps anywhere (third-party code, not ours)
+    "/__pycache__/",        # compiled bytecode artifacts
+)
+
+# Tags that, when present in the same paragraph, mark the entry as a
+# post-mortem / corrective record DOCUMENTING the rule rather than violating
+# it. The STC FALSIFICATION WITHDRAWN entry uses this pattern.
+#
+# Additional rule-attribution patterns (added 2026-04-30): when a paragraph
+# cites CLAUDE.md or a Council ruling as the AUTHORITY for a kill/promote
+# decision, the decision is NOT MPS-derived — it is rule-derived (CLAUDE.md
+# restatement) or council-derived. Lane 7 PSD kill memo was the motivating
+# false positive: docstring quoted CLAUDE.md verbatim and cited Council #271.
+_MPS_DECISION_EXEMPT_TAGS = re.compile(
+    r"\[(WITHDRAWN|POST-MORTEM|HISTORICAL|ARCHIVED|advisory only|MPS-PROXY)\]"
+    r"|\bWITHDRAWN\b"
+    r"|\bPOST-MORTEM\b"
+    r"|FALSIFICATION WITHDRAWN"
+    r"|\bper CLAUDE\.md\b"
+    r"|CLAUDE\.md non-negotiable"
+    r"|CLAUDE\.md FORBIDDEN PATTERNS"
+    r"|CLAUDE\.md \"[^\"]+\""
+    r"|\bper Council\b"
+    r"|\bCouncil #\d+\b"
+    # Same-line waiver marker (operator explicitly attests the line IS
+    # the rule, not a violation — meta-irony false-positive class).
+    r"|MPS-DECISION-WAIVED:"
+)
+
+
+def _check_mps_decision_in_text(
+    text: str, rel_s: str,
+) -> list[str]:
+    """Scan a doc/script for paragraphs that contain a decision verb +
+    MPS/CPU token but no nearby [contest-CUDA] tag or post-mortem tag."""
+    violations: list[str] = []
+    lines = text.splitlines()
+    n = len(lines)
+    for i, line in enumerate(lines):
+        if not _MPS_DECISION_VERBS.search(line):
+            continue
+        if not _MPS_PROXY_TOKENS.search(line):
+            continue
+        # Paragraph window: ±10 lines.
+        lo = max(0, i - 10)
+        hi = min(n, i + 11)
+        window = "\n".join(lines[lo:hi])
+        if _CONTEST_CUDA_TAG.search(window):
+            continue
+        # Post-mortem / withdrawn / advisory-only entries are documenting
+        # the rule, not violating it.
+        if _MPS_DECISION_EXEMPT_TAGS.search(window):
+            continue
+        snippet = line.strip()[:140]
+        violations.append(
+            f"{rel_s}:{i + 1}: decision verb + MPS/CPU token without "
+            f"nearby [contest-CUDA] tag: '{snippet}'"
+        )
+    return violations
+
+
+def check_no_proxy_metric_drives_decision(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Forbid GREEN/RED/KILL/promote/falsify decisions in records that
+    cite MPS/CPU/MPS-PROXY without a [contest-CUDA] artifact in the same
+    paragraph. CLAUDE.md non-negotiable: MPS is unfit for strategy."""
+    root = repo_root or REPO_ROOT
+    scan_dirs = [
+        "docs", "reports", "scripts", "src/tac", "experiments",
+        "submissions", ".ralph", ".omx", "BATTLE_PLAN.md", "PROGRAM.md",
+    ]
+    target_suffixes = (".md", ".sh", ".py")
+    violations: list[str] = []
+    for entry in scan_dirs:
+        p = root / entry
+        if p.is_file():
+            files = [p]
+        elif p.is_dir():
+            files = [
+                f for f in p.rglob("*")
+                if f.is_file() and f.suffix in target_suffixes
+            ]
+        else:
+            continue
+        for f in files:
+            try:
+                rel = f.relative_to(root)
+            except ValueError:
+                continue
+            rel_s = str(rel)
+            if rel_s in _MPS_DECISION_EXEMPT_FILES:
+                continue
+            if any(part in rel_s for part in _MPS_DECISION_EXEMPT_PATH_PARTS):
+                continue
+            try:
+                text = f.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            violations.extend(_check_mps_decision_in_text(text, rel_s))
+    if verbose:
+        if violations:
+            print(
+                f"  [no-mps-decision] {len(violations)} violation(s)"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print("  [no-mps-decision] OK: 0 violations")
+    if violations and strict:
+        raise MetaBugViolation(
+            "MPS-DERIVED STRATEGIC DECISION DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + (f"\n  … and {len(violations) - 20} more"
+               if len(violations) > 20 else "")
+            + "\n\nFix: either remove the decision verb (kill/promote/etc) "
+            "from the record, or attach a [contest-CUDA] artifact reference "
+            "in the same paragraph (within ±10 lines)."
+        )
+    return violations
+
+
+# ── PCC2 (2026-04-30): comment-only contracts ────────────────────────────────
+#
+# Bug class: a placeholder/stub function carries a comment promising the
+# wrapper/deploy/caller will swap in the real implementation, but the wrapper
+# never actually performs the swap. The stub runs in production. Comments rot;
+# assertions don't.
+#
+# Anchor incident (2026-04-30): experiments/train_imp_cycle.py:_finetune
+# carried "deploy script ... OVERRIDES this stub by calling train_distill.py"
+# in its docstring + body comments. The wrapper script never performed the
+# swap. Cycle 0 ran the toy synthetic-tensor loop on random inputs and shipped
+# a non-trained model. Auth eval = 1.98 [contest-CUDA], a 38× regression vs
+# the anchor (0.052). PCC3 added a wall-clock-floor backing assertion in
+# train_imp_cycle.main; PCC2 enforces the META rule across the whole codebase
+# so the next stub-comment without a backing assertion cannot ship.
+#
+# Council deliberation: feedback_grand_council_pcc2_comment_only_contracts_20260430.md
+# Q1 verdict (4-1 hybrid): regex for comment scan, AST for backing-assertion
+#   function-body lookup. Shell scripts skip the AST step.
+# Q2 verdict (6-0 tight): six high-precision patterns for STRICT mode.
+# Q3 verdict (5-0 liberal): backing assertion = any `raise` or `assert` in the
+#   same function body, OR within ±50 lines of the comment, OR a `check_*`
+#   sibling reference anywhere in the file.
+
+# Tight pattern set (STRICT). Each pattern matches a phrase that
+# explicitly promises the wrapper/deploy/caller will replace the current
+# code. Patterns are case-insensitive at match time.
+_COMMENT_ONLY_CONTRACT_PATTERNS_STRICT: tuple[re.Pattern[str], ...] = (
+    re.compile(r"deploy script swaps in (\w+)", re.IGNORECASE),
+    re.compile(
+        r"the deploy script (does|invokes|calls|runs|swaps|overrides|provides|injects|replaces)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(wrapper|deploy)\s+script\s+(handles|does|runs|invokes|calls|provides|overrides|swaps|injects|replaces)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"OVERRIDES this stub", re.IGNORECASE),
+    re.compile(
+        r"(deploy|wrapper)\s+(script\s+)?(swaps|injects|provides|replaces)\b",
+        re.IGNORECASE,
+    ),
+    # NB: "caller is responsible for X" is NOT in the STRICT set — Q2 verdict
+    # ruled it produces too many legitimate-API-docstring false positives.
+    # It IS in the broader audit set below.
+)
+
+# Broader pattern set (--audit only). Used for periodic operator sweeps to
+# discover NEW variants of the bug class. Not gated by STRICT.
+_COMMENT_ONLY_CONTRACT_PATTERNS_AUDIT: tuple[re.Pattern[str], ...] = (
+    *_COMMENT_ONLY_CONTRACT_PATTERNS_STRICT,
+    re.compile(r"wrapper handles (\w+)", re.IGNORECASE),
+    re.compile(r"caller is responsible for (\w+)", re.IGNORECASE),
+    re.compile(r"the wrapper script does (\w+)", re.IGNORECASE),
+    re.compile(r"production (wrapper|deploy)", re.IGNORECASE),
+    re.compile(
+        r"(deploy|wrapper) will (do|run|swap|replace|invoke|call)",
+        re.IGNORECASE,
+    ),
+)
+
+# Backing-assertion patterns. ANY of these inside the function body, OR
+# within ±50 lines of the suspect comment, OR ANYWHERE in the file (for the
+# check_* sibling reference) satisfies the contract.
+_BACKING_ASSERTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bassert\s+\w"),                  # `assert <expr>`
+    re.compile(r"\braise\s+[A-Z]\w*"),             # `raise <ExceptionType>`
+    re.compile(r"check_\w+\s*\("),                 # `check_<name>(...)` call
+    re.compile(r"@requires_\w+"),                  # decorator family
+    re.compile(r"@assert_wrapper_\w+"),            # decorator family
+)
+
+# Files exempt from the scan.
+_COMMENT_ONLY_CONTRACT_EXEMPT_FILES: set[str] = {
+    "src/tac/preflight.py",                # this check itself
+    "src/tac/tests/test_no_comment_only_contracts.py",  # the test file
+}
+# Path-segment exemptions (any rel path containing one of these is skipped).
+_COMMENT_ONLY_CONTRACT_EXEMPT_PATH_PARTS: tuple[str, ...] = (
+    "/.claude/projects/",   # private memory
+    "/memory/",             # auto-memory
+    "MEMORY.md",
+    ".omx/context/",
+    ".omx/research/",
+    "src/tac/tests/",       # tests can carry illustrative comment patterns
+)
+
+
+def _find_enclosing_function_body(
+    tree: ast.AST, lineno: int,
+) -> tuple[int, int] | None:
+    """Return (start_lineno, end_lineno) of the function/method that encloses
+    the given line, or None if at module level. Picks the innermost enclosing
+    function when nested."""
+    best: tuple[int, int] | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        start = node.lineno
+        end = getattr(node, "end_lineno", None)
+        if end is None:
+            continue
+        if start <= lineno <= end:
+            if best is None or (end - start) < (best[1] - best[0]):
+                best = (start, end)
+    return best
+
+
+def _has_backing_assertion(
+    text: str, lines: list[str], comment_lineno: int,
+    tree: ast.AST | None,
+) -> bool:
+    """Liberal backing-assertion check per Q3 council verdict.
+
+    Returns True if ANY of:
+      (a) `assert` / `raise` / `check_*(` / decorator inside the enclosing
+          function body
+      (b) same patterns within ±50 lines of the comment
+      (c) any `check_*(` reference anywhere else in the file (sibling
+          preflight check pattern)
+    """
+    # (c) sibling check_* reference — cheap whole-file scan. Only count it if
+    # the reference is NOT on the comment line itself.
+    for m in re.finditer(r"\bcheck_\w+\s*\(", text):
+        line_idx = text[:m.start()].count("\n")
+        if line_idx + 1 != comment_lineno:
+            return True
+
+    # (a) enclosing function body scan via AST
+    if tree is not None:
+        rng = _find_enclosing_function_body(tree, comment_lineno)
+        if rng is not None:
+            start, end = rng
+            body_text = "\n".join(lines[start - 1:end])
+            for pat in _BACKING_ASSERTION_PATTERNS:
+                if pat.search(body_text):
+                    return True
+
+    # (b) ±50 lines window (line-anchored fallback for shell scripts and
+    # module-level comments outside any function body)
+    lo = max(0, comment_lineno - 51)
+    hi = min(len(lines), comment_lineno + 50)
+    window_text = "\n".join(lines[lo:hi])
+    for pat in _BACKING_ASSERTION_PATTERNS:
+        if pat.search(window_text):
+            return True
+    return False
+
+
+def _scan_file_for_comment_only_contracts(
+    path: Path, repo_root: Path,
+    patterns: tuple[re.Pattern[str], ...],
+) -> list[tuple[str, int, str, bool]]:
+    """Scan one file for comment-only-contract patterns.
+
+    Returns a list of (rel_path, lineno, snippet, is_backed) tuples.
+    `is_backed` is True iff a backing assertion was found per the liberal
+    Q3 council rule.
+    """
+    try:
+        rel = path.relative_to(repo_root) if path.is_absolute() else path
+    except ValueError:
+        return []
+    rel_s = str(rel)
+    if rel_s in _COMMENT_ONLY_CONTRACT_EXEMPT_FILES:
+        return []
+    if any(part in rel_s for part in _COMMENT_ONLY_CONTRACT_EXEMPT_PATH_PARTS):
+        return []
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, OSError):
+        return []
+    lines = text.splitlines()
+    # AST is only useful for `.py` files (best-effort for backing-assertion
+    # function-body lookup). Shell scripts skip the AST step.
+    tree: ast.AST | None = None
+    if path.suffix == ".py":
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except (SyntaxError, ValueError):
+            tree = None
+
+    findings: list[tuple[str, int, str, bool]] = []
+    for i, line in enumerate(lines, start=1):
+        for pat in patterns:
+            if pat.search(line):
+                snippet = line.strip()[:140]
+                backed = _has_backing_assertion(text, lines, i, tree)
+                findings.append((rel_s, i, snippet, backed))
+                break  # one finding per line is enough
+    return findings
+
+
+def check_no_comment_only_contracts(
+    *, strict: bool = False, verbose: bool = False,
+    repo_root: Path | None = None, audit: bool = False,
+) -> list[str]:
+    """Detect the "comment-only contract" anti-pattern (PCC2).
+
+    A placeholder/stub carries a comment promising the wrapper/deploy/caller
+    will swap in the real implementation, but no runtime assertion guards
+    the case where the swap doesn't happen. The IMP cycle 0 = 1.98 metabug
+    (38× regression) was rooted in this exact class.
+
+    Args:
+      strict: if True, raises MetaBugViolation on any unbacked finding.
+      verbose: print per-file violation lines.
+      repo_root: override repo root for testing.
+      audit: if True, use the broader pattern set (more false positives,
+        intended for periodic operator sweeps; should NOT be passed by
+        `preflight_all()`).
+
+    Returns: list of violation strings (file:line:snippet).
+
+    Council: feedback_grand_council_pcc2_comment_only_contracts_20260430.md
+    """
+    root = repo_root or REPO_ROOT
+    scan_dirs = (
+        "scripts", "experiments", "src/tac", "submissions/robust_current",
+    )
+    target_suffixes = (".py", ".sh")
+    patterns = (
+        _COMMENT_ONLY_CONTRACT_PATTERNS_AUDIT if audit
+        else _COMMENT_ONLY_CONTRACT_PATTERNS_STRICT
+    )
+
+    all_findings: list[tuple[str, int, str, bool]] = []
+    for sd in scan_dirs:
+        sd_path = root / sd
+        if not sd_path.is_dir():
+            continue
+        for f in sd_path.rglob("*"):
+            if not f.is_file() or f.suffix not in target_suffixes:
+                continue
+            all_findings.extend(
+                _scan_file_for_comment_only_contracts(f, root, patterns)
+            )
+
+    # Audit mode: report ALL findings (backed and unbacked).
+    # STRICT mode: violations are unbacked findings only.
+    unbacked = [f for f in all_findings if not f[3]]
+    violations = [
+        f"{rel_s}:{lineno}: {snippet}"
+        for rel_s, lineno, snippet, _ in unbacked
+    ]
+
+    if verbose:
+        if audit:
+            print(
+                f"  [no-comment-only-contracts AUDIT] {len(all_findings)} "
+                f"hit(s) ({len(unbacked)} unbacked, "
+                f"{len(all_findings) - len(unbacked)} backed):"
+            )
+            for rel_s, lineno, snippet, backed in all_findings[:30]:
+                tag = "UNBACKED" if not backed else "backed"
+                print(f"    [{tag}] {rel_s}:{lineno}: {snippet}")
+            if len(all_findings) > 30:
+                print(f"    … and {len(all_findings) - 30} more")
+        elif violations:
+            print(
+                f"  [no-comment-only-contracts] {len(violations)} "
+                f"violation(s):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                "  [no-comment-only-contracts] OK: 0 unbacked findings"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "COMMENT-ONLY CONTRACT DETECTED (PCC2):\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + (
+                f"\n  … and {len(violations) - 20} more"
+                if len(violations) > 20 else ""
+            )
+            + "\n\nFix: add a backing assertion (assert/raise/check_*) within "
+            "±50 lines of the comment OR inside the enclosing function body. "
+            "The IMP cycle 0 = 1.98 metabug (38× regression) was rooted in "
+            "this exact class — comments rot, assertions don't.\n"
+            "Council: feedback_grand_council_pcc2_comment_only_contracts_20260430.md"
+        )
+    return violations
+
+
+# ── Check 85 (DARTS-S NaN-display incident): training-script metric-key
+#    consistency. Catches the "epoch_metrics.get('seg', float('nan'))" bug
+#    where the printer references keys the trainer never returns, silently
+#    masking actual training output as NaN for hours of GPU time.
+#
+# Incident (2026-04-29 PM): scripts/remote_lane_darts_s_segmap_arch_sweep.sh
+# ran for 5 hours on Vast.ai 4090 ($1.41 spent), produced log lines
+# "epoch=0 loss=277 seg=nan pose=nan" through "epoch=399 loss=277 seg=nan
+# pose=nan". The loss WAS finite but the printer at experiments/train_segmap.py
+# read epoch_metrics["seg"] / ["seg_loss"] (with float("nan") fallback) when
+# SegMapTrainer.train_epoch returns "seg_dist" / "pose_dist". Both keys
+# missing → NaN printed → operator believed training was diverged → 5h
+# of GPU compute appeared "wasted" until SSH-debug found the actual
+# pose_dist/seg_dist values frozen (separate bug — model not learning).
+#
+# This check scans every `experiments/train_*.py` file for `epoch_metrics`
+# / `metrics.get(...)` / `history[...]["..."]` style key references and
+# warns if those keys are NOT among the documented return-dict keys for
+# any known trainer. Initial registry: SegMapTrainer.train_epoch returns
+# {"loss", "pose_dist", "seg_dist", "kl_aux", "num_steps"}. Add other
+# trainers as they're discovered.
+
+# Registry of trainer-name → set-of-returned-keys. Populate from each
+# trainer's known docstring + return statement.
+TRAINER_RETURN_KEYS: dict[str, set[str]] = {
+    "SegMapTrainer.train_epoch": {
+        "loss", "pose_dist", "seg_dist", "kl_aux", "num_steps", "epoch",
+    },
+    # train_distill.py uses a separate trainer that returns these keys.
+    "DistillTrainer.step": {
+        "seg_loss", "pose_loss", "pcgrad_conflict", "fridrich_loss",
+        "texture_loss", "linf_penalty", "markov_loss", "uncertainty_loss",
+        "loss", "epoch",
+    },
+    # experiments/optimize_poses.py optimize_poses_batch() returns these
+    # per-batch keys consumed via batch_metrics.get(...) in the script.
+    "optimize_poses_batch": {
+        "per_class_distortion", "final_seg_distortion", "improvement_pct",
+        "steps_run", "batch_idx", "time_s", "initial_pose_distortion",
+        "final_pose_distortion", "loss", "epoch",
+    },
+    # Add other trainers as preflight encounters new dispatchers.
+}
+
+# Files exempt: legacy training scripts that pre-date the registry can be
+# whitelisted here. Empty by default — every new caller MUST conform.
+_METRIC_KEY_CONSISTENCY_EXEMPT_FILES: set[str] = set()
+
+
+def _scan_train_script_for_metric_key_misses(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Scan a Python file for `<dict>.get("key", ...)` calls on names that
+    look like training-metrics dicts (epoch_metrics, metrics, history) and
+    report any keys not in any registered TRAINER_RETURN_KEYS set."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if rel_s in _METRIC_KEY_CONSISTENCY_EXEMPT_FILES:
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    # Union of all known trainer return keys (any trainer's key counts).
+    all_known = set()
+    for ks in TRAINER_RETURN_KEYS.values():
+        all_known.update(ks)
+
+    # Common metric-dict variable names across our training scripts.
+    # `batch_metrics` is used by experiments/optimize_poses.py per-batch returns.
+    metric_dict_names = {"epoch_metrics", "metrics", "batch_metrics"}
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "get":
+            continue
+        # Receiver name must look like a metric dict.
+        recv = node.func.value
+        if not isinstance(recv, ast.Name) or recv.id not in metric_dict_names:
+            continue
+        if not node.args:
+            continue
+        first_arg = node.args[0]
+        # Constant string key only (skip dynamic).
+        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+            key = first_arg.value
+            if key not in all_known:
+                line = getattr(node, "lineno", "?")
+                violations.append(
+                    f"{rel_s}:{line}: {recv.id}.get({key!r}, ...) — "
+                    f"key not in TRAINER_RETURN_KEYS union "
+                    f"{sorted(all_known)}"
+                )
+    return violations
+
+
+def check_training_script_metric_keys_consistent(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Verify training scripts under experiments/train_*.py reference only
+    metric-dict keys that some registered trainer actually returns."""
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    train_files = list((root / "experiments").glob("train_*.py"))
+    for f in sorted(train_files):
+        violations.extend(_scan_train_script_for_metric_key_misses(f, root))
+    if verbose:
+        if violations:
+            print(
+                f"  [training-metric-keys] {len(violations)} violation(s)"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                f"  [training-metric-keys] OK: 0 violations across "
+                f"{len(train_files)} train_*.py file(s)"
+            )
+    if violations and strict:
+        raise MetaBugViolation(
+            "TRAINING-METRIC-KEY MISMATCH DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + "\n\nFix: either correct the key name in the print/log to match "
+            "a real trainer return key, OR add the new key to "
+            "TRAINER_RETURN_KEYS for the matching trainer."
+        )
+    return violations
+
+
+# ── Check 86 (DARTS-S freeze incident): no bare .round() in eval-roundtrip
+#    chains. PyTorch's torch.tensor.round() has ZERO gradient → severs the
+#    backprop chain → optimizer "steps" but params don't move → 5h GPU
+#    burned producing constant loss = 277.02 across 400 epochs.
+#
+# Incident (2026-04-29 PM): Lane DARTS-S V1 sweep on Vast.ai 4090 ran 5h
+# with pose_dist=158.49, seg_dist=2.37, kl_aux=4.48 IDENTICAL to 4 decimals
+# across all 400 epochs. The eval-roundtrip in src/tac/segmap_renderer.py:281
+# called `up.clamp(0, 255).round()` with a comment claiming it was
+# "STE-friendly proxy" — it was NOT. Empirical confirmation by Council A
+# (.omx/research/council_darts_s_freeze_audit_20260429.md): with .round(),
+# max(|grad|)=0.00e+00 + loss frozen to 6 decimals; with Uint8STE.apply,
+# max(|grad|)=5.83e+03 + loss DECREASES.
+#
+# Cross-impact: Lane SC++, Lane SA-v2, Lane SO, Lane MM v2 — all invalidated.
+# Lane G v3 unaffected (uses train_distill.py + Uint8STE correctly).
+#
+# This check scans every src/tac/*.py and experiments/*.py file for the
+# pattern `.round()` called inside a function whose name contains
+# "roundtrip" or "eval_roundtrip" or whose body calls F.interpolate
+# (the canonical roundtrip pattern). Whitelist the canonical Uint8STE.apply
+# path (which uses .round() internally but provides STE backward).
+#
+# Memory: feedback_check_86_eval_roundtrip_round_zero_gradient_20260429.md
+# (forthcoming).
+
+_BARE_ROUND_RE = re.compile(r"\.round\(\s*\)")
+_INTERPOLATE_RE = re.compile(r"F\.interpolate\(")
+_UINT8_STE_RE = re.compile(r"Uint8STE\.apply|uint8_ste\(")
+# Manual STE pattern: `... + (X.round().clamp(...) - Y).detach()` produces
+# the round forward but identity backward — same effect as Uint8STE.apply.
+# Detected by presence of `.detach()` on a same-line expression alongside
+# `.round()`, since the AST + line-text combination needs both.
+_MANUAL_STE_RE = re.compile(r"\.detach\(\s*\).*\.round\(\)|\.round\(\).*\.detach\(\s*\)")
+# Files that are READ-ONLY measurement tools — bare .round() is correct
+# because no gradient is needed (analysis / forensics / proxy-score path).
+_BARE_ROUND_READONLY_FILES: set[str] = {
+    "src/tac/forensics.py",                  # explicit "no STE — analysis"
+    "src/tac/scorer.py",                     # compute_proxy_score read-only
+    "experiments/pair_difficulty_map.py",    # measurement tool
+    "experiments/profile_fp4_layer_sensitivity.py",  # measurement tool
+}
+
+
+def _scan_python_for_bare_round_in_roundtrip(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect `.round()` calls inside functions that look like eval-roundtrip
+    chains (body calls F.interpolate AND has 'roundtrip' in the function name
+    OR docstring). Whitelists the canonical Uint8STE forward implementation."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    # Whitelist: Uint8STE itself uses .round() in its forward pass; its
+    # backward provides the STE behavior. Quantization helpers also use
+    # bare .round() in well-tested STE wrappers.
+    if rel_s in {
+        "src/tac/quantization.py",
+        "src/tac/learnable_bit_quant.py",
+    }:
+        return []
+    # Read-only measurement tools where no gradient is needed.
+    if rel_s in _BARE_ROUND_READONLY_FILES:
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        # Get the function source body via line range.
+        start = node.lineno - 1
+        end = node.end_lineno or start + 50
+        body_text = "\n".join(text.splitlines()[start:end])
+        # Heuristic: function is eval-roundtrip-shaped if it calls
+        # F.interpolate AND its name or docstring mentions "roundtrip".
+        name_or_doc_mentions_roundtrip = (
+            "roundtrip" in node.name.lower()
+            or (ast.get_docstring(node) or "").lower().count("roundtrip") > 0
+        )
+        if not _INTERPOLATE_RE.search(body_text):
+            continue
+        if not name_or_doc_mentions_roundtrip:
+            continue
+        # Check if the body has a bare .round() that is NOT inside the
+        # canonical Uint8STE.apply() OR the manual-STE pattern
+        # `... + (X.round().clamp(...) - Y).detach()`.
+        if _BARE_ROUND_RE.search(body_text) and not _UINT8_STE_RE.search(body_text):
+            # Find the specific .round() line for the report.
+            for off, line in enumerate(text.splitlines()[start:end]):
+                if not _BARE_ROUND_RE.search(line):
+                    continue
+                if _UINT8_STE_RE.search(line):
+                    continue
+                # Manual-STE pattern: .round() and .detach() on same line
+                # produces correct STE behavior (forward = round, backward = identity).
+                if _MANUAL_STE_RE.search(line):
+                    continue
+                violations.append(
+                    f"{rel_s}:{start + off + 1}: function {node.name!r} "
+                    f"uses .round() inside eval-roundtrip pattern (calls "
+                    f"F.interpolate + 'roundtrip' in name/docstring) — "
+                    f".round() has ZERO gradient. Use Uint8STE.apply()."
+                )
+    return violations
+
+
+def check_no_bare_round_in_eval_roundtrip(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Forbid `.round()` inside eval-roundtrip chains. .round() has zero
+    gradient → severs backprop → silent training freeze. Use Uint8STE.apply
+    instead (clamp+round forward, identity backward inside [0,255])."""
+    root = repo_root or REPO_ROOT
+    scan_dirs = ["src/tac", "experiments"]
+    violations: list[str] = []
+    for sd in scan_dirs:
+        sd_path = root / sd
+        if not sd_path.is_dir():
+            continue
+        for py in sd_path.rglob("*.py"):
+            violations.extend(
+                _scan_python_for_bare_round_in_roundtrip(py, root)
+            )
+    if verbose:
+        if violations:
+            print(
+                f"  [no-bare-round-roundtrip] {len(violations)} violation(s)"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [no-bare-round-roundtrip] OK: 0 violations")
+    if violations and strict:
+        raise MetaBugViolation(
+            "BARE .round() IN EVAL-ROUNDTRIP DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix: replace `up.clamp(0, 255).round()` with "
+            "`Uint8STE.apply(up)` (canonical STE at src/tac/quantization.py)."
+        )
+    return violations
+
+
+# ── Check 87 (Council C OOM-class deep fix): SegMap-class lanes must
+#    pass --bf16 + --scorer-chunk N + --batch-size B with B*N <= 8.
+#
+# Bug class this catches: a remote_lane_*.sh script that invokes
+#   "$PYBIN" -u experiments/train_segmap.py ... [no --bf16 OR no --scorer-chunk]
+# OR with --batch-size B and --scorer-chunk N where B*N > 8. The DOMINANT
+# memory cost in SegMap-class training is NOT the 94K-param SegMap renderer
+# itself — it is the **two frozen scorer forward+backward chains** (PoseNet
+# FastViT-T12 + SegNet EfficientNet-B2). Specifically PoseNet's FastViT
+# stage-1 self-attention map is `B × heads × N² × 4 bytes` where N=12288
+# at 384×512 scorer input — ~21 GiB at B=16 frames in fp32. This OOMed
+# 14 instances on Modal A10G 22 GB shared-tenant on 2026-04-29 (~$3.50
+# burnt for zero artifact).
+#
+# The matching code-side fixes are:
+#   DF2 (bf16 autocast): src/tac/segmap_renderer.py SegMapTrainer wraps
+#        the renderer forward + scorer call in
+#        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16).
+#        Halves the dominant attention-map allocation (10.5 GiB peak on B=8).
+#   DF3 (per-pair scorer chunking): SegMapTrainer._scorer_forward_chunked
+#        splits the dual scorer_forward_pair calls into chunks of N pairs
+#        along the batch dim. Cuts per-call attention by ~chunk_size.
+#   DF1 (gradient checkpointing on SegMap blocks): NOT REQUIRED because
+#        the renderer is only ~5% of the activation footprint per Boyd's
+#        Lagrangian. Allowed as an alternate path via --gradient-checkpointing
+#        + GPU_TIER_HINT=A100/H100 (reserved for future use; currently
+#        no script needs it).
+#
+# Both DF2 and DF3 must be present together (one without the other does
+# NOT fit on RTX 4090 24 GB at the canonical batch size). The B*N<=8 cap
+# is Council C's empirical envelope: 8 frames per scorer call × bf16
+# attention map = 5.3 GiB peak, fits 24 GB GPU with margin including the
+# no_grad GT scorer overlap during backward.
+#
+# Two acceptable patterns:
+#   (A) `--bf16` AND `--scorer-chunk N` AND `--batch-size B` are all
+#       passed AND `B * N <= 8`.
+#   (B) `--gradient-checkpointing` is passed AND the lane script also
+#       exports `GPU_TIER_HINT=A100` or `=H100` (reserved for the rare
+#       case where a lane explicitly wants the renderer-checkpoint path
+#       on a >40 GB GPU).
+#
+# Memory: .omx/research/council_oom_class_deep_fix_20260429.md.
+
+_SEGMAP_CLASS_TRAINING_TARGETS = {
+    "experiments/train_segmap.py",
+    # Round 7 Defect #1 (2026-04-29 PM): Lane FC invokes
+    # train_segmap_film_canvas.py which constructs the SAME SegMapTrainer
+    # at experiments/train_segmap_film_canvas.py:228 — therefore exposed to
+    # the SAME 21 GiB FastViT-attention-map OOM. The check was previously
+    # blind to it. Coverage gap closed; train_segmap_film_canvas.py also
+    # gained --bf16 + --scorer-chunk CLI flags in the same commit so the
+    # OOM-guard pattern is enforceable.
+    "experiments/train_segmap_film_canvas.py",
+}
+_OOM_GUARD_BN_PRODUCT_CAP = 8
+_OOM_GUARD_TIER_HINT_RE = re.compile(
+    r'(?:^|\n)\s*export\s+GPU_TIER_HINT=(A100|H100)'
+)
+
+
+def check_segmap_class_lanes_have_oom_guards(
+    repo_root: Path | None = None,
+    shell_files: list[str] | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Refuse SegMap-class lane scripts that invoke train_segmap.py without
+    the OOM-class deep fixes (Council C DF2 + DF3).
+
+    See the Check 87 comment block above for the full context. This check
+    is the preflight-time guard that prevents a future operator from
+    re-introducing the 21 GiB single-allocation OOM that wasted ~$3.50 on
+    Modal A10G across 14 SC++/SA/SO instances on 2026-04-29.
+
+    Acceptable invocation patterns:
+      A) Has all three: --bf16 + --scorer-chunk N + --batch-size B
+         AND B * N (effective per-scorer-call frame count) <= 8.
+      B) Has --gradient-checkpointing AND env-export GPU_TIER_HINT=A100/H100
+         (only A100/H100 has VRAM headroom to skip the deep fixes).
+
+    Anything else is a violation.
+    """
+    root = repo_root or REPO_ROOT
+    if shell_files is None:
+        shell_files = sorted(
+            str(p.relative_to(root))
+            for p in (root / "scripts").glob("remote_lane_*.sh")
+        )
+
+    violations: list[str] = []
+    n_invocations_checked = 0
+
+    for shell_rel in shell_files:
+        shell_path = root / shell_rel
+        if not shell_path.exists():
+            continue
+        raw = shell_path.read_text()
+        # Path-B opt-out: A100/H100 + --gradient-checkpointing.
+        has_a100_or_h100_hint = bool(_OOM_GUARD_TIER_HINT_RE.search(raw))
+
+        for lineno, target, flags_used in _scan_shell_lane_invocations(shell_path):
+            if target not in _SEGMAP_CLASS_TRAINING_TARGETS:
+                continue
+            n_invocations_checked += 1
+
+            # Re-walk the collapsed logical line containing this invocation
+            # to extract literal --bf16 / --scorer-chunk N / --batch-size B
+            # values. Walking the COLLAPSED text matches the multi-line
+            # backslash-continuation idiom used by every lane script.
+            collapsed = _collapse_shell_continuations(raw)
+            inv_line = ""
+            for logical_line in collapsed.splitlines():
+                if target in logical_line:
+                    inv_line = logical_line
+                    break
+
+            has_bf16 = "--bf16" in inv_line
+            chunk_match = re.search(r'--scorer-chunk\s+(\d+)', inv_line)
+            bs_match = re.search(r'--batch-size\s+(\d+)', inv_line)
+            has_chkpt = "--gradient-checkpointing" in inv_line
+
+            chunk_value = int(chunk_match.group(1)) if chunk_match else None
+            bs_value = int(bs_match.group(1)) if bs_match else None
+
+            # Path A check: all three flags + B*N <= cap.
+            path_a_ok = (
+                has_bf16
+                and chunk_value is not None
+                and chunk_value > 0
+                and bs_value is not None
+                and bs_value * chunk_value <= _OOM_GUARD_BN_PRODUCT_CAP
+            )
+            # Path B check: gradient-checkpointing + A100/H100 hint.
+            path_b_ok = has_chkpt and has_a100_or_h100_hint
+
+            if not (path_a_ok or path_b_ok):
+                violations.append(
+                    f"{shell_rel}:{lineno}: invokes {target} without OOM-class "
+                    f"deep fixes (Council C DF2 + DF3). Required EITHER:\n"
+                    f"      (A) --bf16 + --scorer-chunk N + --batch-size B with "
+                    f"B*N<={_OOM_GUARD_BN_PRODUCT_CAP}, OR\n"
+                    f"      (B) --gradient-checkpointing AND "
+                    f"export GPU_TIER_HINT=A100 (or H100).\n"
+                    f"    Got: bf16={has_bf16}, scorer-chunk={chunk_value}, "
+                    f"batch-size={bs_value}, chkpt={has_chkpt}, "
+                    f"a100_or_h100_hint={has_a100_or_h100_hint}.\n"
+                    f"    Memory: 14 OOMs on 2026-04-29 (Modal A10G 22 GB); "
+                    f"PoseNet FastViT stage-1 attention is "
+                    f"O(B*heads*12288^2*4 bytes). See "
+                    f".omx/research/council_oom_class_deep_fix_20260429.md."
+                )
+
+    if verbose and violations:
+        print(f"  [segmap-oom-guard] {len(violations)} violation(s):")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(
+            f"  [segmap-oom-guard] OK: "
+            f"{n_invocations_checked} SegMap-class invocations clean"
+        )
+
+    if violations and strict:
+        raise PreflightError(
+            "SEGMAP OOM GUARD: SegMap-class lane scripts must include the "
+            "DF2+DF3 deep fixes (bf16 autocast + per-pair scorer chunking) "
+            "before dispatch. See "
+            ".omx/research/council_oom_class_deep_fix_20260429.md\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check 88 (Council D EMA wire-in): every training path must EMA the model
+#
+# Bug class this catches: a script in experiments/train_*.py (or
+# src/tac/experiments/train_*.py) — and the QAT/post-training quantization
+# scripts (qat_*.py, quantize_*.py) — that calls optimizer.step() in its
+# main loop but does NOT instantiate `EMA(...)` or call `ema.update(...)`.
+# Per CLAUDE.md "EMA — NON-NEGOTIABLE": every training path MUST
+# instantiate EMA, update it after every optimizer.step(), and save the
+# EMA shadow (not the live weights) as the inference checkpoint.
+# Without EMA, single-epoch noise dominates the final checkpoint. Lane G
+# v3 (score 1.05) used EMA correctly. Quantizr (#1, 0.33) uses EMA.
+# Selfcomp (#2, 0.38) uses EMA. Every training run without EMA is a
+# wasted run (Quantizr 0.997 canonical decay).
+#
+# Detection: AST scan for a Call node whose unparsed func ends with
+# `.step()` AND whose receiver name is `optimizer` / `optim` / `_opt`
+# (the canonical training-shaped pattern). If present without (a) `EMA(`
+# construction OR (b) `ema.update(` invocation, flag.
+#
+# Whitelist (waiver — head-of-file marker `# EMA_WAIVED: <reason>` in
+# first 5 lines, OR exempt basename in _EMA_EXEMPT_TRAINING_SCRIPTS):
+#   - smoke / DRY-RUN scripts where EMA isn't needed
+#   - profile scripts (training intentionally a one-shot loop)
+#   - research utilities not in the submission path (mini_scorer)
+#   - codec-calibration scripts (not weight training): neural_weight_codec
+#
+# Memory: .omx/research/council_ema_audit_20260429.md (Council D).
+# Pairs with the CLAUDE.md "EMA — NON-NEGOTIABLE" section added in the
+# same commit.
+
+
+_EMA_OPTIMIZER_NAMES = {"optimizer", "optim", "opt", "_opt"}
+
+
+def _ema_script_calls_optimizer_step(tree: ast.Module) -> bool:
+    """True if the script calls `optimizer.step()` / `optim.step()` / similar
+    in any function body. Used to identify training-shaped scripts."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "step":
+            continue
+        # node.func.value should be a Name in the canonical pattern.
+        v = node.func.value
+        if isinstance(v, ast.Name) and v.id in _EMA_OPTIMIZER_NAMES:
+            return True
+        # Also accept attribute chains like `self.optimizer.step()` /
+        # `cfg.optimizer.step()` where the trailing attr matches.
+        if isinstance(v, ast.Attribute) and v.attr in _EMA_OPTIMIZER_NAMES:
+            return True
+    return False
+
+
+def _ema_script_constructs_ema(tree: ast.Module) -> bool:
+    """True if the script constructs an EMA instance: `EMA(model, ...)`
+    or module-qualified `tac.training.EMA(...)`."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "EMA":
+            return True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "EMA":
+            return True
+    return False
+
+
+def _ema_script_calls_ema_update(tree: ast.Module) -> bool:
+    """True if the script calls `<x>.update(<y>)` where the receiver name
+    contains 'ema'. Conservative: matches `ema.update(model)` /
+    `self.ema.update(model)` / `_ema.update(...)`."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "update":
+            continue
+        v = node.func.value
+        if isinstance(v, ast.Name) and "ema" in v.id.lower():
+            return True
+        if isinstance(v, ast.Attribute) and "ema" in v.attr.lower():
+            return True
+    return False
+
+
+def _ema_script_imports_ema(tree: ast.Module) -> bool:
+    """True if the script imports `EMA` from any module."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "EMA":
+                    return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.endswith(".EMA"):
+                    return True
+    return False
+
+
+def _has_ema_waiver_head_marker(text: str) -> bool:
+    """True if the script has `# EMA_WAIVED:` in its first 5 lines."""
+    head = "\n".join(text.split("\n")[:5])
+    return "# EMA_WAIVED:" in head
+
+
+# These training scripts are exempt because they don't produce a renderer
+# checkpoint that ships in the submission archive. Listed by basename so
+# the check is robust to repo-root path differences.
+_EMA_EXEMPT_TRAINING_SCRIPTS = {
+    # Research utility — never ships
+    "train_mini_scorer.py",
+    # Codec calibration (not weight training of a renderer)
+    "train_neural_weight_codec.py",
+}
+
+
+def _scan_training_script_for_ema_wireins(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Return list of EMA wire-in violations for one training script.
+
+    Violation triggers if BOTH:
+      (a) the script calls optimizer.step() in some function body, AND
+      (b) the script does NOT both instantiate EMA AND call ema.update(...)
+
+    Either an explicit head-of-file `# EMA_WAIVED: <reason>` marker OR
+    presence of the script basename in `_EMA_EXEMPT_TRAINING_SCRIPTS`
+    suppresses the violation.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    if path.name in _EMA_EXEMPT_TRAINING_SCRIPTS:
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+    if _has_ema_waiver_head_marker(text):
+        return []
+    if not _ema_script_calls_optimizer_step(tree):
+        return []
+    has_construct = _ema_script_constructs_ema(tree)
+    has_update = _ema_script_calls_ema_update(tree)
+    has_import = _ema_script_imports_ema(tree)
+    if has_construct and has_update:
+        return []
+    missing = []
+    if not (has_construct or has_import):
+        missing.append("`EMA(model, decay=0.997)` construction (or import)")
+    if not has_update:
+        missing.append("`ema.update(model)` call after optimizer.step()")
+    return [
+        f"{rel}: training script calls optimizer.step() but is missing "
+        f"{' AND '.join(missing)}. Per CLAUDE.md \"EMA — NON-NEGOTIABLE\": "
+        f"every training path MUST instantiate EMA (Quantizr decay=0.997), "
+        f"update after every optim.step(), and ship the EMA shadow as the "
+        f"inference checkpoint. Reference pattern: "
+        f"experiments/train_distill.py L820-828 + L1304. If this script is "
+        f"a research utility / codec calibrator NOT in the submission path, "
+        f"add a head-of-file marker `# EMA_WAIVED: <reason>` (within first "
+        f"5 lines) OR add the basename to `_EMA_EXEMPT_TRAINING_SCRIPTS` in "
+        f"src/tac/preflight.py."
+    ]
+
+
+def check_training_paths_use_ema_correctly(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch training scripts that call optimizer.step() but don't EMA.
+
+    Reference: CLAUDE.md "EMA — NON-NEGOTIABLE" + Council D audit at
+    .omx/research/council_ema_audit_20260429.md. Scans
+    `experiments/train_*.py`, `src/tac/experiments/train_*.py`, and the
+    QAT / post-training quantization scripts (qat_*.py,
+    quantize_*.py) that also produce inference checkpoints.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    candidates: list[Path] = []
+    for d in ("experiments", "src/tac/experiments"):
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        # Training scripts proper.
+        for p in sorted(d_path.glob("train_*.py")):
+            candidates.append(p)
+        # QAT and post-training quantization scripts (they ALSO produce
+        # inference checkpoints per Council D audit §3.2).
+        for pat in ("qat_*.py", "quantize_*.py"):
+            for p in sorted(d_path.glob(pat)):
+                candidates.append(p)
+    for p in candidates:
+        n_scanned += 1
+        violations.extend(_scan_training_script_for_ema_wireins(p, root))
+
+    if verbose and violations:
+        print(
+            f"  [training-needs-ema] {len(violations)} violation(s) across "
+            f"{n_scanned} files:"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [training-needs-ema] OK: {n_scanned} training scripts scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "TRAINING SCRIPT MISSING EMA violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nEMA EVERYWHERE (CLAUDE.md non-negotiable). Reference "
+            "audit: .omx/research/council_ema_audit_20260429.md."
+        )
+    return violations
+
+
+# ── Check 89 (Council B UNIWARD NO-OP incident): remote_lane scripts that
+#    compute a payload and then `cp` over the anchor masks — the encoded
+#    bytes never make it into the archive.
+#
+# Incident (2026-04-29 PM): Lane UNIWARD v8 ran 779s on Modal T4, computed
+# an 8.6 MB UNIWARD SLI1 payload in Stage 3, then Stage 4 ran
+# `cp $ANCHOR_DIR/masks.mkv $ITER_DIR/` which OVERWROTE the encoded bytes
+# with bit-identical Lane A masks. The resulting score 1.14 [contest-CPU
+# advisory] was just Lane A measured on CPU. Council B (Fridrich+Shannon)
+# verdict: NO-OP, encoded bytes never shipped.
+#
+# This check scans every scripts/remote_lane_*.sh for the antipattern:
+# (a) script encodes a payload (writes a file with extension .sli1 / .br /
+#     .stcb / .nwc / .owv2 / .pdv2 / .lct / .bin OR has a comment "Stage N:
+#     encode"/"compute payload"/"build payload")
+# (b) AND later does `cp $ANCHOR_DIR/...mkv $ITER_DIR/` or
+#     `cp $ANCHOR/...zip $ITER_DIR/` (overwrites the staged-output area
+#     with anchor bytes).
+# If both, the script is suspect and must explicitly reference the encoded
+# payload in its archive build (or carry an `# UNIWARD-NO-OP-WAIVED:` marker).
+#
+# Memory: project_lane_uniward_v8_NO_OP_finding_20260429.md.
+
+_PAYLOAD_ENCODE_RE = re.compile(
+    r"(\.sli1|\.br|\.stcb|\.nwc|\.owv2|\.pdv2|\.lct|encode_payload|"
+    r"build_payload|build payload|compute payload|Stage \d+:\s*encode|"
+    r"Stage \d+:\s*build)"
+)
+_ANCHOR_CP_RE = re.compile(
+    r"\bcp\s+[\"']?\$\{?(ANCHOR_DIR|ANCHOR_PATH|ANCHOR)\}?[/\"'].*"
+    r"(masks\.mkv|archive\.zip|renderer\.bin|poses\.pt)"
+)
+_NO_OP_WAIVER_RE = re.compile(
+    r"(?:#\s*UNIWARD-NO-OP-WAIVED|#\s*ANCHOR-CP-INTENTIONAL)"
+)
+
+
+def _scan_remote_lane_for_encode_then_discard(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect remote_lane scripts that encode a payload then `cp` anchor
+    bytes over it, discarding the encoder output (Lane UNIWARD NO-OP class).
+
+    Only flag cp's that come AFTER the FIRST encode step. cp before encode
+    is legitimate "stage anchor base then overwrite one file with encoded
+    version" pattern (most lane scripts do this).
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if _NO_OP_WAIVER_RE.search(text):
+        return []
+    encode_match = _PAYLOAD_ENCODE_RE.search(text)
+    if not encode_match:
+        return []
+    encode_pos = encode_match.start()
+    # Only consider cp matches AFTER the first encode step.
+    cp_matches = [
+        m for m in _ANCHOR_CP_RE.finditer(text) if m.start() > encode_pos
+    ]
+    if not cp_matches:
+        return []
+    violations: list[str] = []
+    for m in cp_matches:
+        line_num = text[:m.start()].count("\n") + 1
+        snippet = m.group(0)[:120]
+        violations.append(
+            f"{rel_s}:{line_num}: encode-then-discard antipattern — script "
+            f"encodes a payload BEFORE this cp at line "
+            f"{text[:encode_pos].count(chr(10)) + 1}, and `{snippet}` "
+            f"overwrites it. Add `# UNIWARD-NO-OP-WAIVED:` marker if "
+            f"intentional, OR fix archive build to ship encoded payload."
+        )
+    return violations
+
+
+def check_remote_lane_scripts_use_computed_payloads(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Forbid the encode-then-discard antipattern in scripts/remote_lane_*.sh
+    (Lane UNIWARD v8 NO-OP class)."""
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    if scripts_dir.is_dir():
+        for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+            violations.extend(
+                _scan_remote_lane_for_encode_then_discard(sh, root)
+            )
+    if verbose:
+        if violations:
+            print(
+                f"  [encode-then-discard] {len(violations)} violation(s)"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print("  [encode-then-discard] OK: 0 violations")
+    if violations and strict:
+        raise MetaBugViolation(
+            "ENCODE-THEN-DISCARD ANTIPATTERN DETECTED:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + "\n\nFix: either (a) modify the archive build step to actually "
+            "ship the encoded payload, OR (b) add a `# UNIWARD-NO-OP-WAIVED:` "
+            "marker explaining why the anchor cp is intentional."
+        )
+    return violations
+
+
+# ── Check A: Vast.ai `create instance` invocation must include --label ───────
+
+
+_VASTAI_CREATE_INSTANCE_RE = re.compile(
+    r'["\']create["\']\s*,\s*["\']instance["\']'
+)
+
+
+def _scan_python_for_vastai_create_no_label(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect `vastai create instance` invocations missing `--label`.
+
+    The Vast.ai web console + show_instances output identify hosts by label.
+    Orphan instances (no label) cannot be killed in bulk, cannot be matched
+    to an experiment, and accrue cost silently. Today's incident: instance
+    35707822 ran for ~$0.05 unidentifiable.
+
+    Looks for `["create", "instance", ...]` arg list (canonical CLI form
+    used by `client.py` and `check_vastai.py`) and checks whether the same
+    arg list also contains `"--label"`.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name:
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List):
+            continue
+        # Pull the literal-string elements.
+        strs = [
+            elt.value for elt in node.elts
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        ]
+        if "create" not in strs or "instance" not in strs:
+            continue
+        # Confirm the order is "create" then "instance" — these are the
+        # vastai positional args. We only flag the literal CLI pattern,
+        # not "create instance" as separate words used elsewhere.
+        try:
+            ci = strs.index("create")
+            if strs[ci + 1] != "instance":
+                continue
+        except (IndexError, ValueError):
+            continue
+        if "--label" not in strs:
+            violations.append(
+                f"{rel}:{node.lineno}: `vastai create instance` invocation "
+                f"missing `--label`. Orphan instances cannot be matched to "
+                f"experiments → silent cost accrual (incident 2026-04-27, "
+                f"$0.05). Add `'--label', f'lane-X-{{experiment.name}}'` to "
+                f"the arg list."
+            )
+    return violations
+
+
+def check_vastai_create_has_label(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Every `vastai create instance` call must pass `--label`.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for path in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_python_for_vastai_create_no_label(path, root))
+    if verbose:
+        if violations:
+            print(f"  [vastai-label] {len(violations)} unlabeled instance create(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [vastai-label] OK: {n_scanned} python file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "VASTAI CREATE INSTANCE WITHOUT --label:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check B: Vast.ai create-instance must register to active-instance tracker
+
+
+_VASTAI_TRACKER_PATH = ".omx/state/vastai_active_instances.json"
+
+
+def _scan_python_for_vastai_create_no_tracker(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect `vastai create instance` not followed by tracker write.
+
+    We look for the canonical `["create", "instance", ...]` arg list, then
+    scan the next ~30 lines for either:
+      - a literal mention of `vastai_active_instances` (any form), OR
+      - a function-name match like `register_active_instance(`,
+        `track_instance(`, `_record_instance(`.
+
+    The tracker exists so a separate cleanup script can detect orphans
+    even when the main launch process dies (e.g. user Ctrl-C between
+    create + setup). Without it, we have no audit trail of what was
+    spawned by what script.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name:
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+    lines = text.splitlines()
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List):
+            continue
+        strs = [
+            elt.value for elt in node.elts
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        ]
+        if "create" not in strs or "instance" not in strs:
+            continue
+        try:
+            ci = strs.index("create")
+            if strs[ci + 1] != "instance":
+                continue
+        except (IndexError, ValueError):
+            continue
+
+        # Scan from this line forward to end-of-file for tracker hooks.
+        # Rationale (R6 refinement, 2026-04-27): waiting for the instance
+        # ID frequently takes 30-90 lines (poll loop for actual_status
+        # ==running, then SSH info). Restricting to a 30-line window
+        # produced false positives in the canonical launch paths
+        # (scripts/check_vastai.py, src/tac/deploy/vastai/client.py)
+        # where the tracker call is wired correctly but appears far
+        # below the `create instance` arg list. The hard rule we care
+        # about: SOMEWHERE in the same function body, a tracker write
+        # must occur. End-of-file is a safe over-approximation; the
+        # call sites are short (~600 lines max) and only one `create
+        # instance` per file in practice.
+        start = node.lineno
+        window = "\n".join(lines[start - 1:])
+        if (
+            "vastai_active_instances" in window
+            or "register_active_instance" in window
+            or "register_instance(" in window
+            or "track_instance(" in window
+            or "_record_instance(" in window
+        ):
+            continue  # tracker hook present
+        violations.append(
+            f"{rel}:{node.lineno}: `vastai create instance` not followed by "
+            f"a tracker write anywhere in the file. Add a call to "
+            f"`tac.vastai_tracker.register_instance(...)` so a cleanup "
+            f"script can detect orphans. (Tracker file: "
+            f"{_VASTAI_TRACKER_PATH}.)"
+        )
+    return violations
+
+
+def check_vastai_create_writes_tracker(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Every Vast.ai launch must register the instance ID to a tracker file.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for path in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_python_for_vastai_create_no_tracker(path, root))
+    if verbose:
+        if violations:
+            print(f"  [vastai-tracker] {len(violations)} untracked launch(es):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [vastai-tracker] OK: {n_scanned} python file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "VASTAI CREATE INSTANCE WITHOUT TRACKER REGISTRATION:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check C: Subagent prompts allowing `--device cpu` fallback ───────────────
+
+
+_DEVICE_CPU_FALLBACK_RE = re.compile(
+    r"--device\s+cpu",
+    re.IGNORECASE,
+)
+_DETERMINISTIC_BYTES_OK_RE = re.compile(
+    r"deterministic[-_ ]bytes acceptable|byte[-_ ]match[ \w]*N/A|cpu fallback approved",
+    re.IGNORECASE,
+)
+
+
+def _scan_for_cpu_fallback_in_subagent_prompts(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Find subagent-prompt files mentioning `--device cpu` without caveat.
+
+    A subagent dispatch prompt that says "use --device cpu if CUDA fails"
+    can produce non-byte-matching archive bytes. Today's Lane H CRF56 task
+    hit this — caught at review, no real cost, but a permanent gate is
+    structurally cheaper than catching it again.
+
+    Path filter: .md files under .agents/ and prompts/, plus Python literal
+    strings invoking `Agent(...)` with prompt= containing the phrase.
+    Caveat regex `_DETERMINISTIC_BYTES_OK_RE` allows the phrase if the
+    same file (or same paragraph, approximated by 5-line window) explicitly
+    permits non-deterministic bytes.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    # Skip preflight + tests + this very file.
+    if (
+        "/tests/" in rel_s
+        or "preflight.py" in rel_s
+        or "test_" in path.name
+        or rel_s.endswith("CLAUDE.md")
+    ):
+        return []
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if not _DEVICE_CPU_FALLBACK_RE.search(text):
+        return []
+
+    violations: list[str] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines, start=1):
+        if not _DEVICE_CPU_FALLBACK_RE.search(line):
+            continue
+        # Look for caveat in surrounding 5-line window.
+        window_start = max(0, i - 5)
+        window_end = min(len(lines), i + 5)
+        window = "\n".join(lines[window_start:window_end])
+        if _DETERMINISTIC_BYTES_OK_RE.search(window):
+            continue
+        violations.append(
+            f"{rel}:{i}: `--device cpu` mention without "
+            f"'deterministic-bytes acceptable' caveat in 5-line window. "
+            f"CPU fallback in a byte-deterministic build path produces "
+            f"non-matching archive bytes (CLAUDE.md FORBIDDEN PATTERNS). "
+            f"Add the caveat or remove the cpu fallback."
+        )
+    return violations
+
+
+def check_subagent_prompts_no_cpu_fallback(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Subagent prompts must not allow `--device cpu` without caveat.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    # Scan .agents/, prompts/, and src/tac/agents/ if it exists.
+    scan_dirs = [".agents", "prompts", "src/tac"]
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for ext in ("*.md", "*.py"):
+            for p in d_path.rglob(ext):
+                if "__pycache__" in p.parts:
+                    continue
+                n_scanned += 1
+                violations.extend(
+                    _scan_for_cpu_fallback_in_subagent_prompts(p, root)
+                )
+    if verbose:
+        if violations:
+            print(f"  [cpu-fallback] {len(violations)} unguarded cpu-fallback prompt(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [cpu-fallback] OK: {n_scanned} prompt/source file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "SUBAGENT PROMPT ALLOWS --device cpu WITHOUT CAVEAT:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check D: Numeric scores in run_log/findings without lane tag ─────────────
+
+
+_SCORE_LANE_TAGS = (
+    "[contest-CUDA]", "[advisory only]", "[MPS-PROXY]",
+    "[contest-compliant]", "[unlimited-compute]",
+    "[scorer-at-inflate-noncompliant]", "[CUDA-PROXY]",
+)
+_SCORE_LINE_RE = re.compile(
+    r"\b(?:auth|score|total)\s*[=:]\s*([0-9]+\.[0-9]+)",
+    re.IGNORECASE,
+)
+
+
+def _scan_doc_for_untagged_scores(path: Path, repo_root: Path) -> list[str]:
+    """Find lines like 'auth = 0.36' lacking a lane tag.
+
+    CLAUDE.md non-negotiable: every numeric score MUST carry a lane tag so
+    operators can never confuse contest-CUDA truth with proxy/MPS noise.
+    Today's run_log has 9 score lines, only 1 tagged (audit done).
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    violations: list[str] = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        if not _SCORE_LINE_RE.search(line):
+            continue
+        # Skip lines that look like math / formulas (e.g. "score = 100*seg + ...")
+        if any(op in line for op in ("100*", "sqrt", "* seg", "(seg")):
+            continue
+        # Skip lines describing the scoring formula itself.
+        if "formula" in line.lower() or "scoring" in line.lower()[:20]:
+            continue
+        if any(tag in line for tag in _SCORE_LANE_TAGS):
+            continue
+        # Allow [N.NN-N.NN] range expressions that are obviously projections.
+        if "projection" in line.lower() or "projected" in line.lower():
+            continue
+        violations.append(
+            f"{rel}:{i}: numeric score without lane tag. "
+            f"Add one of {_SCORE_LANE_TAGS} to the same line. "
+            f"(CLAUDE.md non-negotiable, MPS-CUDA drift = 23x.)"
+        )
+    return violations
+
+
+def check_scores_have_lane_tag(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Every numeric score in run_log/findings/BATTLE_PLAN must be lane-tagged.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    targets = [
+        ".ralph/run_log.md",
+        ".omx/research/findings.md",
+        "docs/BATTLE_PLAN.md",
+    ]
+    n_scanned = 0
+    for t in targets:
+        p = root / t
+        if not p.exists():
+            continue
+        n_scanned += 1
+        violations.extend(_scan_doc_for_untagged_scores(p, root))
+    if verbose:
+        if violations:
+            print(f"  [score-tag] {len(violations)} untagged score line(s):")
+            for v in violations[:20]:  # cap output
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print(f"  [score-tag] OK: {n_scanned} doc file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "SCORE LINES WITHOUT LANE TAG:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check E: SCORER_AT_INFLATE_WAIVED markers must name an env-gate var ──────
+
+
+_WAIVER_GENERIC_RE = re.compile(
+    r"#\s*SCORER_AT_INFLATE_WAIVED\s*(?::\s*([^\n]*))?"
+)
+_WAIVER_ENVGATE_RE = re.compile(
+    r"env-gated[-_]([A-Z_][A-Z0-9_]*)(?:\s*=\s*[^\s,]+)?",
+    re.IGNORECASE,
+)
+
+
+def _scan_for_unspecific_waivers(path: Path, repo_root: Path) -> list[str]:
+    """Detect SCORER_AT_INFLATE_WAIVED markers that lack an env-gate name.
+
+    The waiver format is:
+        # SCORER_AT_INFLATE_WAIVED:env-gated-INFLATE_TTO=1
+    The reason MUST start with `env-gated-` and name a specific env var.
+    Bare `# SCORER_AT_INFLATE_WAIVED` (no reason) or
+    `# SCORER_AT_INFLATE_WAIVED:reason-without-env-gate` is rejected so
+    operators can audit which env-vars enable scorer-at-inflate paths.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    violations: list[str] = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        m = _WAIVER_GENERIC_RE.search(line)
+        if not m:
+            continue
+        reason = (m.group(1) or "").strip()
+        if not reason:
+            violations.append(
+                f"{rel}:{i}: bare `# SCORER_AT_INFLATE_WAIVED` with no "
+                f"reason. Required form: "
+                f"`# SCORER_AT_INFLATE_WAIVED:env-gated-<ENV_VAR_NAME>=<val>`."
+            )
+            continue
+        if not _WAIVER_ENVGATE_RE.search(reason):
+            violations.append(
+                f"{rel}:{i}: waiver reason {reason!r} does not name an "
+                f"env-gate. Required: 'env-gated-<ENV_VAR_NAME>[=val]' so "
+                f"operators can audit which env-var enables this path."
+            )
+    return violations
+
+
+def check_waivers_specify_env_gate(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Every scorer-at-inflate waiver must name the env-gate that enables it.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    submissions_dir = root / "submissions"
+    if submissions_dir.exists():
+        for p in submissions_dir.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            n_scanned += 1
+            violations.extend(_scan_for_unspecific_waivers(p, root))
+    if verbose:
+        if violations:
+            print(f"  [waiver-envgate] {len(violations)} unspecific waiver(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [waiver-envgate] OK: {n_scanned} submission file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "SCORER_AT_INFLATE_WAIVED MARKERS WITHOUT ENV-GATE NAME:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check F: --half-frame archive build requires half-frame-trained renderer
+
+
+def _scan_for_halfframe_without_trained_profile(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect --half-frame archive builds without a trained-for-it profile.
+
+    Per memory `feedback_half_frame_breaks_posenet` (2026-04-27): the
+    Quantizr half-frame trick BREAKS PoseNet on the dilated-h64 baseline
+    (PoseNet=28.7, score 17.55) because that renderer's MotionPredictor uses
+    `(e_t1 - e_t).abs()` and warped-even-mask zeroes the diff.
+
+    Rule: any invocation of `build_baseline_archive.py --half-frame` MUST
+    also pass `--profile <X>` where the profile dict has
+    `mask_half_sim_prob > 0` OR `use_zoom_flow=True`. We can statically
+    check the script-text only — the profile lookup happens at runtime
+    via `tac.profiles.PROFILES[X]`. So we (a) extract the profile name
+    from the same invocation arg list, (b) import PROFILES, (c) check
+    the keys.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name:
+        return []
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if "build_baseline_archive" not in text or "--half-frame" not in text:
+        return []
+    violations: list[str] = []
+    # Try to load PROFILES; if unavailable, fall back to text-marker check.
+    try:
+        from tac.profiles import PROFILES as _PROFILES
+    except Exception:
+        _PROFILES = None
+    # Find each --half-frame mention; near it, find --profile <name>.
+    lines = text.splitlines()
+    for i, line in enumerate(lines, start=1):
+        if "--half-frame" not in line:
+            continue
+        # Skip the argparse flag DEFINITION itself (false positive — this is
+        # the file that introduces the flag, not a caller). Detect the
+        # `add_argument("--half-frame"...)` pattern in the same line OR the
+        # 2 preceding lines (multi-line argparse calls are common).
+        defn_window = "\n".join(lines[max(0, i - 3): i])
+        if "add_argument" in line or "add_argument" in defn_window:
+            continue
+        # Skip docstring / help-string occurrences inside a triple-quoted
+        # block on the same line: these are not invocations.
+        if '"""' in line and line.count('"""') >= 1 and "--half-frame" in line.split('"""')[-1]:
+            # Inside a docstring tail — skip (heuristic).
+            pass
+        # Scan a 30-line window for --profile.
+        window_start = max(0, i - 30)
+        window_end = min(len(lines), i + 30)
+        window = "\n".join(lines[window_start:window_end])
+        prof_match = re.search(
+            r"--profile[\s=]+['\"]?([A-Za-z0-9_]+)['\"]?", window
+        )
+        if not prof_match:
+            violations.append(
+                f"{rel}:{i}: `--half-frame` present but no `--profile` "
+                f"in 30-line window. Half-frame archives REQUIRE a "
+                f"renderer trained with mask_half_sim_prob>0 OR "
+                f"use_zoom_flow=True (memory feedback_half_frame_breaks_posenet)."
+            )
+            continue
+        prof_name = prof_match.group(1)
+        if _PROFILES is None:
+            # Best effort — name-based sanity check.
+            if "half_frame" not in prof_name and "zoom" not in prof_name:
+                violations.append(
+                    f"{rel}:{i}: `--half-frame` with `--profile {prof_name}` "
+                    f"— profile name does not contain 'half_frame' or "
+                    f"'zoom'. Verify profile has mask_half_sim_prob>0 OR "
+                    f"use_zoom_flow=True (PROFILES not importable in scan)."
+                )
+            continue
+        prof = _PROFILES.get(prof_name)
+        if prof is None:
+            violations.append(
+                f"{rel}:{i}: `--half-frame` with unknown profile {prof_name!r}."
+            )
+            continue
+        ok = (
+            prof.get("mask_half_sim_prob", 0) > 0
+            or prof.get("use_zoom_flow", False) is True
+        )
+        if not ok:
+            violations.append(
+                f"{rel}:{i}: `--half-frame` with profile {prof_name!r} which "
+                f"has mask_half_sim_prob=0 AND use_zoom_flow=False. This "
+                f"BREAKS PoseNet (memory feedback_half_frame_breaks_posenet, "
+                f"verified 2026-04-27 score 17.55). Use a profile with "
+                f"either flag enabled (e.g., 'dilated_h64_half_frame')."
+            )
+    return violations
+
+
+def check_halfframe_archive_uses_trained_profile(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """`--half-frame` archive builds must use a renderer trained for it.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    # Scan all python + shell scripts.
+    for path in _iter_python_files(root, ["scripts", "experiments"]):
+        n_scanned += 1
+        violations.extend(_scan_for_halfframe_without_trained_profile(path, root))
+    for path in _iter_shell_files(root, ["scripts"]):
+        n_scanned += 1
+        violations.extend(_scan_for_halfframe_without_trained_profile(path, root))
+    if verbose:
+        if violations:
+            print(f"  [halfframe] {len(violations)} half-frame mismatch(es):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [halfframe] OK: {n_scanned} script file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "HALF-FRAME ARCHIVE WITHOUT HALF-FRAME-TRAINED RENDERER:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check G: profile keys without parse_args resolver (bidirectional) ────────
+
+
+_PROFILE_KEY_EXEMPTIONS = frozenset({
+    # Documentation / metadata keys — never resolved as flags.
+    "_doc", "_notes", "_origin", "name", "description",
+    # Pydantic / dataclass internal keys.
+    "model_config", "Config",
+    # Aliases for already-resolved keys (handled via downstream rename).
+    "channels",  # alias for hidden_dim in some profiles
+})
+
+
+def _extract_profile_keys() -> set[str] | None:
+    """Return the union of keys across all PROFILES dicts, or None if import fails."""
+    try:
+        from tac.profiles import PROFILES
+    except Exception:
+        return None
+    keys: set[str] = set()
+    for prof in PROFILES.values():
+        if isinstance(prof, dict):
+            keys.update(prof.keys())
+    return keys - _PROFILE_KEY_EXEMPTIONS
+
+
+def _scan_for_resolver_keys(text: str) -> set[str]:
+    """Pull every `cfg.<KEY> = ...` assignment + `args.<KEY>` read.
+
+    Also catches a wide variety of profile-key access patterns so a key
+    used anywhere in the codebase (not just in train_renderer) counts as
+    'resolved'. The intent is to flag keys that have ZERO consumers, which
+    is the actual bug class — not to require a specific resolver pattern.
+
+    Resolver detection patterns (any one is sufficient):
+      cfg.X = …                             # assignment
+      cfg.X                                 # bare read
+      args.X                                # parsed-args read
+      profile["X"] / profile.get("X")       # dict access (variants:
+        prof / p / cfg / config / hp / params / arch_dict / arch / vals /
+        opts / overrides)
+      kwargs.get("X")
+      setattr(_, "X", _) / getattr(_, "X")
+      self.config.X / self.cfg.X / self._cfg.X / self._config.X
+      def …(X: type = default)              # function/method parameter
+      f(X=value)                            # keyword argument in call
+      X: type = default                     # dataclass field declaration
+      # PROFILE_KEY_RESOLVED:X              # explicit waiver marker
+    """
+    out: set[str] = set()
+    for m in re.finditer(r"\bcfg\.([A-Za-z_][A-Za-z0-9_]*)\s*=", text):
+        out.add(m.group(1))
+    for m in re.finditer(r"\bargs\.([A-Za-z_][A-Za-z0-9_]*)\b", text):
+        out.add(m.group(1))
+    # `profile["<KEY>"]` / `profile.get("<KEY>")` / `prof["<KEY>"]` /
+    # `p["<KEY>"]` / `cfg["<KEY>"]` — all dict-access patterns.
+    # Extended to cover common alias names: `vals`, `opts`, `overrides`.
+    for m in re.finditer(
+        r'\b(?:profile|prof|p|cfg|config|hp|params|arch_dict|arch|vals|opts|overrides|profile_vals)'
+        r'(?:\.get)?\s*[(\[]\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']',
+        text,
+    ):
+        out.add(m.group(1))
+    # Bare attribute access `cfg.<KEY>` (read, not assignment).
+    for m in re.finditer(r"\bcfg\.([A-Za-z_][A-Za-z0-9_]*)\b", text):
+        out.add(m.group(1))
+    # `kwargs.get("<KEY>")` and `setattr(.., "<KEY>", ..)`.
+    for m in re.finditer(r'\bkwargs\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']', text):
+        out.add(m.group(1))
+    for m in re.finditer(r'\bsetattr\s*\([^,]+,\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']', text):
+        out.add(m.group(1))
+    # `getattr(<x>, "<KEY>"...)` reads.
+    for m in re.finditer(r'\bgetattr\s*\([^,]+,\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']', text):
+        out.add(m.group(1))
+    # `self.config.X`, `self.cfg.X`, `self._cfg.X`, `self._config.X`
+    # — dataclass-config reads (legitimate consumer pattern,
+    # used by tac.contrib.domain_solvers, etc.).
+    for m in re.finditer(
+        r'\bself\.(?:_?config|_?cfg)\.([A-Za-z_][A-Za-z0-9_]*)\b',
+        text,
+    ):
+        out.add(m.group(1))
+    # Explicit waiver marker for cases the scanner can't reach
+    # (e.g. dynamic load via ** spread). Format:
+    #   `# PROFILE_KEY_RESOLVED:my_key`  (single key)
+    #   `# PROFILE_KEY_RESOLVED:k1,k2,k3` (multiple keys)
+    for m in re.finditer(
+        r'#\s*PROFILE_KEY_RESOLVED:\s*([A-Za-z_][A-Za-z0-9_,\s]*)',
+        text,
+    ):
+        for k in m.group(1).split(","):
+            k = k.strip()
+            if k and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', k):
+                out.add(k)
+    # Walk the AST to find function/method parameter names and
+    # dataclass field declarations. This catches the very common
+    # consumption pattern where a function signature names the key
+    # directly, e.g. `def train(scorer_weight: float = 20.0): …`.
+    # Without AST parsing, the regex would have to be fragile.
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in node.args.args + node.args.kwonlyargs + node.args.posonlyargs:
+                out.add(arg.arg)
+            if node.args.vararg:
+                out.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                out.add(node.args.kwarg.arg)
+        elif isinstance(node, ast.ClassDef):
+            # Dataclass-style field declarations:  `X: type = default`
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    out.add(item.target.id)
+                elif isinstance(item, ast.Assign):
+                    for t in item.targets:
+                        if isinstance(t, ast.Name):
+                            out.add(t.id)
+        elif isinstance(node, ast.Call):
+            # `f(X=value)` — keyword arguments in calls.
+            for kw in node.keywords:
+                if kw.arg is not None:  # exclude **kwargs spreads
+                    out.add(kw.arg)
+    return out
+
+
+def check_profile_keys_have_resolvers(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Bidirectional: every profile key must have a parse_args resolver.
+
+    The existing dead-resolver scanner finds parse_args entries that have
+    no profile mapping (orphan flags). This complementary check finds
+    profile keys that have no parse_args resolver (silent default → bug
+    cluster: pose_dim, blend_mode, etc.).
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    # If the provided repo_root has no profiles.py, skip — tests use this
+    # path with a stub repo and we don't want them to pull live PROFILES.
+    if not (root / "src" / "tac" / "profiles.py").exists():
+        if verbose:
+            print(f"  [profile-resolver] SKIP: {root}/src/tac/profiles.py not found")
+        return []
+    keys = _extract_profile_keys()
+    if keys is None:
+        if verbose:
+            print(f"  [profile-resolver] SKIP: PROFILES not importable")
+        return []
+    # Resolver search: the profile-key consumer can be ANY file under
+    # src/tac/ or experiments/. The original narrow list (train_renderer +
+    # train_distill + training + build_renderer + profiles) missed legit
+    # consumers — e.g. T_max is used by the cosine scheduler in
+    # train_renderer.py:1356, but the regex matched the assignment not the
+    # use. Cast a wide net: if a key appears as a dict-access ANYWHERE in
+    # src/tac or experiments, count it as resolved. This makes the gate
+    # find the actual bug class — keys with ZERO consumers — without
+    # producing false positives on widely-used keys.
+    resolver_search_dirs = ["src/tac", "experiments"]
+    resolved: set[str] = set()
+    for d in resolver_search_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in d_path.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            try:
+                text = p.read_text()
+            except (UnicodeDecodeError, FileNotFoundError):
+                continue
+            resolved.update(_scan_for_resolver_keys(text))
+    resolver_files = ["src/tac/", "experiments/"]  # for error message
+    missing = sorted(keys - resolved)
+    for k in missing:
+        violations.append(
+            f"profile key {k!r} has no resolver in any of "
+            f"{resolver_files}. Profiles with this key would silently use "
+            f"the constructor default. Add `cfg.{k} = profile['{k}']` to "
+            f"the resolver section."
+        )
+    if verbose:
+        if violations:
+            print(f"  [profile-resolver] {len(violations)} unresolved profile key(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print(f"  [profile-resolver] OK: {len(keys)} profile key(s) all resolved")
+    if violations and strict:
+        raise MetaBugViolation(
+            "PROFILE KEYS WITHOUT RESOLVERS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check H: scorer-at-inflate path must print [strict-scorer-rule] banner ──
+
+
+def _file_loads_scorer_at_inflate(path: Path) -> bool:
+    """Quick check: does this inflate*.py contain a scorer-load call?"""
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return False
+    return any(
+        keyword in text
+        for keyword in (
+            "load_scorers", "load_posenet", "load_segnet",
+            "load_differentiable_scorers", "tac.scorer",
+            "extract_gt_pose_targets", "load_posenet_targets",
+        )
+    )
+
+
+def check_inflate_scorer_load_has_runtime_banner(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Inflate files loading scorers must print a [strict-scorer-rule] banner.
+
+    Per CLAUDE.md strict-scorer-rule: any inflate-time scorer-load path
+    is non-compliant and MUST print a runtime warning banner so the score
+    can be properly tagged in the run-log. Static scan: every inflate*.py
+    that imports/calls a scorer loader must contain a literal
+    `print(...)` of a string containing `[strict-scorer-rule]`.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    submissions_dir = root / "submissions"
+    if submissions_dir.exists():
+        for p in submissions_dir.rglob("inflate*.py"):
+            n_scanned += 1
+            if not _file_loads_scorer_at_inflate(p):
+                continue
+            try:
+                text = p.read_text()
+            except (UnicodeDecodeError, FileNotFoundError):
+                continue
+            if "[strict-scorer-rule]" not in text:
+                rel = p.relative_to(root) if p.is_absolute() else p
+                violations.append(
+                    f"{rel}: file loads scorer at inflate time but never "
+                    f"prints '[strict-scorer-rule]' banner. Add a "
+                    f"`print('[strict-scorer-rule] ...', file=sys.stderr)` "
+                    f"on the env-gated branch so the score can be tagged "
+                    f"[scorer-at-inflate-noncompliant]."
+                )
+    if verbose:
+        if violations:
+            print(f"  [scorer-banner] {len(violations)} inflate file(s) lack runtime banner:")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [scorer-banner] OK: {n_scanned} inflate file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "INFLATE SCORER-LOAD WITHOUT RUNTIME BANNER:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check I: test files importing symbols that don't exist ──────────────────
+
+
+def _resolve_module_to_path(module: str, repo_root: Path) -> Path | None:
+    """Map dotted module name to .py file path under the repo."""
+    parts = module.split(".")
+    candidates = [
+        repo_root / "src" / Path(*parts).with_suffix(".py"),
+        repo_root / Path(*parts).with_suffix(".py"),
+        repo_root / "src" / Path(*parts) / "__init__.py",
+        repo_root / Path(*parts) / "__init__.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _collect_module_top_level_names(tree: ast.Module) -> set[str]:
+    """Names defined at module top level (functions, classes, assignments)."""
+    out: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    out.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                out.add(alias.asname or alias.name.split(".")[0])
+    return out
+
+
+def _collect_importorskip_modules(tree: ast.Module) -> set[str]:
+    """Collect every module name passed to pytest.importorskip(...) at module top.
+
+    Honors the canonical pytest pattern for tests of optional / pending
+    dependencies:
+        pytest.importorskip("tac.self_augmentation")
+        from tac.self_augmentation import foo  # scanner accepts because of skip above
+
+    A test file that opts in this way runs cleanly when the module lands and
+    skips gracefully (with reason) when it's missing — matches industrial
+    pytest workflow for in-flight subagent / staged work.
+    """
+    skipped: set[str] = set()
+    for node in tree.body:
+        # Look for `pytest.importorskip("X")` either as a bare expression
+        # statement or as an assignment RHS (`mod = pytest.importorskip("X")`).
+        call: ast.Call | None = None
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(
+            getattr(node, "value", None), ast.Call
+        ):
+            call = node.value  # type: ignore[assignment]
+        if call is None:
+            continue
+        func = call.func
+        is_importorskip = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "importorskip"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "pytest"
+        )
+        if not is_importorskip:
+            continue
+        if not call.args:
+            continue
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            skipped.add(first.value)
+    return skipped
+
+
+def _has_module_level_skip(tree: ast.Module) -> bool:
+    """Return True if module body contains `pytest.skip(..., allow_module_level=True)`.
+
+    This is the canonical pytest pattern for "skip the whole module" — see
+    pytest docs on pytest.skip + allow_module_level. The scanner walks the
+    module body (including nested if/try blocks at the top level) for any
+    such call. When found, ALL ImportFrom in the file are tolerated since
+    pytest will refuse to collect the module before any inner import runs.
+    """
+    def _scan(stmts: list[ast.stmt]) -> bool:
+        for node in stmts:
+            call: ast.Call | None = None
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+            if call is not None:
+                func = call.func
+                is_skip = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "skip"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "pytest"
+                )
+                if is_skip:
+                    for kw in call.keywords:
+                        if (
+                            kw.arg == "allow_module_level"
+                            and isinstance(kw.value, ast.Constant)
+                            and kw.value.value is True
+                        ):
+                            return True
+            # Recurse into top-level if/try blocks (still "module level").
+            if isinstance(node, ast.If) and (_scan(node.body) or _scan(node.orelse)):
+                return True
+            if isinstance(node, ast.Try):
+                if _scan(node.body) or _scan(node.orelse) or _scan(node.finalbody):
+                    return True
+                for handler in node.handlers:
+                    if _scan(handler.body):
+                        return True
+        return False
+    return _scan(tree.body)
+
+
+def _scan_test_file_for_dead_imports(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Catch broken test imports. Companion to existing dead-import scanner.
+
+    Existing scanner skips test dirs because of fixture noise. But real
+    failures hide there: test_yousfi_*, test_wavelet_variance have been
+    broken for sessions. Scan ONLY test files, ONLY for ImportError-class
+    issues (target module not found, target name not in module).
+
+    Honors `pytest.importorskip("X")` at module top as a legitimate opt-out
+    for tests of optional / in-flight modules — see _collect_importorskip_modules.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    if _has_module_level_skip(tree):
+        # `pytest.skip(..., allow_module_level=True)` at module top — pytest
+        # refuses to collect the module so no ImportFrom inside ever runs.
+        return []
+
+    importorskip_mods = _collect_importorskip_modules(tree)
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module is None:
+            continue
+        # Only check intra-project imports (start with tac, experiments,
+        # comma_lab, scripts).
+        mod = node.module
+        if not (
+            mod.startswith("tac")
+            or mod.startswith("experiments")
+            or mod.startswith("comma_lab")
+            or mod.startswith("scripts")
+        ):
+            continue
+        # Honor pytest.importorskip("X") opt-out: skip imports of X or any
+        # submodule under X.
+        if any(mod == m or mod.startswith(m + ".") for m in importorskip_mods):
+            continue
+        # Resolve module file.
+        mod_path = _resolve_module_to_path(mod, repo_root)
+        if mod_path is None or not mod_path.exists():
+            violations.append(
+                f"{rel}:{node.lineno}: imports from {mod!r} which does not "
+                f"resolve to a file. Either delete the test or fix the "
+                f"import (test has been silently broken)."
+            )
+            continue
+        # For each name imported, check it's defined in target.
+        try:
+            target_text = mod_path.read_text()
+            target_tree = ast.parse(target_text)
+        except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+            continue
+        defined = _collect_module_top_level_names(target_tree)
+        for alias in node.names:
+            name = alias.name
+            if name == "*":
+                continue
+            if name in defined:
+                continue
+            # `from tac import preflight` is a valid submodule import even when
+            # `preflight` isn't a top-level name in `tac/__init__.py`. Python
+            # resolves it to `tac/preflight.py`. Accept the import if the
+            # submodule file exists.
+            sub_path = _resolve_module_to_path(f"{mod}.{name}", repo_root)
+            if sub_path is not None and sub_path.exists():
+                continue
+            violations.append(
+                f"{rel}:{node.lineno}: imports {name!r} from {mod!r} "
+                f"but {mod} does not define it. Test will ImportError "
+                f"at collection time (silently skipped)."
+            )
+    return violations
+
+
+def check_test_files_imports_resolve(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Tests file imports must resolve to actually-defined symbols.
+
+    Per the historical pattern: test files have been silently broken for
+    sessions because the existing dead-import scanner skips test dirs.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    test_dir = root / "src" / "tac" / "tests"
+    if test_dir.exists():
+        for p in test_dir.rglob("test_*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            n_scanned += 1
+            violations.extend(_scan_test_file_for_dead_imports(p, root))
+    if verbose:
+        if violations:
+            print(f"  [test-imports] {len(violations)} broken test import(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print(f"  [test-imports] OK: {n_scanned} test file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "TEST FILE IMPORTS DO NOT RESOLVE:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check J: subagent dispatch prompts must mention cost cap ────────────────
+
+
+_VASTAI_PROMPT_RE = re.compile(r"\b(?:vast\.?ai|Vast\.?ai)\b")
+_COST_GUARD_RE = re.compile(
+    r"\$\s*\d|cost cap|budget|\$24 hard cap|destroy.*instance",
+    re.IGNORECASE,
+)
+
+
+def _scan_for_vastai_prompt_no_cost_cap(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect agent prompts/dispatches mentioning Vast.ai with no cost guard."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if (
+        "/tests/" in rel_s
+        or "test_" in path.name
+        or "preflight.py" in rel_s
+        or rel_s.endswith("CLAUDE.md")
+        or rel_s.endswith("MEMORY.md")
+        or "memory/" in rel_s
+        or rel_s.startswith(".memory/")
+    ):
+        return []
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if not _VASTAI_PROMPT_RE.search(text):
+        return []
+    # Whole-file granularity for agent prompts: if the file mentions
+    # vast.ai but never mentions a cost guard, flag it once.
+    if _COST_GUARD_RE.search(text):
+        return []
+    # Find the first line that mentions vast.ai for the violation lineno.
+    lineno = 1
+    for i, line in enumerate(text.splitlines(), start=1):
+        if _VASTAI_PROMPT_RE.search(line):
+            lineno = i
+            break
+    return [
+        f"{rel}:{lineno}: file dispatches/discusses Vast.ai work without "
+        f"any cost-cap mention (no '$', 'budget', 'cost cap', or "
+        f"'destroy instance'). Per feedback_vastai_cost_paranoia: "
+        f"every Vast.ai dispatch MUST name a $ cap and a destroy condition."
+    ]
+
+
+def check_vastai_prompts_have_cost_cap(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Subagent prompts mentioning Vast.ai must mention a cost cap.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    scan_dirs = [".agents", "prompts"]
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in d_path.rglob("*.md"):
+            n_scanned += 1
+            violations.extend(_scan_for_vastai_prompt_no_cost_cap(p, root))
+    if verbose:
+        if violations:
+            print(f"  [vastai-cost-cap] {len(violations)} unguarded vastai prompt(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [vastai-cost-cap] OK: {n_scanned} prompt file(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "VASTAI PROMPTS WITHOUT COST CAP:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check K: --with-uniward-delta requires --allow-pending-compliance/attestation
+
+
+def _scan_for_uniward_delta_without_attestation(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Detect --with-uniward-delta usage without the compliance gate.
+
+    Per Lane C R5 (commit ef8a9a1b): every UNIWARD δ injection MUST pass
+    one of:
+      - --allow-pending-compliance (operator override, recorded)
+      - <attestation file present at canonical path>
+    Static check: if a script invokes build_baseline_archive with
+    --with-uniward-delta, it must ALSO pass --allow-pending-compliance OR
+    have an explicit comment referencing the attestation file path.
+
+    Refinement (R6 cleanup, 2026-04-27): the file that DEFINES the flag
+    (experiments/build_baseline_archive.py) is excluded — every mention
+    inside it is either the argparse definition, a help string, or an
+    error message. The flag's compliance enforcement is implemented IN
+    that file (the gate). So the rule: scan only CALLERS, not the file
+    that owns the argparse definition. We detect ownership by looking
+    for a top-level `add_argument("--with-uniward-delta"` line.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    if "/tests/" in rel_s or "test_" in path.name:
+        return []
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if "--with-uniward-delta" not in text:
+        return []
+    # Skip the file that DEFINES the flag (and thus enforces the gate
+    # internally). Every textual occurrence inside that file is either
+    # the argparse spec, the help string, or an internal error/comment —
+    # never an actual subprocess call to itself.
+    if 'add_argument("--with-uniward-delta"' in text or "add_argument('--with-uniward-delta'" in text:
+        return []
+    violations: list[str] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines, start=1):
+        if "--with-uniward-delta" not in line:
+            continue
+        # Skip occurrences inside an obvious string literal (help text,
+        # error message). Heuristic: line contains the flag preceded by
+        # an opening quote AND followed (within the line) by a closing
+        # quote, with no `subprocess` / `Popen` / shell-call markers.
+        stripped = line.strip()
+        is_comment_only = stripped.startswith("#") or stripped.startswith('"') or stripped.startswith("'")
+        if is_comment_only and "subprocess" not in line and "Popen" not in line:
+            continue
+        # Scan a 30-line window.
+        window_start = max(0, i - 30)
+        window_end = min(len(lines), i + 30)
+        window = "\n".join(lines[window_start:window_end])
+        if (
+            "--allow-pending-compliance" in window
+            or "lane_c_compliance_attestations" in window
+            or "verify_attestation_for_blob" in window
+        ):
+            continue
+        violations.append(
+            f"{rel}:{i}: `--with-uniward-delta` without "
+            f"`--allow-pending-compliance` OR an attestation file reference "
+            f"in 30-line window. Per Lane C R5 (commit ef8a9a1b): δ.bin "
+            f"injection requires explicit compliance gate."
+        )
+    return violations
+
+
+def check_uniward_delta_has_attestation_gate(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """`--with-uniward-delta` invocations must include compliance gate.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for path in _iter_python_files(root, ["scripts", "experiments"]):
+        n_scanned += 1
+        violations.extend(_scan_for_uniward_delta_without_attestation(path, root))
+    for path in _iter_shell_files(root, ["scripts"]):
+        n_scanned += 1
+        violations.extend(_scan_for_uniward_delta_without_attestation(path, root))
+    if verbose:
+        if violations:
+            print(f"  [uniward-attestation] {len(violations)} ungated δ invocation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [uniward-attestation] OK: {n_scanned} script(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "UNIWARD DELTA WITHOUT COMPLIANCE GATE:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check L: Vast.ai remote scripts must write provenance.json ──────────────
+
+
+def _shell_script_writes_provenance(path: Path) -> bool:
+    """True if this shell script writes provenance.json (any form)."""
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return False
+    return "provenance.json" in text or "PROVENANCE_JSON" in text
+
+
+def check_remote_scripts_write_provenance(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Every `scripts/remote_*.sh` must write provenance.json.
+
+    Per CLAUDE.md canonical pipeline standard + memory
+    `feedback_canonical_remote_bootstraps`: every remote run produces a
+    provenance.json so a fresh agent can reconstruct the experiment.
+    Lanes A/B/D/G shipped without it.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    scripts_dir = root / "scripts"
+    if not scripts_dir.exists():
+        if verbose:
+            print(f"  [provenance] SKIP: scripts/ not found")
+        return []
+    n_scanned = 0
+    for p in sorted(scripts_dir.glob("remote_*.sh")):
+        n_scanned += 1
+        if not _shell_script_writes_provenance(p):
+            rel = p.relative_to(root) if p.is_absolute() else p
+            violations.append(
+                f"{rel}: remote script does not write provenance.json. "
+                f"Per feedback_canonical_remote_bootstraps: every remote "
+                f"run must emit provenance + heartbeat + run_record."
+            )
+    if verbose:
+        if violations:
+            print(f"  [provenance] {len(violations)} remote script(s) missing provenance:")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [provenance] OK: {n_scanned} remote script(s) scanned")
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE SCRIPTS WITHOUT PROVENANCE.JSON:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check M0: train_renderer KL auxiliaries require explicit scope ─────────
+
+
+def check_train_renderer_kl_aux_explicit_scope(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Prevent KL-like renderer auxiliaries from activating by weight alone.
+
+    Historical KL lanes were confounded by ambiguous primary-vs-auxiliary
+    semantics and stale weights. `train_renderer.py` may only use scoped
+    SegNet auxiliary KL/JBL, every positive `kl_distill_weight` profile
+    must declare `kl_distill_scope="segnet_aux"`, and legacy high-weight
+    KL profiles must be explicitly non-promotable.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    try:
+        from tac.profiles import PROFILES
+    except Exception as exc:  # pragma: no cover - import failure is fatal below
+        violations.append(f"could not import tac.profiles.PROFILES: {exc}")
+        PROFILES = {}
+
+    for name, profile in sorted(PROFILES.items()):
+        weight = profile.get("kl_distill_weight")
+        scope = profile.get("kl_distill_scope", "none")
+        if scope == "primary_scorer":
+            violations.append(
+                f"profiles[{name!r}]: train_renderer profile declares "
+                "kl_distill_scope='primary_scorer', which is forensic-only "
+                "and blocked from renderer training."
+            )
+        if isinstance(weight, (int, float)) and weight > 0 and scope != "segnet_aux":
+            violations.append(
+                f"profiles[{name!r}]: kl_distill_weight={weight} but "
+                f"kl_distill_scope={scope!r}; positive renderer KL-like "
+                "auxiliary weights require explicit scope 'segnet_aux'."
+            )
+        if (
+            isinstance(weight, (int, float))
+            and weight >= 0.1
+            and profile.get("promotion_eligible") is not False
+        ):
+            violations.append(
+                f"profiles[{name!r}]: kl_distill_weight={weight} is a "
+                "high-scale KL configuration but promotion_eligible is not "
+                "False. Legacy high-weight KL is forensic-only until retuned "
+                "with loss-ratio evidence and exact CUDA component gates."
+            )
+
+    train_renderer = root / "src/tac/experiments/train_renderer.py"
+    text = _read_text_if_possible(train_renderer)
+    required_tokens = {
+        "--kl-distill-scope": "CLI exposes the explicit KL scope",
+        "positive kl_distill_weight requires explicit": "positive weight fail-closed guard",
+        "train_renderer never permits primary/full-scorer KL": "primary KL hard block",
+        'args.kl_distill_scope == "segnet_aux"': "loss block checks explicit scope",
+        "--allow-high-kl-weight-forensic": "high-weight KL requires forensic opt-in",
+        "kl_distill_weight >= 0.1": "direct high-weight KL is fail-closed",
+    }
+    for token, reason in required_tokens.items():
+        if token not in text:
+            violations.append(f"{train_renderer.relative_to(root)}: missing {token!r} ({reason}).")
+
+    if verbose:
+        if violations:
+            print(f"  [train-renderer-kl-scope] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [train-renderer-kl-scope] OK: renderer KL auxiliaries are explicit-scope")
+    if violations and strict:
+        raise PreflightError(
+            "TRAIN_RENDERER KL AUXILIARY SCOPE violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nRenderer KL-like auxiliaries must not activate from "
+            "kl_distill_weight alone. Use kl_distill_scope='segnet_aux' and "
+            "mark high-weight KL as non-promotable until exact CUDA archive "
+            "eval/component gates and scale review exist before any claim."
+        )
+    return violations
+
+
+# ── Check M0b: every KL/JBL profile normalizes through policy schema ──────
+
+
+def check_distillation_policy_schema_clean(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+    profiles: Mapping[str, Mapping[str, object]] | None = None,
+) -> list[str]:
+    """Validate KL/JBL/distillation configs through the frozen policy schema."""
+
+    violations: list[str] = []
+    if profiles is None:
+        try:
+            from tac.profiles import PROFILES
+        except Exception as exc:  # pragma: no cover - import failure is fatal below
+            violations.append(f"could not import tac.profiles.PROFILES: {exc}")
+            PROFILES = {}
+        profiles = PROFILES
+
+    try:
+        from tac.kl_config import DistillationPolicyError, normalize_distillation_policy
+    except Exception as exc:  # pragma: no cover - import failure is fatal below
+        violations.append(f"could not import tac.kl_config policy schema: {exc}")
+        normalize_distillation_policy = None  # type: ignore[assignment]
+        DistillationPolicyError = Exception  # type: ignore[assignment]
+
+    if normalize_distillation_policy is not None:
+        for name, profile in sorted(profiles.items()):
+            if not isinstance(profile, Mapping):
+                violations.append(f"profiles[{name!r}] is not a mapping")
+                continue
+            try:
+                policy = normalize_distillation_policy(profile)
+            except DistillationPolicyError as exc:
+                violations.append(f"profiles[{name!r}] distillation policy invalid: {exc}")
+                continue
+
+            weight = profile.get("kl_distill_weight", profile.get("weight", 0.0))
+            try:
+                weight_value = float(weight or 0.0)
+            except (TypeError, ValueError):
+                violations.append(f"profiles[{name!r}] has nonnumeric kl_distill_weight={weight!r}")
+                continue
+            scope = profile.get("kl_distill_scope", profile.get("scope", "none"))
+            if weight_value > 0.0 and scope == "segnet_aux" and policy.family == "none":
+                violations.append(
+                    f"profiles[{name!r}] has active kl_distill_weight={weight_value} "
+                    "but normalized to family='none'"
+                )
+            if policy.family in {"primary_scorer_kl", "segnet_kl_legacy", "jbl"}:
+                provenance = policy.to_provenance()
+                if provenance.get("promotion_eligible") is not False:
+                    violations.append(
+                        f"profiles[{name!r}] family={policy.family!r} is forensic-only "
+                        "but promotion_eligible is not False"
+                    )
+                if not provenance.get("forensic_reason"):
+                    violations.append(
+                        f"profiles[{name!r}] family={policy.family!r} is forensic-only "
+                        "but forensic_reason is missing"
+                    )
+
+    if verbose:
+        if violations:
+            print(f"  [distillation-policy-schema] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [distillation-policy-schema] OK: KL/JBL profiles normalize through policy schema")
+    if violations and strict:
+        raise PreflightError(
+            "DISTILLATION POLICY SCHEMA violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nEvery KL/JBL/distillation lane must serialize a "
+            "distillation_policy_v1-compatible policy before training, "
+            "dispatch, adjudication, or promotion."
+        )
+    return violations
+
+
+# ── Check M: F.kl_div(reduction="batchmean") on spatial tensors ────────────
+#
+# Bug class (2026-04-27 council forensics, findings.md "Lane G — really
+# dead, or bugged?"): `F.kl_div(..., reduction="batchmean")` divides only
+# by the batch dim. On a (B, C, H, W) segmentation logit tensor that
+# under-divides the canonical per-pixel mean by H × W (= 196,608 for
+# 384 × 512 SegNet). The same surface API silently fits two completely
+# different objectives depending on tensor shape — exactly the silent-
+# default class CLAUDE.md FORBIDDEN PATTERNS warns against.
+#
+# Live failure: every caller of `kl_distill_segnet_only` passing
+# `kl_distill_weight=1.0` (DEN/SHIRAZ/WILDE/Lane-D training profiles,
+# Lane G pose TTO v1/v2) ran with a ~5000× over-weighted KL term.
+#
+# Defense: forbid `reduction="batchmean"` outright in the scanned dirs,
+# require a `# KL_BATCHMEAN_OK:<reason>` waiver marker on the call line
+# justifying that the input is provably a flat (B, num_classes) classifier
+# tensor (the only shape for which `batchmean` matches the user's intent).
+# Mirrors the existing `# KL_RAW_PAIRS_OK:<reason>` waiver pattern from
+# Check B above.
+
+
+def _scan_python_for_kl_div_batchmean(path: Path, repo_root: Path) -> list[str]:
+    """Detect any `F.kl_div(..., reduction="batchmean")` call without a
+    same-line `# KL_BATCHMEAN_OK:<reason>` waiver marker.
+
+    Heuristic: matches calls whose function reference ends in `kl_div`
+    (covers `F.kl_div`, `torch.nn.functional.kl_div`, and bare
+    `kl_div` after `from torch.nn.functional import kl_div`). Only the
+    exact `reduction="batchmean"` keyword form is flagged — positional
+    `reduction` is rare in this API but still caught when the value is
+    a string constant `"batchmean"`.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+    lines = text.splitlines()
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        try:
+            func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        except Exception:
+            func_str = ""
+        # Match `F.kl_div`, `torch.nn.functional.kl_div`, bare `kl_div`.
+        if not (func_str == "kl_div" or func_str.endswith(".kl_div")):
+            continue
+        # Look for reduction=... keyword.
+        is_batchmean = False
+        for kw in node.keywords:
+            if kw.arg == "reduction" and isinstance(kw.value, ast.Constant) \
+                    and kw.value.value == "batchmean":
+                is_batchmean = True
+                break
+        # Positional fallback: kl_div(input, target, size_average, reduce, reduction)
+        # The 5th positional (index 4) is `reduction`. We only flag if it is a
+        # string literal "batchmean"; anything else (variable, missing) is fine.
+        if not is_batchmean and len(node.args) >= 5:
+            arg5 = node.args[4]
+            if isinstance(arg5, ast.Constant) and arg5.value == "batchmean":
+                is_batchmean = True
+        if not is_batchmean:
+            continue
+        # Same-line waiver opt-out.
+        ln = node.lineno
+        if 0 < ln <= len(lines):
+            comment_idx = lines[ln - 1].find("#")
+            if comment_idx >= 0 and "KL_BATCHMEAN_OK" in lines[ln - 1][comment_idx:]:
+                continue
+        violations.append(
+            f"{rel}:{node.lineno}: `F.kl_div(..., reduction=\"batchmean\")` "
+            f"detected. On a spatial (B, C, H, W) tensor this under-divides "
+            f"the canonical per-pixel mean by H × W (=196,608 for 384x512 "
+            f"SegNet — see findings.md \"Lane G — really dead, or bugged?\"). "
+            f"Use `F.kl_div(..., reduction=\"none\").sum(dim=1).mean()` for "
+            f"per-pixel-per-class mean (canonical pattern: "
+            f"`kl_distill_scorer_loss` line 622+646). If the input is "
+            f"provably a flat (B, num_classes) classifier tensor and "
+            f"`batchmean` is intended, add `# KL_BATCHMEAN_OK:<reason>` "
+            f"on this line."
+        )
+    return violations
+
+
+def check_kl_div_reduction_correct(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid `F.kl_div(..., reduction="batchmean")` without explicit waiver.
+
+    See module-level Check M comment + findings.md
+    "## 2026-04-27 Council forensics: Lane G — really dead, or bugged?"
+    for the full math derivation. The scanner walks `src/tac/`,
+    `experiments/`, `submissions/`, and `scripts/` for offending calls
+    and requires a same-line `# KL_BATCHMEAN_OK:<reason>` marker as the
+    only opt-out (mirrors the `# KL_RAW_PAIRS_OK:<reason>` pattern in
+    Check B above).
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    scan_dirs = ["src/tac", "experiments", "scripts", "submissions"]
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in d_path.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            n_scanned += 1
+            violations.extend(_scan_python_for_kl_div_batchmean(p, root))
+
+    if verbose and violations:
+        print(f"  [no-kl-div-batchmean] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-kl-div-batchmean] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "F.kl_div(reduction=\"batchmean\") on spatial tensors:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nSee findings.md \"Lane G — really dead, or bugged?\" "
+            "for the math (1/H/W silent under-division). Use "
+            "`reduction=\"none\"` → `.sum(dim=1).mean()` (canonical pattern "
+            "in kl_distill_scorer_loss line 622+646), OR add a same-line "
+            "`# KL_BATCHMEAN_OK:<reason>` marker if the input is provably "
+            "a flat (B, num_classes) classifier tensor."
+        )
+    return violations
+
+
+# 2026-04-27 audit: the 12 checks listed in the previous TODO block are now
+# wired into preflight_all() at strict=True (see lines ~316-330 above), the
+# violation counts above ran clean. TODO removed; if a future check needs to
+# be deferred, add it directly to preflight_all() at strict=False with a
+# one-line note linking the audit that promotes it.
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check N (29th meta-bug): silent-default-masquerading-as-negative-result
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The bug class — a CLI flag is missing, the script auto-discovers from a list
+# of N hardcoded fallback paths, none exist, the script prints a `[WARN] ...`
+# line and proceeds with a silent default (None / zero / empty). The operator
+# sees the script "succeed" but the produced artifact was trained against the
+# wrong inputs. The result then enters the council deliberation as if it were
+# a real negative result, leading to "this lane is dead" misjudgments.
+#
+# Real-world incidents (2 in 2 days, 2026-04-27):
+#   • Lane G v1 — `kl_distill_weight` defaulted to 5e-6 with batchmean reduction;
+#     reported "KL distill killed PoseNet" when in fact the gradient was 5000x
+#     over-weighted. (See findings.md "Lane G — really dead, or bugged?")
+#   • Lane F v1 — `qat_finetune.py` had no `--poses` arg, auto-discovered from
+#     `experiments/results/gt_poses.pt` + `upstream/gt_poses.pt`, neither
+#     existed, printed `[WARN] ... will use zero poses` and proceeded. Renderer
+#     was QAT-trained against zero poses, deployed against real poses, +58%
+#     PoseNet regression reported as "FP4 quantization is dead." (See findings.md
+#     "Lane F regression — bugged or dead?")
+#
+# The structural fix: forbid the pattern `for x in [Path(...), Path(...)]:
+# if x.exists(): ... ; print("[WARN] ... not found"); return None` (or
+# equivalent). Either RAISE (preferred) or document the silent fallback with
+# an `# AUTO_DISCOVERY_OK:<reason>` waiver marker on the loop or warn line.
+#
+# Detection (combined AST + text):
+#   1. AST-find every `for ... in [<list of Path/str literals>]:` loop body
+#      that contains `if <var>.exists():` AND a `break` / `return` / assignment.
+#   2. Look in the *same containing function* for a subsequent print-or-log call
+#      whose string argument contains `[WARN]` (case-insensitive `WARN`).
+#   3. If the function does NOT raise / sys.exit after the warn, flag it.
+#   4. Same-line waiver `# AUTO_DISCOVERY_OK:<reason>` on either the for loop
+#      header OR the warn line opts out.
+
+
+_AUTO_DISCOVERY_WAIVER_TOKEN = "AUTO_DISCOVERY_OK"
+
+
+def _line_has_waiver(lines: list[str], lineno: int) -> bool:
+    """Return True if `lines[lineno-1]` has a `# AUTO_DISCOVERY_OK:` comment."""
+    if not (0 < lineno <= len(lines)):
+        return False
+    src_line = lines[lineno - 1]
+    comment_idx = src_line.find("#")
+    if comment_idx < 0:
+        return False
+    return _AUTO_DISCOVERY_WAIVER_TOKEN in src_line[comment_idx:]
+
+
+def _function_has_waiver(lines: list[str], fn_node: ast.AST) -> bool:
+    """Return True if any line in the function body has the waiver marker.
+
+    Permissive: a single waiver anywhere in the function exempts the function.
+    Lets callers waive a multi-line auto-discovery block without picking the
+    exact line."""
+    if not hasattr(fn_node, "lineno") or not hasattr(fn_node, "end_lineno"):
+        return False
+    start, end = fn_node.lineno, fn_node.end_lineno or fn_node.lineno
+    for ln in range(start, end + 1):
+        if _line_has_waiver(lines, ln):
+            return True
+    return False
+
+
+def _list_is_path_candidates(node: ast.AST) -> bool:
+    """Detect `[Path("..."), Path(...) / "...", Path(cfg.x) / "..."]` literal.
+
+    The list must contain >=2 elements that are either Path() calls, BinOp /
+    expressions involving Path, or string literals that look like file paths
+    (have a "/" or end with .pt/.bin/.json). Lenient on the exact form to
+    handle the patterns we've seen in the wild.
+    """
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return False
+    if len(node.elts) < 2:
+        return False
+    n_path_like = 0
+    for elt in node.elts:
+        # Path("...") or Path(...) / "..."
+        text = ""
+        try:
+            text = ast.unparse(elt) if hasattr(ast, "unparse") else ""
+        except Exception:
+            pass
+        if "Path(" in text:
+            n_path_like += 1
+            continue
+        # bare string with path-like marker
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            v = elt.value
+            if "/" in v or v.endswith((".pt", ".bin", ".json", ".mkv", ".pth", ".safetensors")):
+                n_path_like += 1
+    return n_path_like >= 2
+
+
+def _function_warns_then_proceeds(fn_node: ast.AST, lines: list[str]) -> tuple[bool, int]:
+    """Scan a function body for a `print/log("[WARN] ...")`-style call that is
+    NOT followed by `raise` / `sys.exit` / `SystemExit` in the same function.
+
+    Returns (has_silent_warn, warn_lineno). `has_silent_warn` is True when the
+    warn is unguarded. lineno=0 when no warn found.
+    """
+    warn_calls: list[tuple[int, ast.Call]] = []
+    raise_or_exit_after: dict[int, bool] = {}
+
+    # First pass: collect warn print/log calls.
+    for sub in ast.walk(fn_node):
+        if not isinstance(sub, ast.Call):
+            continue
+        # Only top-of-string literal argument check.
+        for a in sub.args:
+            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                # Case-insensitive: `[WARN]`, `WARNING`, `WARN:`.
+                up = a.value.upper()
+                if "[WARN]" in up or "WARNING:" in up or up.startswith("WARN "):
+                    # Filter by function name to avoid false positives like
+                    # `assert "[WARN]" in ...` (those are ast.Compare, not Call).
+                    func_text = ""
+                    try:
+                        func_text = ast.unparse(sub.func) if hasattr(ast, "unparse") else ""
+                    except Exception:
+                        pass
+                    # Match `print`, `*.print`, `log`, `*.log`, `_warn`,
+                    # `*.warn`, `*.warning`, `logger.warning`, etc.
+                    func_lower = func_text.lower()
+                    if any(tok in func_lower for tok in (
+                        "print", "log", "warn", "_warn", "echo",
+                    )):
+                        warn_calls.append((sub.lineno, sub))
+                        break
+
+    if not warn_calls:
+        return (False, 0)
+
+    # Second pass: for each warn, check if a `raise` / `sys.exit` / `SystemExit`
+    # appears in the function body AFTER the warn line.
+    for warn_ln, _ in warn_calls:
+        guarded = False
+        for sub in ast.walk(fn_node):
+            if isinstance(sub, ast.Raise) and sub.lineno > warn_ln:
+                guarded = True
+                break
+            if isinstance(sub, ast.Call):
+                func_text = ""
+                try:
+                    func_text = ast.unparse(sub.func) if hasattr(ast, "unparse") else ""
+                except Exception:
+                    pass
+                if sub.lineno > warn_ln and func_text in (
+                    "sys.exit", "exit", "SystemExit", "os._exit",
+                ):
+                    guarded = True
+                    break
+        raise_or_exit_after[warn_ln] = guarded
+
+    # Silent warn = warn that is NOT guarded.
+    for warn_ln, _ in warn_calls:
+        if not raise_or_exit_after.get(warn_ln, False):
+            return (True, warn_ln)
+    return (False, 0)
+
+
+def _scan_python_for_silent_auto_discovery(path: Path, repo_root: Path) -> list[str]:
+    """Detect the silent-default-masquerading-as-negative-result pattern.
+
+    Looks for functions containing BOTH:
+      (a) a `for x in [<list of >=2 Path-like literals>]:` loop body that
+          conditionally uses the candidate via `<x>.exists()`, AND
+      (b) somewhere later in the same function, an unguarded `print/log/warn`
+          call whose first string literal contains `[WARN]` / `WARNING:` /
+          `WARN ` (case-insensitive), with no following `raise` / `sys.exit`.
+
+    The opt-out marker is `# AUTO_DISCOVERY_OK:<reason>` placed anywhere in
+    the offending function (typically on the for-loop header or the warn line).
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    # Skip test files (they intentionally exercise the bug pattern).
+    if "tests" in rel.parts or rel.name.startswith("test_"):
+        return []
+    try:
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+    lines = text.splitlines()
+    violations: list[str] = []
+
+    for fn_node in ast.walk(tree):
+        if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if _function_has_waiver(lines, fn_node):
+            continue
+
+        # (a) Find a for-loop with Path-list iter + .exists() check in body.
+        has_path_list_loop = False
+        loop_lineno = 0
+        for sub in ast.walk(fn_node):
+            if not isinstance(sub, ast.For):
+                continue
+            if not _list_is_path_candidates(sub.iter):
+                continue
+            # Body must contain `<var>.exists()` Attribute call.
+            uses_exists = False
+            for body_sub in ast.walk(sub):
+                if isinstance(body_sub, ast.Call):
+                    func_text = ""
+                    try:
+                        func_text = ast.unparse(body_sub.func) if hasattr(ast, "unparse") else ""
+                    except Exception:
+                        pass
+                    if func_text.endswith(".exists"):
+                        uses_exists = True
+                        break
+            if uses_exists:
+                has_path_list_loop = True
+                loop_lineno = sub.lineno
+                break
+
+        if not has_path_list_loop:
+            continue
+
+        # (b) Function must contain an unguarded warn call.
+        has_silent_warn, warn_lineno = _function_warns_then_proceeds(fn_node, lines)
+        if not has_silent_warn:
+            continue
+
+        violations.append(
+            f"{rel}:{loop_lineno}: function `{fn_node.name}` uses Path-list "
+            f"auto-discovery (loop at line {loop_lineno}) followed by an unguarded "
+            f"`[WARN]` print at line {warn_lineno}, with no `raise`/`sys.exit` "
+            f"after it. This is the SILENT-DEFAULT-MASQUERADING bug class — "
+            f"the script proceeds with a wrong default that produces an invalid "
+            f"result without operator awareness. See findings.md "
+            f"\"Lane F regression — bugged or dead?\" (2026-04-27) and memory "
+            f"`feedback_silent_default_masquerading_as_negative_result`. Fix: "
+            f"raise SystemExit on missing input OR add a same-function "
+            f"`# AUTO_DISCOVERY_OK:<reason>` marker on the loop or warn line."
+        )
+
+    return violations
+
+
+def check_no_silent_auto_discovery_with_warn(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """29th meta-bug check: silent-default-masquerading-as-negative-result.
+
+    Catches functions that auto-discover from a list of hardcoded paths,
+    print a `[WARN]` line when none exist, and proceed without raising.
+    The operator sees the script "succeed" but the artifact was built with
+    the wrong inputs — leading to "this lane is dead" misjudgments.
+
+    Real-world incidents:
+      • Lane F v1 (qat_finetune.py): auto-discovered gt_poses.pt from 2 paths,
+        printed [WARN] ... will use zero poses, trained renderer with wrong
+        conditioning. Reported as "FP4 quantization is dead." (BUGGED.)
+      • Lane G v1 (kl_distill_weight defaulted with batchmean reduction):
+        same class — silent bad default reported as "KL distill is dead."
+
+    Reference: findings.md "Lane F regression — bugged or dead?" + memory
+    `feedback_silent_default_masquerading_as_negative_result`.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_python_for_silent_auto_discovery(py, root))
+
+    if verbose and violations:
+        print(f"  [no-silent-auto-discovery] {len(violations)} violation(s) across {n_scanned} files:")
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(f"  [no-silent-auto-discovery] OK: {n_scanned} files scanned")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SILENT-DEFAULT-MASQUERADING-AS-NEGATIVE-RESULT violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nThis is the 2-in-2-days bug class (Lane G + Lane F, "
+            "2026-04-27). The pattern is: missing CLI flag → auto-discover "
+            "from N hardcoded paths → none exist → print [WARN] → proceed "
+            "with silent default → operator sees the result land as a "
+            "negative outcome. Fix: replace the auto-discovery + warn with "
+            "an explicit `--<flag>` argument that RAISES on missing input. "
+            "Documented opt-out: same-function `# AUTO_DISCOVERY_OK:<reason>` "
+            "marker. See findings.md and memory "
+            "`feedback_silent_default_masquerading_as_negative_result`."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check N+1 (30th meta-bug): remote scripts must have executable bit
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-27: Lane GH script was committed without +x bit; the audit subagent
+# caught it via test_remote_lane_gh_script.py::test_script_is_executable.
+# This preflight check generalizes the protection.
+def check_remote_scripts_executable_bit(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Every scripts/remote_*.sh must have the executable bit set so
+    ``bash`` invocations + tmux dispatch work without requiring chmod first.
+    """
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [executable-bit] OK: scripts dir not found, skipped")
+        return violations
+    for script_path in sorted(scripts_dir.glob("remote_*.sh")):
+        st = script_path.stat()
+        if not (st.st_mode & 0o111):
+            violations.append(
+                f"{script_path}: not executable (mode {oct(st.st_mode)}). "
+                f"Run `chmod +x {script_path}` to fix. Required for bash + "
+                f"tmux dispatch."
+            )
+    if verbose:
+        n_scripts = len(list(scripts_dir.glob("remote_*.sh")))
+        if violations:
+            print(f"  [executable-bit] {len(violations)} violation(s) across {n_scripts} remote_*.sh")
+        else:
+            print(f"  [executable-bit] OK: {n_scripts} remote_*.sh script(s) all executable")
+    if strict and violations:
+        raise PreflightError(
+            "REMOTE SCRIPT EXECUTABLE BIT VIOLATIONS — at least one "
+            f"scripts/remote_*.sh lacks +x bit:\n  • " + "\n  • ".join(violations) +
+            "\nFix: chmod +x on each. Required so bash dispatch works "
+            "without manual chmod intervention. (Lane GH bug 2026-04-27.)"
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check N+2 (31st meta-bug): remote scripts must record predicted_band
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-27: every remote_*.sh script today documents predicted_band in
+# provenance JSON for empirical calibration of council intuition. Without
+# the metadata, post-hoc analysis can't answer "did this lane land within
+# the council's predicted range?" — losing crucial signal.
+def check_remote_scripts_record_predicted_band(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Every scripts/remote_*.sh that emits provenance.json AND runs a
+    LANE EXPERIMENT (not a bootstrap or sweep orchestrator) must include
+    a 'predicted_band' field for empirical calibration.
+    """
+    # Exempt: bootstraps (utility, no per-experiment band), sweep orchestrators
+    # (band depends on which trial wins), pure auth-eval reruns (diagnostic).
+    EXEMPT_SUFFIXES = (
+        "_bootstrap.sh", "_setup_full.sh", "_setup.sh",
+        "_sweep.sh", "_optimized.sh",  # Bayesian sweep machinery
+        "_auth_eval_only.sh",  # diagnostic rerun
+    )
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [predicted-band] OK: scripts dir not found, skipped")
+        return violations
+    n_scripts = 0
+    n_with_provenance = 0
+    for script_path in sorted(scripts_dir.glob("remote_*.sh")):
+        if any(script_path.name.endswith(suf) for suf in EXEMPT_SUFFIXES):
+            continue
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        if "provenance.json" not in text and "PROVENANCE" not in text:
+            continue  # script doesn't emit provenance, exempt
+        n_with_provenance += 1
+        if "predicted_band" not in text:
+            violations.append(
+                f"{script_path}: emits provenance.json but no "
+                f"'predicted_band' metadata. Add to the python json.dump "
+                f"block: `'predicted_band': [LOW, HIGH]`. Required for "
+                f"council prediction calibration."
+            )
+    if verbose:
+        if violations:
+            print(f"  [predicted-band] {len(violations)}/{n_with_provenance} provenance-emitting script(s) missing predicted_band")
+        else:
+            print(f"  [predicted-band] OK: {n_with_provenance}/{n_scripts} remote_*.sh script(s) record predicted_band")
+    if strict and violations:
+        raise PreflightError(
+            "PREDICTED BAND METADATA VIOLATIONS — at least one "
+            f"scripts/remote_*.sh emits provenance but lacks predicted_band:\n  • "
+            + "\n  • ".join(violations) +
+            "\nFix: add 'predicted_band': [LOW, HIGH] to each provenance JSON "
+            "for council calibration. (no-signal-loss CLAUDE.md rule.)"
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check N+3 (32nd meta-bug): remote scripts must tag completion [contest-CUDA]
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-27: per CLAUDE.md FORBIDDEN PATTERNS rule, every score must carry
+# a lane tag (contest-CUDA / advisory / MPS-PROXY). Remote script completion
+# logs are the canonical place for the tag. Currently checked only via
+# per-script test files — generalize via preflight.
+def check_remote_scripts_tag_contest_cuda_at_completion(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Every scripts/remote_*.sh that runs contest_auth_eval AND IS A
+    LANE EXPERIMENT (not a bootstrap or sweep orchestrator) must include
+    '[contest-CUDA]' literal in the completion log line so reports are
+    self-tagging per CLAUDE.md score-tag rule.
+    """
+    EXEMPT_SUFFIXES = (
+        "_bootstrap.sh", "_setup_full.sh", "_setup.sh",
+        "_sweep.sh", "_optimized.sh",
+        "_auth_eval_only.sh",
+    )
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [completion-tag] OK: scripts dir not found, skipped")
+        return violations
+    n_scripts = 0
+    n_with_eval = 0
+    for script_path in sorted(scripts_dir.glob("remote_*.sh")):
+        if any(script_path.name.endswith(suf) for suf in EXEMPT_SUFFIXES):
+            continue
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        if "contest_auth_eval" not in text:
+            continue
+        n_with_eval += 1
+        # Look for [contest-CUDA] tag literal anywhere in the script.
+        if "[contest-CUDA]" not in text:
+            violations.append(
+                f"{script_path}: invokes contest_auth_eval but completion "
+                f"log lacks '[contest-CUDA]' tag. Add the literal string "
+                f"to the LANE_X_DONE log line so produced scores are "
+                f"self-tagging per CLAUDE.md score-tag rule."
+            )
+    if verbose:
+        if violations:
+            print(f"  [completion-tag] {len(violations)}/{n_with_eval} eval script(s) missing [contest-CUDA] tag")
+        else:
+            print(f"  [completion-tag] OK: {n_with_eval}/{n_scripts} remote_*.sh script(s) tag completion")
+    if strict and violations:
+        raise PreflightError(
+            "COMPLETION TAG VIOLATIONS — at least one scripts/remote_*.sh "
+            f"runs contest_auth_eval but lacks '[contest-CUDA]' tag:\n  • "
+            + "\n  • ".join(violations) +
+            "\nFix: add '[contest-CUDA]' literal to the completion log line "
+            "(LANE_X_DONE marker) so scores are self-tagging."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 33 (33rd meta-bug): remote scripts must NVDEC-probe at Stage 0
+#                          BEFORE any GPU-spend operations
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: 7/12 overnight Vast.ai instances had compute-CUDA but
+# missing NVDEC. The probe correctly catches this BUT only after Stage 4
+# of setup_full.sh, which has already done apt + pip + DALI install
+# (~5-10 min wasted). The probe MUST run at Stage 0 of every lane script
+# so failures cost <30 seconds, not >5 minutes.
+#
+# This check verifies that every lane script's `bash $WORKSPACE/scripts/probe_nvdec.sh`
+# call appears EARLY (before pip install / archive build / training).
+def check_remote_scripts_probe_nvdec_early(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Every scripts/remote_lane_*.sh that does GPU work must call
+    `bash $WORKSPACE/scripts/probe_nvdec.sh` BEFORE Stage 1 (training,
+    archive build, mask extraction). NVDEC failures should cost <30s,
+    not >5 min of wasted bootstrap.
+    """
+    EXEMPT_SUFFIXES = (
+        "_bootstrap.sh", "_setup_full.sh", "_setup.sh",
+        "_sweep.sh", "_optimized.sh", "_auth_eval_only.sh",
+    )
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [nvdec-early] OK: scripts dir not found, skipped")
+        return violations
+    n_scripts = 0
+    n_with_probe = 0
+    n_opted_out = 0
+    for script_path in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        if any(script_path.name.endswith(suf) for suf in EXEMPT_SUFFIXES):
+            continue
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        # Honor NO_NVDEC_NEEDED opt-out marker in first 30 lines (parity with
+        # _load_lane_script at line ~5831). Lanes operating on already-decoded
+        # tensors / archives don't need an NVDEC probe — the marker is the
+        # operator's affirmative declaration of that.
+        header = "\n".join(text.split("\n")[:30])
+        if _NVDEC_OPT_OUT_TOKEN in header:
+            n_opted_out += 1
+            continue
+        # Strip comment-only lines so header docstrings don't false-positive
+        # the GPU-marker scan. Use line-based filtering: lines starting with #.
+        non_comment_lines = []
+        char_offset = 0
+        non_comment_text_chars = []
+        for line in text.split("\n"):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                # replace comment with same-length spaces to preserve indices
+                non_comment_text_chars.append(" " * len(line))
+            else:
+                non_comment_text_chars.append(line)
+        scan_text = "\n".join(non_comment_text_chars)
+        # Find first probe_nvdec.sh call line and any GPU-cost line
+        probe_idx = scan_text.find("probe_nvdec.sh")
+        # GPU-cost markers: training launch, archive rebuild, mask extract
+        # Match with $PYBIN/$PYTHON prefix or `python` to ensure it's an
+        # executable invocation, not a doc reference.
+        gpu_markers = [
+            "experiments/train_renderer", "experiments/qat_finetune",
+            "experiments/optimize_poses", "experiments/build_baseline_archive",
+            "experiments/contest_auth_eval",
+        ]
+        first_gpu_idx = min(
+            (scan_text.find(m) for m in gpu_markers if scan_text.find(m) >= 0),
+            default=-1,
+        )
+        if probe_idx < 0:
+            violations.append(
+                f"{script_path}: no `probe_nvdec.sh` call. Add Stage 0 "
+                f"NVDEC probe before any GPU-cost operation."
+            )
+            continue
+        n_with_probe += 1
+        if first_gpu_idx >= 0 and first_gpu_idx < probe_idx:
+            violations.append(
+                f"{script_path}: probe_nvdec.sh appears AFTER GPU-cost "
+                f"command (probe@{probe_idx}, first GPU op@{first_gpu_idx}). "
+                f"Move probe to Stage 0 BEFORE any GPU spend."
+            )
+    if verbose:
+        if violations:
+            print(f"  [nvdec-early] {len(violations)}/{n_scripts} script(s) violate early-probe rule")
+        else:
+            print(f"  [nvdec-early] OK: {n_with_probe}/{n_scripts} lane script(s) probe NVDEC at Stage 0")
+    if strict and violations:
+        raise PreflightError(
+            "EARLY NVDEC PROBE VIOLATIONS — at least one lane script "
+            f"doesn't probe NVDEC at Stage 0:\n  • " + "\n  • ".join(violations) +
+            "\nFix: add `bash $WORKSPACE/scripts/probe_nvdec.sh || exit 2` "
+            "BEFORE any train/qat/eval/archive command. Per memory "
+            "feedback_vastai_nvdec_host_variation, NVDEC failure rate is "
+            "~30-50% across host pools; early-probe saves $0.05-0.10 per bad host."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 34 (34th meta-bug): remote scripts that --resume-from a checkpoint
+#                          must STATE_DICT-shape-validate the checkpoint
+#                          against the profile-built model BEFORE GPU spend
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: Lane S overnight dispatch crashed at training launch with
+# motion.head shape mismatch (Lane A renderer has 6-channel motion.head,
+# Lane S profile builds 4-channel). The resume failed AFTER 5+ minutes
+# of mask extraction + scorer cache build (~$0.05 wasted).
+#
+# This check looks for `--resume-from <path>` in lane scripts and ensures
+# either:
+#   (a) the script does a pre-flight shape validation BEFORE training launch
+#       (e.g., `python -c "torch.load(...); model.load_state_dict(...)"`)
+#   (b) the script uses the canonical resume-and-validate helper
+#       `experiments/validate_resume_shapes.py` (TODO if doesn't exist)
+def check_resume_from_state_dict_shape_compat(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Every lane script using `--resume-from <ckpt>` must shape-validate
+    the checkpoint against the profile-built model BEFORE the heavy
+    bootstrap (mask extraction, scorer cache).
+    """
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [resume-shape] OK: scripts dir not found, skipped")
+        return violations
+    n_scripts = 0
+    n_with_resume = 0
+    for script_path in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        text = script_path.read_text(errors="ignore")
+        n_scripts += 1
+        if "--resume-from" not in text:
+            continue
+        n_with_resume += 1
+        # Look for any shape-validation marker:
+        # - "load_state_dict" (inline pyc verification)
+        # - "validate_resume_shapes" (canonical tool)
+        # - "shape" + "validate" within 200 chars of --resume-from
+        validation_markers = [
+            "load_state_dict",
+            "validate_resume_shapes",
+            "validate_shape",
+            "shape_compat",
+            "_shape_check",
+        ]
+        has_validation = any(m in text for m in validation_markers)
+        if not has_validation:
+            violations.append(
+                f"{script_path}: --resume-from present but no state_dict "
+                f"shape validation. Add a pre-flight `python -c 'import torch; "
+                f"torch.load(\"$RESUME_PATH\")'` + model.load_state_dict() "
+                f"check BEFORE the heavy training launch. Lane S motion.head "
+                f"6-vs-4 mismatch wasted ~$0.05 + 5 min when this was missing."
+            )
+    if verbose:
+        if violations:
+            print(f"  [resume-shape] {len(violations)}/{n_with_resume} resume-using script(s) lack shape validation")
+        else:
+            print(f"  [resume-shape] OK: {n_with_resume}/{n_scripts} lane script(s) shape-validate resumes")
+    if strict and violations:
+        raise PreflightError(
+            "RESUME STATE_DICT SHAPE VALIDATION VIOLATIONS — at least one "
+            f"lane script uses --resume-from but doesn't shape-validate:\n  • "
+            + "\n  • ".join(violations) +
+            "\nFix: add a pre-flight shape check before training launch. "
+            "Lane S motion.head bug 2026-04-28."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 35 (35th meta-bug): scripts must NOT call `tmux kill-server`
+#                          (kills OTHER lanes' tmux sessions on shared host)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: I caught myself writing `tmux kill-server` in a quick_setup
+# inline command — it would have killed any other lane's tmux session
+# running on a shared Vast.ai instance. The canonical safe alternative
+# is `tmux kill-session -t <session_name>` for the specific session, or
+# just rely on `tmux new-session -d` to NOT clobber existing.
+def check_no_tmux_kill_server_in_lane_scripts(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Scripts must NOT call ``tmux kill-server`` — kills ALL tmux
+    sessions on the host, not just the lane's. Use
+    ``tmux kill-session -t <name>`` instead, or rely on the absence
+    of a same-named session.
+    """
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    n_scripts = 0
+    for script_path in sorted(scripts_dir.glob("remote_*.sh")):
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        non_comment_text = "\n".join(
+            line if not line.lstrip().startswith("#") else " " * len(line)
+            for line in text.split("\n")
+        )
+        if "tmux kill-server" in non_comment_text:
+            violations.append(
+                f"{script_path}: calls 'tmux kill-server' which kills ALL "
+                f"tmux sessions on the host. Use 'tmux kill-session -t <name>' "
+                f"for specific session, or rely on tmux new-session's existing-"
+                f"session detection."
+            )
+    if verbose:
+        if violations:
+            print(f"  [no-tmux-kill-server] {len(violations)}/{n_scripts} script(s) violate")
+        else:
+            print(f"  [no-tmux-kill-server] OK: {n_scripts} script(s) clean")
+    if strict and violations:
+        raise PreflightError(
+            "TMUX KILL-SERVER VIOLATIONS — at least one remote script "
+            f"calls 'tmux kill-server':\n  • " + "\n  • ".join(violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 36 (36th meta-bug): scripts must NOT unconditionally call
+#                          `python -m ensurepip --upgrade`
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: setup_full Stage 2 hit `subprocess.CalledProcessError` because
+# the PyTorch container ships pip 26.x but ensurepip carries pip 24.0 wheels
+# — ensurepip refuses to "upgrade" to an older version. The canonical fix
+# is to skip ensurepip if pip is already importable.
+def check_no_unconditional_ensurepip(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Scripts must guard ensurepip --upgrade with an `if ! python -c
+    "import pip"` check, or skip ensurepip entirely on PyTorch containers
+    that ship newer pip than the bundled wheels.
+    """
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    n_scripts = 0
+    for script_path in sorted(scripts_dir.glob("remote_*.sh")):
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        non_comment_text = "\n".join(
+            line if not line.lstrip().startswith("#") else " " * len(line)
+            for line in text.split("\n")
+        )
+        if "ensurepip" not in non_comment_text:
+            continue
+        # Find the line(s) containing ensurepip and check if guarded.
+        # Look for `if ! ... pip` or `import pip` within 5 lines BEFORE.
+        lines = non_comment_text.split("\n")
+        for i, line in enumerate(lines):
+            if "ensurepip" in line and "--upgrade" in line:
+                window = "\n".join(lines[max(0, i-5):i+1])
+                if "import pip" not in window and "if !" not in window:
+                    violations.append(
+                        f"{script_path}:{i+1}: unconditional 'ensurepip "
+                        f"--upgrade'. Wrap with `if ! \"$PYBIN\" -c \"import "
+                        f"pip\" 2>/dev/null; then ensurepip; fi`. The "
+                        f"PyTorch container ships pip 26.x; bundled "
+                        f"wheels (pip 24.0) trigger downgrade-refusal crash."
+                    )
+    if verbose:
+        if violations:
+            print(f"  [no-uncond-ensurepip] {len(violations)}/{n_scripts} script(s) violate")
+        else:
+            print(f"  [no-uncond-ensurepip] OK: {n_scripts} script(s) clean")
+    if strict and violations:
+        raise PreflightError(
+            "UNCONDITIONAL ENSUREPIP VIOLATIONS — at least one script "
+            f"calls ensurepip --upgrade without a pip-check guard:\n  • "
+            + "\n  • ".join(violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 37 (37th meta-bug): lane scripts that contest_auth_eval must
+#                          first remove macOS AppleDouble resource forks
+#                          (`._*.mkv`) from upstream/videos to prevent
+#                          contest-CUDA "extra-file contamination" failure.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-27: Lane F-V2 auth eval CRASHED at completion because the SCP'd
+# tarball brought macOS `._0.mkv` AppleDouble files alongside `0.mkv`.
+# `experiments/contest_auth_eval.py::_validate_uncompressed_dir` raises
+# "uncompressed-dir contamination" with exit non-zero. Lost ~30s of GPU
+# spend per occurrence + cognitive load to debug.
+def check_lane_scripts_strip_macos_resource_forks(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Lane scripts running contest_auth_eval must ensure macOS AppleDouble
+    files are purged from upstream/videos. Two valid patterns:
+    (a) lane script does its own `rm -f upstream/videos/._*.mkv` before eval
+    (b) setup_full.sh purges them once at bootstrap (and lane script depends
+        on setup_full having been run via canonical bootstrap)
+    """
+    EXEMPT_SUFFIXES = (
+        "_bootstrap.sh", "_setup_full.sh", "_setup.sh",
+        "_sweep.sh", "_optimized.sh", "_auth_eval_only.sh",
+    )
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    # Check if setup_full.sh has the canonical purge — if so, lane scripts
+    # that follow the canonical bootstrap path are exempt.
+    setup_full = scripts_dir / "remote_setup_full.sh"
+    setup_full_purges = False
+    if setup_full.exists():
+        setup_text = setup_full.read_text(errors="ignore")
+        setup_full_purges = (
+            "find" in setup_text and "upstream/videos" in setup_text
+            and "'._*'" in setup_text
+        ) or "rm -f upstream/videos/._" in setup_text
+    n_scripts = 0
+    n_with_eval = 0
+    for script_path in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        if any(script_path.name.endswith(suf) for suf in EXEMPT_SUFFIXES):
+            continue
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        if "contest_auth_eval" not in text:
+            continue
+        n_with_eval += 1
+        # Look for `rm -f` of `._*.mkv` or equivalent before contest_auth_eval
+        # OR a `find ... -name '._*'` cleanup. Permissive — accept any of:
+        # - `rm -f upstream/videos/._*.mkv`
+        # - `rm -f upstream/videos/._*`
+        # - `find upstream/videos -name '._*' -delete`
+        cleanup_markers = [
+            "rm -f upstream/videos/._",
+            "rm -f \"upstream/videos/._",
+            "find upstream/videos -name '._",
+            "find upstream/videos -name \"._",
+            "find upstream/videos -type f -name '._",
+        ]
+        # If setup_full purges, AND this script sources env.sh / runs after
+        # setup_full, accept that as satisfying the rule.
+        depends_on_setup_full = "source" in text and "env.sh" in text
+        if setup_full_purges and depends_on_setup_full:
+            continue
+        if not any(m in text for m in cleanup_markers):
+            violations.append(
+                f"{script_path}: invokes contest_auth_eval but doesn't strip "
+                f"macOS AppleDouble files (._*.mkv) from upstream/videos. "
+                f"Add `rm -f upstream/videos/._*.mkv` BEFORE the eval call to "
+                f"prevent contamination-error crashes (Lane F-V2 bug 2026-04-27)."
+            )
+    if verbose:
+        if violations:
+            print(f"  [strip-resource-forks] {len(violations)}/{n_with_eval} eval script(s) lack ._* cleanup")
+        else:
+            print(f"  [strip-resource-forks] OK: {n_with_eval}/{n_scripts} script(s) strip macOS resource forks")
+    if strict and violations:
+        raise PreflightError(
+            "macOS RESOURCE FORK CLEANUP VIOLATIONS — at least one lane "
+            f"script invokes contest_auth_eval without ._* cleanup:\n  • "
+            + "\n  • ".join(violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 38 (38th meta-bug): SSH commands in shell scripts must specify
+#                          ConnectTimeout to prevent infinite hangs.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-27/28: SSH commands without ConnectTimeout can hang for 60+
+# seconds when the host is briefly unreachable. In overnight wave loops,
+# this stalls the parent agent + accumulates dead connections. Standard
+# is `-o ConnectTimeout=10`.
+def check_ssh_commands_have_connect_timeout(strict: bool = False, verbose: bool = False) -> list[str]:
+    """Bash scripts using `ssh -o` for remote execution must specify
+    `ConnectTimeout=N` to prevent indefinite hangs on bad hosts.
+    """
+    violations: list[str] = []
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    n_scripts = 0
+    n_with_ssh = 0
+    for script_path in sorted(scripts_dir.glob("*.sh")):
+        n_scripts += 1
+        text = script_path.read_text(errors="ignore")
+        non_comment_text = "\n".join(
+            line if not line.lstrip().startswith("#") else " " * len(line)
+            for line in text.split("\n")
+        )
+        # Look for `ssh ` invocations (remote execution) — but not in
+        # `ssh-keygen`, `ssh-add`, etc.
+        # Scan line by line for executable ssh calls
+        lines = non_comment_text.split("\n")
+        has_ssh_call = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Match `ssh ` (with space) but not `sshd`, `ssh-keygen`, `ssh-add`,
+            # or `ssh://`. Also accept `ssh\` (continuation).
+            if "ssh " in line or stripped.endswith("ssh"):
+                # Filter out common non-execution forms
+                if any(m in line for m in ("ssh://", "sshd", "ssh-keygen", "ssh-add", "ssh-copy-id", "$SSH_", '"ssh"', "'ssh'")):
+                    continue
+                # Must be an ssh that includes flags or remote target
+                if "@" not in line and "-p " not in line and "-o " not in line:
+                    continue  # not a remote-exec form
+                has_ssh_call = True
+                if "ConnectTimeout" not in line:
+                    # Check next 3 lines (for line continuations via \)
+                    window = "\n".join(lines[i:min(i+3, len(lines))])
+                    if "ConnectTimeout" not in window:
+                        violations.append(
+                            f"{script_path}:{i+1}: SSH command without "
+                            f"`ConnectTimeout=N`. Add `-o ConnectTimeout=10` "
+                            f"to prevent indefinite hangs on bad hosts."
+                        )
+        if has_ssh_call:
+            n_with_ssh += 1
+    if verbose:
+        if violations:
+            print(f"  [ssh-timeout] {len(violations)}/{n_with_ssh} ssh-using script(s) violate")
+        else:
+            print(f"  [ssh-timeout] OK: {n_with_ssh}/{n_scripts} script(s) use SSH timeouts")
+    if strict and violations:
+        raise PreflightError(
+            "SSH CONNECT TIMEOUT VIOLATIONS — at least one script uses "
+            f"`ssh` without ConnectTimeout:\n  • " + "\n  • ".join(violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 39 (2026-04-28): undeployed archive-artifact producers
+#
+# CATCHES the recurring "code-shipped-never-deployed" failure mode. Pattern:
+# a tool exists at experiments/precompute_*.py or src/tac/*.py that writes a
+# filename listed in submission_archive.py's artifact registry; it has a
+# __main__ entry; it has tests; but no scripts/remote_lane_*.sh ever invokes
+# it. Such a tool is dead code from the lab's perspective — burned engineering
+# hours that never reach a Vast.ai score measurement.
+#
+# Concrete instances this would have caught:
+#   - Lane EC engineered corrections — sat unused 2 weeks (Apr 14 → Apr 28).
+#     33KB precompute_gradient_corrections.py + 60KB trick_stack.py
+#     composition + 444-line test, all shipping `gradient_corrections.bin`,
+#     never deployed until hand-flagged this session.
+#   - Per project_outstanding_work_and_stacks_20260428: Lane Ω-V2, SI-V2,
+#     LR-V2, LM-V2, MOS — same pattern, varying severity.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Artifact filenames recognized as "submission archive output". Mirrored from
+# submission_archive.py's required_files() mapping; if that registry changes,
+# update both places. (A future hardening: parse the AST at runtime.)
+_ARCHIVE_ARTIFACT_FILENAMES = frozenset({
+    "renderer.bin",
+    "masks.mkv",
+    "masks.amrc",
+    "optimized_poses.pt",
+    "optimized_poses.bin",
+    "optimized_embedding.pt",
+    "poses.pt",
+    "corrections.bin",
+    "gradient_corrections.bin",
+    "mini_segnet.bin",
+    "mini_posenet.bin",
+    "posenet_targets.bin",
+    "zoom_scalars.bin",
+    "foveation_params.bin",
+})
+
+# Producers we exempt from the "must be deployed" rule. These are either the
+# registry itself, library helpers consumed inline by already-deployed
+# pipelines, canonical entry points referenced through indirection
+# (subprocess via deploy_vastai.py, pipeline.py, etc.) that grep wouldn't
+# catch, or historically-dead lanes preserved for archeology. EVERY
+# EXEMPTION needs a one-line WHY comment.
+_DEPLOY_SCANNER_EXEMPT_PRODUCERS = frozenset({
+    # Planning tool — CPU-only, deterministic, writes score_claim=false atom plans
+    # for charged mask grammar work; not a deployable archive producer
+    "experiments/plan_charged_mask_grammar_atoms.py",
+    # Registry itself — it's the source of truth, not a producer
+    "src/tac/submission_archive.py",
+    # Renderer export is invoked from training scripts, never standalone
+    "src/tac/renderer_export.py",
+    # Pose TTO is invoked through pipeline.py compress + remote_pose_tto_bootstrap.sh
+    "src/tac/optimize_poses.py",
+    "experiments/optimize_poses.py",
+    # Mask codec is invoked from compress.sh + canonical archive builders
+    "src/tac/mask_codec.py",
+    "src/tac/mask_entropy_coder.py",
+    # AMRC lossless mask codec — invoked from compress.sh
+    "src/tac/lossless/argmax_codec.py",
+    # Pipeline is itself the orchestrator
+    "experiments/pipeline.py",
+    # Mini scorer training is the deployed lane's entry point itself
+    "experiments/train_mini_scorer.py",
+    # Library used by precompute_corrections.py, domain_solvers.py,
+    # trick_stack.py — not a standalone tool
+    "src/tac/scorer_targets.py",
+    # ARCHEOLOGY: mini-scorer inflate path — strict-scorer-rule (CLAUDE.md)
+    # forbids scorers at inflate time; mini-scorer lane is dead by policy.
+    "experiments/mini_tto_inflate.py",
+    # ARCHEOLOGY: embedding-loss TTO produced auth 0.61 on 2026-04-15 but was
+    # superseded by pose TTO + KL distill collapse; preserved for reference.
+    "experiments/optimize_embedding.py",
+    # Canonical local E2E auth-eval smoke (Check 64). Mentions 'masks.amrc' in
+    # its archive whitelist string but is itself a LOCAL preflight tool, not
+    # a producer — it never writes the artifact, only validates archives that
+    # contain it. Invoked by operators before lane dispatch + by Check 64.
+    "experiments/canonical_local_auth_eval_smoke.py",
+})
+
+# Directory prefixes that run on alternative platforms (NOT Vast.ai), so
+# absence from scripts/remote_lane_*.sh is expected.
+_DEPLOY_SCANNER_EXEMPT_DIR_PREFIXES = (
+    # Kaggle kernels run via `kaggle kernels push`, not via remote_lane scripts
+    "experiments/kaggle_kernels/",
+)
+
+
+def _scan_repo_for_artifact_producers(
+    artifact_name: str, repo_root: Path,
+) -> list[Path]:
+    """Find .py files that LIKELY write `artifact_name` to disk.
+
+    Heuristic: file mentions the literal filename in source AND has at least
+    one of {open(...,"wb"), torch.save, .write_bytes, np.save, pickle.dump,
+    json.dump, zipfile.write*, brotli, gzip}. False positives (mentions in a
+    docstring/comment) are rare and harmless — the deploy check filters them
+    out by requiring __main__ + non-deployment.
+    """
+    producers: list[Path] = []
+    write_markers = (
+        "open(", "torch.save(", ".write_bytes(", "np.save(",
+        "pickle.dump(", "json.dump(", "zipfile.", "brotli.", "gzip.",
+        ".write(", "np.tofile(",
+    )
+    quoted_names = (f'"{artifact_name}"', f"'{artifact_name}'")
+    for py in _iter_python_files(repo_root, ["src/tac", "experiments"]):
+        # Skip tests + caches
+        rel = py.relative_to(repo_root) if py.is_absolute() else py
+        rel_s = str(rel)
+        if "/tests/" in rel_s or "/__pycache__/" in rel_s:
+            continue
+        try:
+            text = py.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if not any(q in text for q in quoted_names):
+            continue
+        if not any(m in text for m in write_markers):
+            continue
+        producers.append(py)
+    return producers
+
+
+def _producer_has_main_entry(py: Path) -> bool:
+    """True if file is a script (has __main__) — i.e., not a pure library."""
+    try:
+        text = py.read_text(errors="ignore")
+    except (FileNotFoundError, PermissionError):
+        return False
+    return (
+        'if __name__ == "__main__"' in text
+        or "if __name__ == '__main__'" in text
+    )
+
+
+def _producer_is_deployed(
+    py: Path, artifact: str, repo_root: Path,
+) -> bool:
+    """True if any deployment surface references the producer or its output.
+
+    Three-signal OR across three deployment surfaces:
+      1. scripts/remote_lane_*.sh — Vast.ai lane scripts
+      2. scripts/remote_*_bootstrap.sh — canonical bootstraps (parameterized)
+      3. src/tac/deploy/**/*.py — Vast.ai/Modal/Kaggle deployment registries
+
+    For each surface we accept a match on producer's basename, producer's
+    full repo path, or the artifact filename itself (covers inline producers
+    like `python -c "..." > foo.bin`).
+    """
+    name = py.name
+    rel_s = str(py.relative_to(repo_root) if py.is_absolute() else py)
+
+    def _has_ref(t: str) -> bool:
+        return name in t or rel_s in t or artifact in t
+
+    scripts_dir = repo_root / "scripts"
+    if scripts_dir.is_dir():
+        for pattern in ("remote_lane_*.sh", "remote_*_bootstrap.sh"):
+            for sh in scripts_dir.glob(pattern):
+                try:
+                    if _has_ref(sh.read_text(errors="ignore")):
+                        return True
+                except (FileNotFoundError, PermissionError):
+                    continue
+
+    # Surface 3: deploy registries — train_joint_pair.py is invoked
+    # transparently through src/tac/deploy/vastai/experiments.py, etc.
+    deploy_dir = repo_root / "src" / "tac" / "deploy"
+    if deploy_dir.is_dir():
+        for dp in deploy_dir.rglob("*.py"):
+            try:
+                if _has_ref(dp.read_text(errors="ignore")):
+                    return True
+            except (FileNotFoundError, PermissionError):
+                continue
+    return False
+
+
+def check_undeployed_archive_artifact_producers(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch the 'code-shipped-never-deployed' bug class.
+
+    For every filename registered in submission_archive.py's artifact mapping,
+    find tools that produce it (write the filename to disk) and have a
+    __main__ entry. If none of those tools is referenced by any
+    scripts/remote_lane_*.sh (or remote_*_bootstrap.sh), we have a never-
+    deployed lane — engineering hours that never produce a measured score.
+
+    Reference: project_lane_ec_engineered_corrections_20260428 (sat 2 weeks
+    unused). Reference: project_outstanding_work_and_stacks_20260428 TIER 3.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    seen_producers: set[Path] = set()
+
+    for artifact in sorted(_ARCHIVE_ARTIFACT_FILENAMES):
+        for py in _scan_repo_for_artifact_producers(artifact, root):
+            if py in seen_producers:
+                continue
+            seen_producers.add(py)
+            rel_s = str(py.relative_to(root) if py.is_absolute() else py)
+            if rel_s in _DEPLOY_SCANNER_EXEMPT_PRODUCERS:
+                continue
+            if any(rel_s.startswith(p) for p in _DEPLOY_SCANNER_EXEMPT_DIR_PREFIXES):
+                continue  # alternative-platform producer (e.g., Kaggle)
+            if not _producer_has_main_entry(py):
+                continue  # pure library — OK
+            if _producer_is_deployed(py, artifact, root):
+                continue
+            violations.append(
+                f"{rel_s}: writes '{artifact}' via __main__ entry but no "
+                f"scripts/remote_lane_*.sh (or remote_*_bootstrap.sh) "
+                f"invokes it. This is the 'code-shipped-never-deployed' "
+                f"pattern (Lane EC sat unused 2 weeks). Either: (a) add a "
+                f"remote_lane_*.sh that runs it; (b) add the file path to "
+                f"_DEPLOY_SCANNER_EXEMPT_PRODUCERS in preflight.py with a "
+                f"WHY comment if the producer is library-only or invoked "
+                f"through indirection."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [undeployed-producers] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [undeployed-producers] OK: every artifact-producer __main__ has a remote_lane_*.sh invocation")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "UNDEPLOYED ARCHIVE-ARTIFACT PRODUCERS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 40 (2026-04-28): hardware-quantization capability disclosure
+#
+# CATCHES the bug class that destroyed Lane F lineage: emitting FP4 archives
+# / running FakeQuantFP4 in production code paths WITHOUT disclosing that
+# FP4 hardware acceleration requires Blackwell (CC 10.0) and our reference
+# 4090 hardware (CC 8.9) only supports SIMULATED FP4 via FakeQuantFP4.
+#
+# Memory ref: project_cosmos_deep_dive_addendum_20260428.
+# Lane F V1=2.73, V2=1.79, V3=1.85 all generated by FakeQuantFP4 simulation
+# with NO hardware backing. The "FP4 architecturally hostile" conclusion
+# was unverifiable — could be simulation noise, not architectural. FP8 IS
+# hardware-supported on 4090 via torchao.float8 (Lane F-V5 rescue path).
+# ════════════════════════════════════════════════════════════════════════════
+
+# Files that emit FP4 archives or use FakeQuantFP4 in production paths
+# (not tests, not docs). Either each must add a disclosure marker, or be
+# exempted here with a WHY comment.
+_FP4_DISCLOSURE_EXEMPT = frozenset({
+    # Library that defines the simulation primitive itself; the simulation
+    # IS the unit of the docstring there.
+    "src/tac/quantization.py",
+    # Library export of FP4A format; format definition not a runtime path.
+    "src/tac/renderer_export.py",
+})
+
+
+def _scan_for_fp4_production_paths(repo_root: Path) -> list[str]:
+    """Scan for FP4 production paths missing hardware-disclosure markers.
+
+    A "production path" is a non-test .py file under src/tac/ or experiments/
+    that ACTUALLY INSTANTIATES quantization (not just reads/validates the
+    archive format). Detection signals:
+      (a) constructor call `FakeQuantFP4(...)` (instantiation, not import), OR
+      (b) function call `fake_quant_fp4(...)` (lowercase apply form)
+    AND does NOT contain a hardware-disclosure marker:
+      - "[SIMULATED-FP4]" string literal
+      - "[ADVISORY-FP4]" string literal
+      - "compute_capability" reference (any form)
+      - "get_device_capability" reference
+      - "assert_quantization_hardware_supported" reference
+      - "# FP4_HARDWARE_DISCLOSED:" comment marker
+
+    Reading FP4A magic bytes (loaders/validators/registries) does NOT count
+    as a production path; the magic-byte check is a passive format detection
+    that doesn't make hardware-FP4 claims.
+    """
+    violations: list[str] = []
+    # Constructor-call patterns indicating actual quantization instantiation
+    # (regex-aware): `FakeQuantFP4(`, `FakeQuantFP4.apply(`, `fake_quant_fp4(`
+    instantiation_re = re.compile(
+        r"\b(?:FakeQuantFP4\s*\(|FakeQuantFP4\.apply\s*\(|fake_quant_fp4\s*\()"
+    )
+    disclosure_markers = (
+        "[SIMULATED-FP4]",
+        "[ADVISORY-FP4]",
+        "compute_capability",
+        "get_device_capability",
+        "assert_quantization_hardware_supported",
+        "# FP4_HARDWARE_DISCLOSED:",
+    )
+    for py in _iter_python_files(repo_root, ["src/tac", "experiments"]):
+        rel = py.relative_to(repo_root) if py.is_absolute() else py
+        rel_s = str(rel)
+        if "/tests/" in rel_s or "/__pycache__/" in rel_s:
+            continue
+        if rel_s in _FP4_DISCLOSURE_EXEMPT:
+            continue
+        try:
+            text = py.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if not instantiation_re.search(text):
+            continue
+        if any(m in text for m in disclosure_markers):
+            continue
+        violations.append(
+            f"{rel_s}: instantiates FakeQuantFP4 in a production path "
+            f"without a hardware-disclosure marker. FP4 hardware "
+            f"acceleration requires Blackwell (CC 10.0); 4090 (CC 8.9) "
+            f"only supports simulated FP4. Either: (a) add a runtime print "
+            f"'[SIMULATED-FP4] hardware capability < 10.0 — FP4 is "
+            f"simulated via FakeQuantFP4'; (b) add `# FP4_HARDWARE_DISCLOSED: "
+            f"<reason>` comment near the FakeQuantFP4 call; (c) call "
+            f"`assert_quantization_hardware_supported('fp4', device, "
+            f"allow_simulation=True)` from tac.quantization. Reference: "
+            f"project_cosmos_deep_dive_addendum_20260428."
+        )
+    return violations
+
+
+def check_fp4_production_paths_disclose_hardware(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch undeclared simulated-FP4 production paths.
+
+    Reference: project_cosmos_deep_dive_addendum_20260428 (4090 is CC 8.9,
+    NVFP4 needs CC 10.0; Lane F results were all simulated FakeQuantFP4
+    with no hardware backing).
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations = _scan_for_fp4_production_paths(root)
+
+    if verbose:
+        if violations:
+            print(f"  [fp4-hw-disclose] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [fp4-hw-disclose] OK: every FP4 production path discloses hardware reality")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "FP4 PRODUCTION PATHS MISSING HARDWARE DISCLOSURE:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 42 (2026-04-28): train/inference pose-projection parity (BUG-1 class)
+#
+# CATCHES the bug class found by Lane M-V2 audit (memory:
+# project_lane_m_v2_audit_council_findings_20260428): a pose-projection
+# helper used at OPTIMIZATION time but NOT at INFLATE time, so the optimizer
+# solves a different problem than what gets evaluated. The Lane M-V2 case:
+#
+#   optimize_poses.py: _project_to_renderer_pose(cond) → [zoom, 0,0,0,0,0]
+#   inflate_renderer: <not called>; uses raw saved tensor → [zoom, baseline]
+#
+# Optimizer was driving a model conditioned on zero-pad; inflate evaluated
+# with frozen-baseline-pad. The 0.076 PoseNet result was signal of the bug,
+# not of the architectural premise. ~$1.50 + 5h GPU wasted before audit.
+#
+# This check enforces: any pose-projection helper (regex
+# `_project.*pose|project_pose`) defined in experiments/ must EITHER be
+# called from submissions/robust_current/inflate_renderer.py OR have an
+# explicit `# PROJECT_PARITY_WAIVED:<reason>` marker near its definition.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _scan_pose_projection_helpers(repo_root: Path) -> list[tuple[str, int]]:
+    """Find pose-projection helper definitions in optimize/training scripts.
+
+    Returns list of (file_path, lineno) where a candidate helper is defined.
+    Pattern: `def _project*pose*` or `def project_*_pose` or `def *_pose_pad*`.
+    """
+    helpers: list[tuple[str, int]] = []
+    pattern = re.compile(
+        r"^def\s+(_?project_\w*pose\w*|project_\w*_pose|_?\w*_pose_pad\w*)\s*\(",
+    )
+    for py in _iter_python_files(repo_root, ["experiments", "src/tac"]):
+        rel = py.relative_to(repo_root) if py.is_absolute() else py
+        rel_s = str(rel)
+        if "/tests/" in rel_s or "/inflate_renderer.py" in rel_s:
+            continue
+        try:
+            text = py.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        for i, line in enumerate(text.splitlines(), start=1):
+            m = pattern.match(line.lstrip())
+            if m:
+                helpers.append((rel_s, i))
+    return helpers
+
+
+def _inflate_calls_helper(helper_name: str, repo_root: Path) -> bool:
+    """True iff inflate_renderer.py calls a function matching `helper_name`."""
+    inflate_path = repo_root / "submissions" / "robust_current" / "inflate_renderer.py"
+    if not inflate_path.exists():
+        return False
+    try:
+        text = inflate_path.read_text(errors="ignore")
+    except (FileNotFoundError, PermissionError):
+        return False
+    # Match either direct call `helper_name(` or import `from X import helper_name`
+    return bool(re.search(rf"\b{re.escape(helper_name)}\s*\(", text)) or bool(
+        re.search(rf"\bimport\s+\w+\s*,?\s*{re.escape(helper_name)}", text)
+    ) or bool(re.search(rf"from\s+\S+\s+import.*\b{re.escape(helper_name)}", text))
+
+
+def _has_parity_waiver(file_path: Path, def_lineno: int) -> bool:
+    """Look for `# PROJECT_PARITY_WAIVED:` marker within 15 lines of def.
+
+    Window is 15 because waiver comments often span multiple lines for
+    explanation (e.g., the BUG-1 waiver at optimize_poses.py:752 needs
+    7+ lines to reference the audit + V3-clean fix path).
+    """
+    try:
+        lines = file_path.read_text(errors="ignore").splitlines()
+    except (FileNotFoundError, PermissionError):
+        return False
+    start = max(0, def_lineno - 15)
+    end = min(len(lines), def_lineno + 6)
+    return any("PROJECT_PARITY_WAIVED:" in line for line in lines[start:end])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 43 (2026-04-28): launcher tarball must include lane anchor paths
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def check_launcher_tarball_includes_lane_anchors(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch the bug class where lane scripts reference anchor files that
+    are EXCLUDED from the launcher's tarball.
+
+    Reference: 2026-04-28 PM, 3 lanes (Ω-V2, EC, SAUG-V2) launched OK via
+    launcher V4 split-mode but FAILED on remote because tarball excluded
+    `experiments/results/lane_a_landed/` (3.4GB) — losing the canonical
+    700KB `archive_lane_a.zip` anchor that all lanes reference. ~$1.50
+    wasted across 3 destroyed instances.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+
+    scripts_dir = root / "scripts"
+    launcher = root / "scripts" / "launch_lane_on_vastai.py"
+    if not scripts_dir.is_dir() or not launcher.exists():
+        if verbose:
+            print(f"  [tarball-anchor-parity] OK: launcher or scripts dir missing — skipping")
+        return violations
+
+    # Collect anchor paths referenced in remote_lane_*.sh
+    # 2026-04-29: regex fix — split optional quote and ${VAR:-` into two
+    # independent groups so `="${VAR:-experiments/...}"` matches.
+    anchor_paths: set[str] = set()
+    pattern = re.compile(
+        r'(?:ANCHOR_\w+|LANE_\w*ARCHIVE\w*|LANE_\w*POSES\w*|LANE_\w*MASKS\w*|LANE_\w*RENDERER\w*)='
+        r'"?'
+        r'(?:\$\{[^:}]+:-)?'
+        r'(experiments/results/[\w./_-]+)'
+    )
+    for sh in scripts_dir.glob("remote_lane_*.sh"):
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        for m in pattern.finditer(text):
+            anchor_paths.add(m.group(1))
+
+    if not anchor_paths:
+        if verbose:
+            print(f"  [tarball-anchor-parity] OK: no anchor paths to check")
+        return violations
+
+    # Parse launcher includes + excludes
+    try:
+        ltext = launcher.read_text(errors="ignore")
+    except (FileNotFoundError, PermissionError):
+        return violations
+
+    includes: set[str] = set()
+    excludes: list[str] = []
+    for line in ltext.splitlines():
+        s = line.strip()
+        m_ex = re.match(r'"--exclude=([^"]+)"', s)
+        if m_ex:
+            excludes.append(m_ex.group(1))
+            continue
+        m_inc = re.match(r'"(experiments/[^"]+)",?$', s)
+        if m_inc:
+            includes.add(m_inc.group(1))
+
+    for ap in sorted(anchor_paths):
+        if ap in includes:
+            continue
+        # If any exclude pattern would match the anchor path → violation
+        # (unless an include exactly overrides)
+        excluded = False
+        for ex in excludes:
+            ex_clean = ex.rstrip("*").rstrip("/")
+            if not ex_clean:
+                continue
+            if ap.startswith(ex_clean):
+                if any(ap == inc or ap.startswith(inc.rstrip("/") + "/") for inc in includes):
+                    continue
+                excluded = True
+                break
+        if excluded:
+            violations.append(
+                f"{ap}: referenced as anchor in scripts/remote_lane_*.sh but "
+                f"EXCLUDED from launcher tarball. Lanes deployed via "
+                f"scripts/launch_lane_on_vastai.py will FAIL on remote. "
+                f"Add to includes list in `build_tarball()` OR remove the "
+                f"parent --exclude pattern."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [tarball-anchor-parity] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [tarball-anchor-parity] OK: {len(anchor_paths)} anchor path(s) all in tarball")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LAUNCHER TARBALL MISSING LANE ANCHORS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_lane_anchor_masks_full_resolution(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Check 76 — every masks.mkv referenced as a lane anchor must be at
+    full resolution (≥384×512) to match renderer training.
+
+    HISTORICAL BUG, RECURRING:
+      - 2026-04-21 (memory feedback_catastrophic_failures_20260421):
+        "MASKS.MKV AT 48x64 DESTROYED THE SCORE." Score 103.27 vs ~0.71.
+      - 2026-04-29 (Lane UNIWARD v7): same bug, different anchor.
+        score 53.61 (vs predicted [1.00, 1.13]) because lane bundled
+        submissions/baseline_dilated_h64_0_90/masks.mkv (64x48 1/8 res).
+
+    Renderer is trained on 384×512 inputs. Sub-resolution masks force
+    the renderer to upscale/extrapolate → catastrophic distortion.
+
+    This check probes every masks.mkv referenced as an ANCHOR_* /
+    LANE_*_MASKS / ANCHOR_DIR path in remote_lane_*.sh, opens it via
+    av/ffmpeg, and fails if width × height < 384 × 512.
+    """
+    try:
+        import av
+    except ImportError:
+        if verbose:
+            print(f"  [anchor-masks-fullres] SKIP: av not installed")
+        return []
+
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        return []
+
+    # Find all masks.mkv paths referenced (directly or via ANCHOR_DIR/...)
+    pattern = re.compile(
+        r'(?:ANCHOR_\w*MASKS\w*|LANE_\w*MASKS\w*|ANCHOR_DIR)\s*='
+        r'"?'
+        r'(?:\$\{[^:}]+:-)?'
+        r'(experiments/results/[\w./_-]+|submissions/[\w./_-]+|upstream/[\w./_-]+)'
+    )
+    masks_referenced: set[Path] = set()
+    for sh in scripts_dir.glob("remote_lane_*.sh"):
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        for m in pattern.finditer(text):
+            anchor_path = root / m.group(1)
+            # Direct masks.mkv path
+            if anchor_path.is_file() and anchor_path.suffix == ".mkv":
+                masks_referenced.add(anchor_path)
+            # ANCHOR_DIR pointing at a directory containing masks.mkv
+            elif anchor_path.is_dir():
+                masks_path = anchor_path / "masks.mkv"
+                if masks_path.is_file():
+                    masks_referenced.add(masks_path)
+
+    violations: list[str] = []
+    n_checked = 0
+    for masks_path in sorted(masks_referenced):
+        # Per-file waiver: a sibling `.preflight_anchor_lowres_ok` sentinel
+        # documents that the masks.mkv was INTENTIONALLY encoded at sub-full
+        # resolution (e.g. the verified 0.9001 baseline whose masks were
+        # produced when the renderer accepted lower resolutions). The
+        # sentinel file's contents must explain WHY the low-res anchor is
+        # legitimate (operator audit trail).
+        waiver_path = masks_path.parent / ".preflight_anchor_lowres_ok"
+        if waiver_path.is_file():
+            n_checked += 1
+            continue
+        try:
+            container = av.open(str(masks_path))
+            stream = container.streams.video[0]
+            w, h = stream.width, stream.height
+            container.close()
+            n_checked += 1
+            if w * h < 384 * 512:
+                violations.append(
+                    f"{masks_path.relative_to(root)}: resolution {w}×{h} "
+                    f"(< full 384×512). Lanes anchoring this WILL score "
+                    f"catastrophically (Lane UNIWARD v7 = 53.61 from this "
+                    f"exact bug, score 103.27 historical 2026-04-21). "
+                    f"Use experiments/results/lane_a_landed/iter_0/masks.mkv "
+                    f"or experiments/results/lane_g_v3_landed/iter_0/masks.mkv. "
+                    f"OR if this anchor was INTENTIONALLY low-res (e.g. the "
+                    f"verified 0.9001 baseline), drop a "
+                    f"`.preflight_anchor_lowres_ok` sentinel in the parent "
+                    f"directory documenting why."
+                )
+        except Exception as e:
+            violations.append(
+                f"{masks_path.relative_to(root)}: could not probe "
+                f"({type(e).__name__}: {e})"
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [anchor-masks-fullres] {len(violations)} violation(s) "
+                  f"({n_checked} checked):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [anchor-masks-fullres] OK: {n_checked} masks.mkv "
+                  f"all ≥ 384×512")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE ANCHOR MASKS BELOW FULL RESOLUTION:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_no_off_manifold_pose_zeros(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_dirs: tuple[str, ...] = ("src/tac", "experiments", "scripts"),
+) -> list[str]:
+    """Check 75 — `torch.zeros(N, 6)` for pose tensors is off-manifold for
+    6-DOF-trained renderers and CATASTROPHICALLY breaks scores.
+
+    2026-04-29 incidents (verified):
+      - Lane GP v2: torch.zeros(n_pairs, 6) with poses[:, 0]=poly → 89.66
+        (pose=149.95, baseline 0.003 = 50000× worse)
+      - Lane M-V1: same pattern → 2.35 (pose ~16× worse than baseline)
+      - Lane M-V2 fix attempted (preserve dims 1-5) → 1.84 (still worse)
+      - Memory `project_lane_mn_radial_zoom_negative` documents this for 7 days
+    User: "fix and harden all" — make this bug class IMPOSSIBLE to ship again.
+
+    Detects: pattern `torch.zeros(<n>, 6, ...)` followed by assignment to
+    only dim 0 (e.g. `poses[:, 0] = ...`). Requires same-line waiver
+    `# OFF_MANIFOLD_OK: <reason>` to ship — otherwise FAIL.
+
+    Why this is the right surface: any pose tensor that GETS POPULATED with
+    only one dimension is a renderer-input mismatch unless the renderer
+    was DESIGNED to take rank-1 conditioning (Fix B retraining).
+    """
+    root = repo_root or REPO_ROOT
+    skip_parts = {"__pycache__", ".venv", ".git", ".pytest_cache",
+                  "build", "dist", "node_modules", "tests"}
+    # Skip self (preflight.py contains regex patterns as strings)
+    skip_files = {"preflight.py"}
+
+    # Match `torch.zeros(<anything>, 6` (with the 6 as 2nd positional arg).
+    # The trailing context allows extra args (dtype, device, etc).
+    zeros_re = re.compile(
+        r'torch\.zeros\s*\(\s*[^,)]+,\s*6\b',
+    )
+
+    violations: list[str] = []
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for f in list(d_path.rglob("*.py")) + list(d_path.rglob("*.sh")):
+            if f.is_dir() or any(p in skip_parts for p in f.parts):
+                continue
+            if f.name in skip_files:
+                continue
+            try:
+                text = f.read_text(errors="ignore")
+            except (FileNotFoundError, PermissionError):
+                continue
+            for m in zeros_re.finditer(text):
+                lineno = text[:m.start()].count("\n") + 1
+                # Get the specific line for waiver detection
+                line_start = text.rfind("\n", 0, m.start()) + 1
+                line_end = text.find("\n", m.end())
+                if line_end == -1:
+                    line_end = len(text)
+                line = text[line_start:line_end]
+                if "OFF_MANIFOLD_OK:" in line:
+                    continue
+                # Skip the canonical reconstruct_poses fallback path —
+                # that one is properly guarded with a `warnings.warn`.
+                if "warnings.warn" in text[max(0, m.start()-200):m.start()]:
+                    continue
+                # Allow if same line has a 6-DOF assignment that fills
+                # all dims (e.g., `torch.zeros(n, 6); poses[:] = ...`)
+                # — but harder to verify, so require waiver.
+                violations.append(
+                    f"{f.relative_to(root)}:{lineno}: `torch.zeros(N, 6)` "
+                    f"creates an OFF-MANIFOLD pose tensor for 6-DOF-trained "
+                    f"renderers. Lane GP v2 = 89.66, Lane M-V1 = 2.35 from "
+                    f"this exact pattern. Either pass baseline_poses to "
+                    f"preserve dims 1-5, OR add `# OFF_MANIFOLD_OK: <reason>` "
+                    f"on the same line if intentional (e.g. unit test, or "
+                    f"rank-1-trained renderer). See "
+                    f"project_lane_gp_v2_audit_20260429."
+                )
+
+    if verbose:
+        if violations:
+            print(f"  [no-off-manifold-pose-zeros] {len(violations)} violation(s):")
+            for v in violations[:10]:
+                print(f"    • {v}")
+        else:
+            print(f"  [no-off-manifold-pose-zeros] OK")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "OFF-MANIFOLD POSE ZERO PATTERN (Lane GP/M failure mode):\n"
+            + "\n".join(f"  • {v}" for v in violations[:10])
+        )
+    return violations
+
+
+def check_python_heredocs_no_undefined_names(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_dirs: tuple[str, ...] = ("scripts", "experiments", "tools"),
+) -> list[str]:
+    """Check 74 — Python heredocs in shell scripts must not reference
+    undefined names (missing imports).
+
+    2026-04-29 incidents (multiple lane crashes from this exact bug class):
+      - UNIWARD heredoc used `sys.path.insert` without `import sys` → NameError
+      - UNIWARD Stage 3 used `json.dump` without `import json` → NameError
+    User: "not importing libraries needed is so dumb. how are you not
+    catching these beforehand. permanently protect against all bug classes."
+
+    Approach: AST-walk every python-heredoc body, collect all loaded Name
+    references, subtract (imported names ∪ defined names ∪ builtins ∪
+    common-shell-env-vars). Anything left is an UndefinedName risk.
+
+    Common shell-injected vars (UW_PAYLOAD, GIT_HASH, etc) get treated
+    as `os.environ` keys at runtime — substitute and skip.
+    """
+    import ast
+    import builtins as _builtins
+
+    root = repo_root or REPO_ROOT
+    skip_parts = {"__pycache__", ".venv", ".git", ".pytest_cache",
+                  "build", "dist", "node_modules"}
+
+    builtin_names = set(dir(_builtins))
+    # Common patterns the heredoc treats as runtime-injected (env vars
+    # bash-substituted in via export + os.environ).
+    runtime_injected = {"prov"}
+
+    heredoc_re = re.compile(
+        r'(?:"?\$PYBIN"?|python3?)\s+[^<\n]*?<<\s*'
+        r"['\"]?(?P<tag>[A-Z_][A-Z0-9_]*)['\"]?[^\n]*\n"
+        r'(?P<body>.*?)\n^(?P=tag)\s*$',
+        re.MULTILINE | re.DOTALL,
+    )
+
+    violations: list[str] = []
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for sh in d_path.rglob("*.sh"):
+            if sh.is_dir() or any(p in skip_parts for p in sh.parts):
+                continue
+            try:
+                text = sh.read_text(errors="ignore")
+            except (FileNotFoundError, PermissionError):
+                continue
+            for m in heredoc_re.finditer(text):
+                body = m.group("body")
+                lineno = text[:m.start("body")].count("\n") + 1
+                # Substitute $VAR and ${VAR} → 'shellvar' string so AST parses
+                stub = re.sub(r"\$\{?(\w+)\}?", r"'shellvar'", body)
+                try:
+                    tree = ast.parse(stub)
+                except (SyntaxError, IndentationError):
+                    # Already covered by Check 72
+                    continue
+
+                # Collect imported names + assigned names + function/class defs
+                defined: set[str] = set()
+                # First pass: imports + top-level assignments + function/class defs
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom):
+                        for n in node.names:
+                            defined.add(n.asname or n.name)
+                    elif isinstance(node, ast.Import):
+                        for n in node.names:
+                            defined.add((n.asname or n.name).split(".")[0])
+                    elif isinstance(node, ast.Assign):
+                        for tgt in node.targets:
+                            if isinstance(tgt, ast.Name):
+                                defined.add(tgt.id)
+                            elif isinstance(tgt, (ast.Tuple, ast.List)):
+                                for elt in tgt.elts:
+                                    if isinstance(elt, ast.Name):
+                                        defined.add(elt.id)
+                    elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                        defined.add(node.target.id)
+                    elif isinstance(node, ast.AnnAssign):
+                        # Annotated assignment: `name: type = value` or `name: type`.
+                        # 2026-05-01 fix: previously missed because only ast.Assign +
+                        # ast.AugAssign were handled. False-positive on
+                        # `scripts/remote_lane_nerv.sh:81-110` (function-local
+                        # `meta: dict = {...}`) was the trigger.
+                        if isinstance(node.target, ast.Name):
+                            defined.add(node.target.id)
+                    elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+                        # Walrus operator: `(name := value)` (PEP 572). Same class
+                        # of false-positive risk as AnnAssign.
+                        defined.add(node.target.id)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        defined.add(node.name)
+                    elif isinstance(node, ast.For):
+                        if isinstance(node.target, ast.Name):
+                            defined.add(node.target.id)
+                        elif isinstance(node.target, (ast.Tuple, ast.List)):
+                            for elt in node.target.elts:
+                                if isinstance(elt, ast.Name):
+                                    defined.add(elt.id)
+                    elif isinstance(node, ast.With):
+                        for item in node.items:
+                            if item.optional_vars and isinstance(item.optional_vars, ast.Name):
+                                defined.add(item.optional_vars.id)
+                    elif isinstance(node, ast.comprehension):
+                        # Comprehension target: name OR tuple/list of names
+                        def _capture_target(t):
+                            if isinstance(t, ast.Name):
+                                defined.add(t.id)
+                            elif isinstance(t, (ast.Tuple, ast.List)):
+                                for e in t.elts:
+                                    _capture_target(e)
+                        _capture_target(node.target)
+                    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
+                                            ast.GeneratorExp)):
+                        # Walk all generators to capture their targets
+                        for gen in node.generators:
+                            def _capture_target2(t):
+                                if isinstance(t, ast.Name):
+                                    defined.add(t.id)
+                                elif isinstance(t, (ast.Tuple, ast.List)):
+                                    for e in t.elts:
+                                        _capture_target2(e)
+                            _capture_target2(gen.target)
+                    elif isinstance(node, ast.ExceptHandler) and node.name:
+                        defined.add(node.name)
+                # Function-arg names
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        for arg in node.args.args + node.args.kwonlyargs:
+                            defined.add(arg.arg)
+                        if node.args.vararg:
+                            defined.add(node.args.vararg.arg)
+                        if node.args.kwarg:
+                            defined.add(node.args.kwarg.arg)
+
+                # Find all Loaded Name references
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                        name = node.id
+                        if name in defined or name in builtin_names or name in runtime_injected:
+                            continue
+                        # Skip common module-attribute access roots that ARE imported
+                        # (e.g., 'os.environ' — `os` should be in defined if imported).
+                        # If we get here, name isn't defined → flag it.
+                        violations.append(
+                            f"{sh.relative_to(root)}:{lineno + node.lineno - 1}: "
+                            f"heredoc <<'{m.group('tag')}' references "
+                            f"undefined name {name!r} — missing import?"
+                        )
+
+    # Dedupe identical violations (one per occurrence)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for v in violations:
+        if v not in seen:
+            seen.add(v)
+            deduped.append(v)
+
+    if verbose:
+        if deduped:
+            print(f"  [heredoc-undefined-names] {len(deduped)} violation(s):")
+            for v in deduped[:20]:
+                print(f"    • {v}")
+            if len(deduped) > 20:
+                print(f"    ... and {len(deduped) - 20} more")
+        else:
+            print(f"  [heredoc-undefined-names] OK")
+
+    if deduped and strict:
+        raise MetaBugViolation(
+            "PYTHON HEREDOCS REFERENCE UNDEFINED NAMES (likely missing imports):\n"
+            + "\n".join(f"  • {v}" for v in deduped[:20])
+        )
+    return deduped
+
+
+def check_remote_lane_argparse_arity(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Check 73 — every `python <script.py>` invocation in a remote_lane_*.sh
+    must pass all required argparse args of <script.py>.
+
+    Why: 2026-04-29 Q-FAITHFUL crashed at 64s on Modal with
+    `train_renderer.py: error: --tag required`. preflight_arity (the
+    existing arity check) only scans `experiments/pipeline.py` and
+    `scripts/deploy_vastai.py` — NOT the 70+ remote_lane_*.sh scripts.
+
+    This check parses every `"$PYBIN"|python|python3 -u <path>.py \\
+    [args...]` invocation across all lane scripts (handles bash line
+    continuation `\\`), then validates each against the target's argparse.
+
+    Catches the meta-bug class where a lane script forgets a required flag
+    that the train script demands.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        return []
+
+    sigs = _build_target_signatures(root)
+    violations: list[str] = []
+
+    # Pattern: invocation start (line begins with optional whitespace,
+    # PYBIN/python/python3, optional -u, then script path .py)
+    invoc_re = re.compile(
+        r'^\s*"?\$PYBIN"?|^\s*python3?\b'
+    )
+
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+
+        # Walk lines, find invocation starts. Handle line-continuation `\`.
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Skip comments
+            if line.lstrip().startswith("#"):
+                i += 1
+                continue
+            # Detect invocation start with python script .py
+            m = re.search(
+                r'(?:"?\$PYBIN"?|\bpython3?\b)\s+(?:-u\s+)?(?:-m\s+)?'
+                r'(?P<target>[\w./-]+\.py)\b',
+                line,
+            )
+            if not m:
+                i += 1
+                continue
+            target_path = m.group("target")
+            # Normalize relative path. Lane scripts use 'src/tac/experiments/X.py'
+            # and 'experiments/X.py' — both should resolve.
+            invocation_lineno = i + 1
+            # Collect continuation lines (lines ending with `\` are continued)
+            full_cmd = line
+            while line.rstrip().endswith("\\") and i + 1 < len(lines):
+                i += 1
+                line = lines[i]
+                full_cmd += "\n" + line
+
+            # Extract flag tokens from full_cmd; target_sig keys are stored
+            # WITH `--` prefix, so prepend `--` when comparing.
+            flag_tokens = re.findall(r'\B--([a-z][a-z0-9-]+)', full_cmd)
+            passed = {f"--{t}" for t in flag_tokens}
+
+            # Match target to a known argparse signature. Try several path forms.
+            target_sig = None
+            for try_path in (target_path, f"src/tac/experiments/{Path(target_path).name}",
+                             f"experiments/{Path(target_path).name}"):
+                if try_path in sigs:
+                    target_sig = sigs[try_path]
+                    break
+            if target_sig is None:
+                i += 1
+                continue  # target not in our argparse-known set
+
+            target_flags = set(target_sig.keys())
+
+            # Rule A: unknown flag (passes a flag the target doesn't have)
+            unknown = passed - target_flags
+            for f in sorted(unknown):
+                violations.append(
+                    f"{sh.relative_to(root)}:{invocation_lineno}: "
+                    f"passes {f} to {target_path} but target has no such "
+                    f"argparse arg"
+                )
+
+            # Rule B: missing required (target requires a flag the launcher omits)
+            #
+            # Subcommand-aware skip: if the target uses argparse subparsers
+            # (e.g. experiments/pipeline.py has compress/eval/inflate/build
+            # subcommands), the merged target_sig contains the UNION of every
+            # subcommand's required args. A `compress` invocation should not
+            # be flagged for missing `--archive` when --archive is required
+            # only by the `eval` subparser. Heuristic: if a known subcommand
+            # token appears as a positional after the .py file, skip Rule B
+            # for this invocation (Rule A unknown-flag detection still fires).
+            _SUBCMD_TOKENS = {
+                "compress", "eval", "inflate", "build", "train",
+                "package", "harvest", "audit", "report",
+            }
+            tail_after_target = full_cmd[
+                full_cmd.find(target_path) + len(target_path):
+            ]
+            tokens_after_target = re.findall(
+                r"\s([a-z][a-z_-]{2,15})(?:\s|$|\\)", tail_after_target,
+            )
+            uses_subcommand = bool(
+                _SUBCMD_TOKENS.intersection(tokens_after_target)
+            )
+            if not uses_subcommand:
+                for flag, spec in target_sig.items():
+                    if spec.get("required") and flag not in passed:
+                        violations.append(
+                            f"{sh.relative_to(root)}:{invocation_lineno}: "
+                            f"invokes {target_path} but does not pass "
+                            f"required arg {flag}"
+                        )
+
+            i += 1
+
+    if verbose:
+        if violations:
+            print(f"  [remote-lane-arity] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... and {len(violations) - 20} more")
+        else:
+            print(f"  [remote-lane-arity] OK")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE LANE SCRIPT ARGPARSE ARITY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+        )
+    return violations
+
+
+def check_python_heredocs_in_shell_compile(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_dirs: tuple[str, ...] = ("scripts", "experiments", "tools"),
+) -> list[str]:
+    """Check 72 — Python code embedded in shell heredocs must compile.
+
+    py_compile (Check 67) only sees standalone .py files. bash -n (Check 68)
+    treats heredocs as opaque strings. Neither catches Python SyntaxErrors
+    inside `python -u - <<'PY' ... PY` heredocs.
+
+    2026-04-29 incident: R9 batch-patch added bash PIPE_RC guards to lines
+    matching `| tee log` — but the regex hit lines INSIDE python heredocs:
+
+        "$PYBIN" -u - <<'PY' 2>&1 | tee log
+        PIPE_RC=("${PIPESTATUS[@]}")     ← injected INTO heredoc
+        if [ "${PIPE_RC[0]}" -ne 0 ]; then
+            ...
+        fi
+        import torch                       ← actual Python
+        ...
+        PY
+
+    Python interpreter received the bash code as input and crashed with
+    SyntaxError. Both Check 67 and Check 68 passed because each only sees
+    its own language.
+
+    This check extracts every `<<'PY'...PY` (and other quoted-tag heredocs
+    fed to python interpreters) from shell scripts and runs py_compile on
+    the contents. Catches injected-bash-into-python AND any actual Python
+    SyntaxError in heredocs.
+    """
+    import py_compile
+    import tempfile
+
+    root = repo_root or REPO_ROOT
+    skip_parts = {"__pycache__", ".venv", ".git", ".pytest_cache",
+                  "build", "dist", "node_modules"}
+
+    # Match `<command...> <<'TAG' ... TAG` where command invokes python
+    # (PYBIN, python, python3) and TAG is a heredoc terminator.
+    heredoc_re = re.compile(
+        r'(?P<cmd>(?:^|[\s|=&])\s*(?:"?\$PYBIN"?|python3?)\s+[^<\n]*?<<\s*'
+        r"['\"]?(?P<tag>[A-Z_][A-Z0-9_]*)['\"]?[^\n]*\n"
+        r'(?P<body>.*?)\n^(?P=tag)\s*$)',
+        re.MULTILINE | re.DOTALL,
+    )
+
+    violations: list[str] = []
+    n_compiled = 0
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for sh in d_path.rglob("*.sh"):
+            if sh.is_dir() or any(p in skip_parts for p in sh.parts):
+                continue
+            try:
+                text = sh.read_text(errors="ignore")
+            except (FileNotFoundError, PermissionError):
+                continue
+            for m in heredoc_re.finditer(text):
+                body = m.group("body")
+                lineno = text[:m.start("body")].count("\n") + 1
+                # Normalize: heredoc bodies often use $VAR which Python won't
+                # like, but only at runtime. Python compilation only cares
+                # about syntax. $VAR is just a $ followed by identifier in
+                # most string contexts → SyntaxError. So we substitute $VAR
+                # → 'VAR' as a parse-only proxy.
+                #
+                # However bash $VAR appears in real Python only inside string
+                # literals (e.g., os.environ["..."]) — bash expands them
+                # BEFORE python sees them. For static parse, treat $VAR as
+                # an identifier.
+                stub = re.sub(r"\$\{?(\w+)\}?", r"_v_\1", body)
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
+                                                  delete=False) as tf:
+                    tf.write(stub)
+                    tmp = tf.name
+                try:
+                    py_compile.compile(tmp, doraise=True)
+                    n_compiled += 1
+                except py_compile.PyCompileError as e:
+                    violations.append(
+                        f"{sh.relative_to(root)}:{lineno}: heredoc "
+                        f"<<'{m.group('tag')}' fails Python compile: "
+                        f"{str(e).strip()[:200]}"
+                    )
+                except (SyntaxError, IndentationError) as e:
+                    violations.append(
+                        f"{sh.relative_to(root)}:{lineno + (e.lineno or 0) - 1}: "
+                        f"heredoc <<'{m.group('tag')}' "
+                        f"{type(e).__name__} at heredoc-line {e.lineno}: {e.msg}"
+                    )
+                except Exception as e:
+                    violations.append(
+                        f"{sh.relative_to(root)}:{lineno}: heredoc "
+                        f"<<'{m.group('tag')}' "
+                        f"{type(e).__name__}: {e}"
+                    )
+                finally:
+                    Path(tmp).unlink(missing_ok=True)
+
+    if verbose:
+        if violations:
+            print(f"  [python-heredocs-compile] {len(violations)} violation(s) "
+                  f"({n_compiled} heredocs OK):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(f"  [python-heredocs-compile] OK: {n_compiled} heredocs compile clean")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PYTHON HEREDOCS IN SHELL SCRIPTS FAIL TO COMPILE:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+        )
+    return violations
+
+
+def check_no_shadowed_module_import_used_before_local_import(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_dirs: tuple[str, ...] = ("src/tac", "experiments", "tools"),
+) -> list[str]:
+    """Check 71 — UnboundLocalError trap from `from X import Y` inside a
+    function body shadowing a module-level `from X import Y`, when Y is
+    used in that function body BEFORE the local import line.
+
+    2026-04-29 incident: src/tac/experiments/train_renderer.py line 3057
+    had `from tac.losses import _hwc_to_chw` inside `def train()`, which
+    Python compiled as making `_hwc_to_chw` local-throughout-train. The
+    same function used `_hwc_to_chw` at line 2357 → UnboundLocalError.
+    All v4 TIER-1 lanes crashed at this exact line. ~$1+ wasted.
+
+    py_compile (Check 67) doesn't catch this (legal syntax).
+    pytest-collect (Check 70) doesn't catch this (only fails if test
+    actually exercises the function path).
+
+    Detects: imports at module level whose names are ALSO imported inside
+    a function body, AND used in that function body before the local
+    import line number.
+    """
+    import ast
+
+    root = repo_root or REPO_ROOT
+    skip_parts = {"__pycache__", ".venv", ".git", ".pytest_cache",
+                  "build", "dist", "tests"}
+
+    violations: list[str] = []
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for py in d_path.rglob("*.py"):
+            if any(p in skip_parts for p in py.parts):
+                continue
+            try:
+                tree = ast.parse(py.read_text())
+            except SyntaxError:
+                continue
+            # Module-level imports
+            mod_imports: set[str] = set()
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom):
+                    for n in node.names:
+                        mod_imports.add(n.asname or n.name)
+            # Walk each function/method
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                # Find local re-imports of module-level names + earliest use lines
+                local_imports: dict[str, int] = {}  # name → import lineno
+                first_use: dict[str, int] = {}  # name → first reference lineno
+                for sub in ast.walk(node):
+                    if sub is node:
+                        continue
+                    if isinstance(sub, ast.ImportFrom):
+                        for n in sub.names:
+                            name = n.asname or n.name
+                            if name in mod_imports and name not in local_imports:
+                                local_imports[name] = sub.lineno
+                    elif isinstance(sub, ast.Name):
+                        if sub.id in mod_imports and sub.id not in first_use:
+                            first_use[sub.id] = sub.lineno
+                for name, imp_line in local_imports.items():
+                    use_line = first_use.get(name)
+                    if use_line is not None and use_line < imp_line:
+                        violations.append(
+                            f"{py.relative_to(root)}:{imp_line}: "
+                            f"`from ... import {name}` inside `{node.name}()` "
+                            f"shadows module-level import. {name} is also "
+                            f"used at line {use_line} (BEFORE the local import) "
+                            f"→ UnboundLocalError. Remove the inner import."
+                        )
+
+    if verbose:
+        if violations:
+            print(f"  [shadowed-import-before-use] {len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(f"  [shadowed-import-before-use] OK")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SHADOWED IMPORT TRIGGERS UnboundLocalError:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+        )
+    return violations
+
+
+def check_pytest_collection_clean(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    test_dirs: tuple[str, ...] = ("src/tac/tests",),
+    timeout: int = 60,
+) -> list[str]:
+    """Check 70 — `pytest --collect-only` must succeed cleanly.
+
+    PROACTIVE: catches missing imports, fixture errors, conftest bugs that
+    only surface at test-collection time. py_compile (Check 67) catches
+    syntax; this catches imports + decorator errors.
+
+    Runs in ~1.5s for 4306 tests. STRICT @ 0 collection errors.
+    """
+    import subprocess
+
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    for d in test_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [".venv/bin/python", "-m", "pytest", "--collect-only", "-q",
+                 str(d_path)],
+                cwd=root, capture_output=True, text=True, timeout=timeout,
+            )
+            if proc.returncode != 0:
+                # Extract the error lines (typically prefixed by "ERROR" or "_____ ERRORS _____")
+                err_lines = []
+                in_errors = False
+                for line in (proc.stdout + "\n" + proc.stderr).splitlines():
+                    if "ERROR" in line or "Error" in line or "error" in line[:10]:
+                        in_errors = True
+                    if in_errors:
+                        err_lines.append(line)
+                violations.append(
+                    f"{d}: pytest --collect-only returncode={proc.returncode}. "
+                    f"First 3 errors: " + " | ".join(err_lines[:3])[:300]
+                )
+        except subprocess.TimeoutExpired:
+            violations.append(f"{d}: pytest --collect-only timed out ({timeout}s)")
+        except FileNotFoundError:
+            if verbose:
+                print(f"  [pytest-collect] SKIP: .venv/bin/python missing")
+            return []
+
+    if verbose:
+        if violations:
+            print(f"  [pytest-collect] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [pytest-collect] OK: all test dirs collect clean")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PYTEST COLLECTION ERRORS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_lane_anchor_files_exist_locally(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Check 69 — every `ANCHOR_*` / `LANE_*_ARCHIVE` path referenced in
+    `remote_lane_*.sh` must EXIST in the local working tree.
+
+    Check 43 verifies launcher tarball INCLUDES the path. This check is
+    complementary: if the file doesn't exist locally, the tarball ships
+    nothing, the lane crashes on remote with `[ -f "$ANCHOR_..." ]` failure.
+
+    Skips paths that are env-overridable to placeholders (ANCHOR_FOO=${BAR:-})
+    when no resolvable default exists in the file.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [anchor-exists-locally] OK: scripts/ missing — skipping")
+        return []
+
+    # 2026-04-29: regex fix — `="${VAR:-experiments/...}"` form needs two
+    # independent optional groups, not one alternation.
+    pattern = re.compile(
+        r'(?:ANCHOR_\w+|LANE_\w*ARCHIVE\w*|LANE_\w*POSES\w*|LANE_\w*MASKS\w*|LANE_\w*RENDERER\w*)='
+        r'"?'
+        r'(?:\$\{[^:}]+:-)?'
+        r'(experiments/results/[\w./_-]+|submissions/[\w./_-]+|upstream/[\w./_-]+)'
+    )
+
+    violations: list[str] = []
+    n_checked = 0
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        for m in pattern.finditer(text):
+            anchor_path = m.group(1)
+            n_checked += 1
+            full = root / anchor_path
+            if not full.exists():
+                violations.append(
+                    f"{sh.relative_to(root)}: ANCHOR `{anchor_path}` does NOT "
+                    f"exist locally — launcher tarball will ship nothing, "
+                    f"lane will crash at `[ -f $ANCHOR_... ]` check on remote."
+                )
+
+    if verbose:
+        if violations:
+            print(f"  [anchor-exists-locally] {len(violations)} violation(s) "
+                  f"({n_checked} anchor refs scanned):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(f"  [anchor-exists-locally] OK: {n_checked} anchor refs all exist locally")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE ANCHOR FILES DO NOT EXIST LOCALLY:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+        )
+    return violations
+
+
+def check_python_files_compile(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_dirs: tuple[str, ...] = ("src/tac", "scripts", "experiments", "tools"),
+) -> list[str]:
+    """Check 67 — every `.py` file in `scan_dirs` must parse + compile.
+
+    PROACTIVE: catches SyntaxError + IndentationError + obvious typos
+    BEFORE they ship to a remote and crash the lane after 5 minutes of
+    deploy. Uses `py_compile.compile(doraise=True)` which exercises the
+    full grammar without importing the module (so no import side-effects).
+
+    2026-04-29: added per user demand "preflight needs to include a python
+    compile step of all so we can identify any python errors without
+    deploying" + "autodetect and permanently prevent all bugs possible
+    to anticipate".
+
+    Skips: __pycache__, .venv, .git, .pytest_cache, build/, dist/, node_modules.
+    """
+    import py_compile
+
+    root = repo_root or REPO_ROOT
+    skip_parts = {"__pycache__", ".venv", ".git", ".pytest_cache",
+                  "build", "dist", "node_modules", ".eggs"}
+
+    violations: list[str] = []
+    n_compiled = 0
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for py in d_path.rglob("*.py"):
+            if any(p in skip_parts for p in py.parts):
+                continue
+            try:
+                py_compile.compile(str(py), doraise=True)
+                n_compiled += 1
+            except py_compile.PyCompileError as e:
+                violations.append(
+                    f"{py.relative_to(root)}: {type(e).__name__}: "
+                    f"{str(e).strip()[:200]}"
+                )
+            except (SyntaxError, IndentationError) as e:
+                violations.append(
+                    f"{py.relative_to(root)}: {type(e).__name__} at "
+                    f"line {e.lineno}: {e.msg}"
+                )
+            except Exception as e:  # pragma: no cover  unexpected
+                violations.append(
+                    f"{py.relative_to(root)}: {type(e).__name__}: {e}"
+                )
+
+    if verbose:
+        if violations:
+            print(f"  [python-compile] {len(violations)} violation(s) "
+                  f"({n_compiled} files compiled OK):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... and {len(violations) - 20} more")
+        else:
+            print(f"  [python-compile] OK: {n_compiled} files compile clean")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PYTHON FILES FAIL TO COMPILE — would crash on import at deploy:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + (f"\n  ... and {len(violations) - 20} more" if len(violations) > 20 else "")
+        )
+    return violations
+
+
+def check_shell_scripts_syntax_clean(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    scan_dirs: tuple[str, ...] = ("scripts", "submissions", "experiments", "tools"),
+) -> list[str]:
+    """Check 68 — every `*.sh` file in `scan_dirs` must pass `bash -n`.
+
+    PROACTIVE bash syntax check (no execution). Catches unclosed quotes,
+    bad heredocs, unmatched braces — bugs that would otherwise crash 30s
+    into a remote deploy.
+
+    Skips: directories that happen to end in .sh (recovered_*.sh, etc.)
+    """
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        if verbose:
+            print(f"  [shell-syntax] SKIP: bash not found on PATH")
+        return []
+
+    root = repo_root or REPO_ROOT
+    skip_parts = {"__pycache__", ".venv", ".git", ".pytest_cache",
+                  "build", "dist", "node_modules"}
+
+    violations: list[str] = []
+    n_checked = 0
+    for d in scan_dirs:
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for sh in d_path.rglob("*.sh"):
+            if sh.is_dir() or not sh.is_file():
+                continue
+            if any(p in skip_parts for p in sh.parts):
+                continue
+            try:
+                proc = subprocess.run(
+                    [bash, "-n", str(sh)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                n_checked += 1
+                if proc.returncode != 0:
+                    err = proc.stderr.strip().splitlines()
+                    msg = err[0] if err else f"non-zero exit {proc.returncode}"
+                    violations.append(
+                        f"{sh.relative_to(root)}: bash syntax error: {msg[:200]}"
+                    )
+            except subprocess.TimeoutExpired:
+                violations.append(
+                    f"{sh.relative_to(root)}: bash -n timed out (10s)"
+                )
+            except Exception as e:  # pragma: no cover
+                violations.append(
+                    f"{sh.relative_to(root)}: {type(e).__name__}: {e}"
+                )
+
+    if verbose:
+        if violations:
+            print(f"  [shell-syntax] {len(violations)} violation(s) "
+                  f"({n_checked} scripts checked):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... and {len(violations) - 20} more")
+        else:
+            print(f"  [shell-syntax] OK: {n_checked} scripts pass `bash -n`")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SHELL SCRIPTS FAIL `bash -n` SYNTAX CHECK:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+        )
+    return violations
+
+
+def check_no_git_reset_hard_in_remote_lane_scripts(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Check 44 — `git reset --hard origin/main` in remote_lane_*.sh wipes
+    local-only anchor files (archive_lane_a.zip, baseline dirs, etc.) that
+    the launcher just SCP'd. The tarball IS the parity mechanism — never
+    re-sync from origin/main on the remote.
+
+    2026-04-29 incident: 5/6 TIER-1 lanes crashed at Stage 1 with
+    "FATAL: missing Lane G v3 anchor archive" because canonical git-sync
+    pattern (introduced today) ran `git reset --hard origin/main` after
+    extract, deleting the local-only anchor archives the launcher had
+    bundled. ~$1.50 wasted, 0 training output.
+
+    Detects executable `git fetch ... && git reset --hard ...` lines
+    (ignores comments). Returns violations; raises MetaBugViolation if strict.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [no-git-reset-hard] OK: scripts/ missing — skipping")
+        return []
+
+    violations: list[str] = []
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            # Match executable `git reset --hard` (not in comments).
+            # Allow optional `-C <path>` (or `--git-dir=…`/`--work-tree=…`
+            # variants) between `git` and `reset` — earlier regex missed
+            # `git -C "$WORKSPACE" reset --hard origin/main` (Lane J-IMP
+            # 2026-04-30 incident).
+            if re.search(r"\bgit\b(?:\s+(?:-C\s+\S+|--git-dir=\S+|--work-tree=\S+|-c\s+\S+))*\s+reset\s+--hard\b", line):
+                violations.append(
+                    f"{sh.relative_to(root)}:{lineno}: executable `git reset --hard` "
+                    f"wipes local-only anchor files SCP'd by launcher. "
+                    f"Trust the tarball — remove this line."
+                )
+
+    if verbose:
+        if violations:
+            print(f"  [no-git-reset-hard] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [no-git-reset-hard] OK: 0 lane scripts run `git reset --hard`")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE SCRIPTS RUNNING `git reset --hard` WILL WIPE LOCAL-ONLY ANCHORS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nRemove the `git fetch + git reset --hard` block from each script. "
+            "The launcher tarball is the canonical parity mechanism."
+        )
+    return violations
+
+
+def check_pose_projection_train_inference_parity(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch pose-projection helpers used asymmetrically (BUG-1 class).
+
+    Reference: project_lane_m_v2_audit_council_findings_20260428.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    helpers = _scan_pose_projection_helpers(root)
+    for rel_s, lineno in helpers:
+        # Extract helper name from def line
+        try:
+            text = (root / rel_s).read_text(errors="ignore")
+            line = text.splitlines()[lineno - 1].lstrip()
+            m = re.match(r"def\s+(\w+)\s*\(", line)
+            if not m:
+                continue
+            helper_name = m.group(1)
+        except (FileNotFoundError, PermissionError, IndexError):
+            continue
+        if _has_parity_waiver(root / rel_s, lineno):
+            continue
+        if _inflate_calls_helper(helper_name, root):
+            continue
+        violations.append(
+            f"{rel_s}:{lineno}: pose-projection helper `{helper_name}` is "
+            f"defined in an optimization script but never called from "
+            f"submissions/robust_current/inflate_renderer.py. This is the "
+            f"BUG-1 class from Lane M-V2 audit "
+            f"(project_lane_m_v2_audit_council_findings_20260428): the "
+            f"optimizer projects pose tensors one way, inflate evaluates "
+            f"with raw saved tensors → train/inference distribution mismatch. "
+            f"Either: (a) call the same helper from inflate_renderer.py to "
+            f"ensure parity; (b) add `# PROJECT_PARITY_WAIVED: <reason>` "
+            f"comment near the def if the helper is intentionally one-sided."
+        )
+
+    if verbose:
+        if violations:
+            print(f"  [pose-parity] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [pose-parity] OK: every pose-projection helper has parity or waiver")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "POSE-PROJECTION TRAIN/INFERENCE PARITY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 41 (2026-04-28): remote_lane_*.sh scripts must have heartbeat loop
+#
+# CATCHES the bug class that wasted ~$2.50 on 2026-04-28: 3 Vast.ai instances
+# (W Iceland 35739770, K Denmark 35739771, OS-V2 NC 35739773) where SSH +
+# repo clone succeeded but the lane script never invoked, leaving no
+# heartbeat.log on disk and no GPU activity. The launcher reported success
+# because clone completed, masking the actual non-execution.
+#
+# Memory ref: feedback_vastai_launch_returns_success_before_lane_starts.
+#
+# This check enforces that every remote_lane_*.sh script:
+#   (a) defines HEARTBEAT (or LOG_DIR + heartbeat.log path), AND
+#   (b) writes to that path in a backgrounded loop
+# So a watchdog (or future post-launch verifier) can poll the on-disk
+# heartbeat freshness as the canonical readiness signal.
+#
+# Sweep orchestrators (`*_sweep.sh`) are exempt because they delegate to
+# per-trial scripts that have their own heartbeats.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Sweep / orchestrator scripts that delegate heartbeat to sub-scripts
+_HEARTBEAT_EXEMPT_SUFFIXES = (
+    "_sweep.sh",
+    # Lane A-Sweep template + orchestrator (per file docstring)
+    "remote_lane_a_optimized.sh",
+)
+
+
+def _scan_remote_lane_scripts_missing_heartbeat(repo_root: Path) -> list[str]:
+    """Scan remote_lane_*.sh for missing heartbeat-write pattern.
+
+    Required pattern: file mentions 'heartbeat' (case-insensitive) AND has
+    one of:
+      - `>> "$HEARTBEAT"` (canonical pattern)
+      - `>> $HEARTBEAT`
+      - `>> "$LOG_DIR/heartbeat.log"`
+      - any `heartbeat.log` write
+
+    Sweep orchestrators are exempted via _HEARTBEAT_EXEMPT_SUFFIXES.
+    """
+    violations: list[str] = []
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    write_patterns = (
+        '>> "$HEARTBEAT"',
+        ">> $HEARTBEAT",
+        '>> "$LOG_DIR/heartbeat.log"',
+        ">> heartbeat.log",
+        '"heartbeat.log"',
+        "'heartbeat.log'",
+    )
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        name = sh.name
+        if any(name.endswith(suf) for suf in _HEARTBEAT_EXEMPT_SUFFIXES):
+            continue
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if "heartbeat" not in text.lower():
+            violations.append(
+                f"{sh.relative_to(repo_root)}: no `heartbeat` reference. "
+                f"Lane scripts MUST write a heartbeat.log so the launcher "
+                f"and watchdog can verify the lane actually started "
+                f"(memory: feedback_vastai_launch_returns_success_before_lane_starts). "
+                f"Use the canonical pattern from "
+                f"scripts/remote_lane_lm_zero_cost_poses.sh: "
+                f"`HEARTBEAT=\"$LOG_DIR/heartbeat.log\"` + a backgrounded "
+                f"`while true; do echo ... >> \"$HEARTBEAT\"; sleep 60; done &` "
+                f"loop. If this is an orchestrator that delegates heartbeat "
+                f"to per-trial sub-scripts, add the basename to "
+                f"_HEARTBEAT_EXEMPT_SUFFIXES with a WHY comment."
+            )
+            continue
+        if not any(p in text for p in write_patterns):
+            violations.append(
+                f"{sh.relative_to(repo_root)}: mentions 'heartbeat' but no "
+                f"actual heartbeat-write pattern detected (expected one of: "
+                f"`>> \"$HEARTBEAT\"`, `>> $HEARTBEAT`, `>> \"$LOG_DIR/heartbeat.log\"`, "
+                f"or any `heartbeat.log` write). Add the canonical write "
+                f"loop or update _HEARTBEAT_EXEMPT_SUFFIXES."
+            )
+    return violations
+
+
+def check_remote_lane_scripts_have_heartbeat(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch lane scripts missing heartbeat-write pattern.
+
+    Reference: feedback_vastai_launch_returns_success_before_lane_starts.
+    Lane W/K/OS-V2 (2026-04-28) silently never started despite SSH + clone
+    success, wasting ~$2.50. Heartbeat.log freshness is the only ground-
+    truth readiness signal.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations = _scan_remote_lane_scripts_missing_heartbeat(root)
+
+    if verbose:
+        if violations:
+            print(f"  [lane-heartbeat] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [lane-heartbeat] OK: every remote_lane_*.sh writes a heartbeat (or is sweep-exempt)")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE LANE SCRIPTS MISSING HEARTBEAT:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 43 (2026-04-29): new remote_lane_*.sh scripts need controlled baseline
+#
+# Tuna-2 methodology: every new lane should identify a minimal-change
+# controlled baseline so a negative/positive result isolates one mechanism.
+# Scope is intentionally date-gated to scripts added/modified after
+# 2026-04-29. For tracked files we ask git for the latest followed commit; for
+# untracked or temp-repo tests we fall back to file mtime.
+# ════════════════════════════════════════════════════════════════════════════
+
+_CONTROLLED_BASELINE_CUTOFF = _dt.datetime(2026, 4, 29, tzinfo=_dt.timezone.utc)
+
+
+def _parse_git_iso_datetime(text: str) -> _dt.datetime | None:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _remote_lane_script_changed_after_cutoff(
+    sh: Path,
+    repo_root: Path,
+    cutoff: _dt.datetime,
+) -> bool:
+    rel = sh.relative_to(repo_root)
+    changed_at = None
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "log",
+                "-1",
+                "--follow",
+                "--format=%aI",
+                "--",
+                str(rel),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            changed_at = _parse_git_iso_datetime(proc.stdout)
+    except (OSError, subprocess.SubprocessError):
+        changed_at = None
+
+    if changed_at is None:
+        try:
+            changed_at = _dt.datetime.fromtimestamp(
+                sh.stat().st_mtime,
+                tz=_dt.timezone.utc,
+            )
+        except FileNotFoundError:
+            return False
+    if changed_at.tzinfo is None:
+        changed_at = changed_at.replace(tzinfo=_dt.timezone.utc)
+    return changed_at > cutoff
+
+
+def _scan_remote_lane_scripts_missing_controlled_baseline(
+    repo_root: Path,
+    cutoff: _dt.datetime = _CONTROLLED_BASELINE_CUTOFF,
+) -> list[str]:
+    violations: list[str] = []
+    scripts_dir = repo_root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        if not _remote_lane_script_changed_after_cutoff(sh, repo_root, cutoff):
+            continue
+        try:
+            text = sh.read_text(errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if "controlled_baseline" in text:
+            continue
+        violations.append(
+            f"{sh.relative_to(repo_root)}: missing `controlled_baseline` "
+            f"metadata. New Tuna-2 remote lane scripts added/modified after "
+            f"2026-04-29 should name a minimal-change controlled baseline "
+            f"(docs/lane_methodology.md) so lane comparisons isolate one "
+            f"mechanism."
+        )
+    return violations
+
+
+def check_remote_lane_scripts_have_controlled_baseline(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Warn when future remote lane scripts omit controlled_baseline metadata."""
+    root = repo_root or REPO_ROOT
+    violations = _scan_remote_lane_scripts_missing_controlled_baseline(root)
+
+    if verbose:
+        if violations:
+            print(f"  [controlled-baseline] {len(violations)} warning(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                "  [controlled-baseline] OK: qualifying remote_lane_*.sh "
+                "scripts declare controlled_baseline"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE LANE SCRIPTS MISSING CONTROLLED BASELINE:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 44 (2026-04-28): autograd.Function backward tests must check grad
+#                        DIRECTION / VALUE, not just `grad is not None`.
+#
+# Round 22 review meta-bug: the bit-STE Round 12/13/14/18 reviews silently
+# passed because the only assertion on `bits.grad` was
+# `assert bits.grad is not None`. A SIGN bug (positive grad pushing bits
+# down instead of up) hid for 4 review rounds before Round 21 finally caught
+# it. The CLAUDE.md anti-arbitrariness rule: gradient-correctness tests must
+# pin a number, a sign, or a comparison to a reference — finiteness is not
+# a correctness gate.
+#
+# This check scans `src/tac/tests/test_*.py`. For each test that mentions
+# any class extending `torch.autograd.Function`, we require the test to
+# also assert at least one of:
+#   - a numeric value on `.grad` (e.g., `pytest.approx(-0.04, ...)`)
+#   - a sign / comparison on `.grad` (e.g., `grad < 0`, `grad.item() > 0`)
+#   - a tensor comparison (e.g., `torch.allclose(grad, expected)`)
+#
+# Same-line waiver:
+#   `# GRADIENT_DIRECTION_NOT_REQUIRED:<reason>`
+# ════════════════════════════════════════════════════════════════════════════
+
+_GRAD_DIRECTION_WAIVER_TOKEN = "GRADIENT_DIRECTION_NOT_REQUIRED:"
+
+# Patterns that indicate a real gradient-direction / value assertion.
+# We keep this conservative: any of these substrings in the same test
+# function as a `.grad` reference satisfies the gate.
+_GRAD_DIRECTION_PATTERNS = (
+    "pytest.approx",
+    "approx(",  # e.g., `approx(-0.04)` after `from pytest import approx`
+    "torch.allclose",
+    "allclose(",
+    "torch.testing.assert_close",
+    "assert_close(",
+    ".grad <",
+    ".grad >",
+    ".grad.item() <",
+    ".grad.item() >",
+    ".grad ==",
+    ".grad.item() ==",
+    ".grad !=",
+    ".sign()",
+    "torch.sign",
+    "loss_decrease",  # canonical pattern: assert loss after grad-step lower
+    "loss_after",
+    "loss_before",
+    "torch.equal",
+    # Convergence via SGD step: `final <= initial` / `initial >= final`.
+    # Same idea as the loss-convergence patterns in Check 45 but specific
+    # to autograd.Function tests that take a manual gradient step.
+    "final <= initial",
+    "initial >= final",
+    "final < initial",
+    "initial > final",
+    # Indexed grad value/sign checks: `.grad[i].item() == X`,
+    # `.grad[i] < 0`, etc. Catches the canonical Round 22 pattern where
+    # specific elements are anchored. Use a regex below as well.
+)
+
+# Regex: indexed-grad value/sign check, e.g.
+#   `w.grad[0].item() == 1.0` or `bits.grad[1] < 0` or `w.grad[i, j] >= ...`
+_GRAD_DIRECTION_REGEX = re.compile(
+    r"\.grad\[[^\]]*\](?:\.item\(\))?\s*(?:==|!=|<=|>=|<|>)"
+)
+
+# Regex: magnitude check on a grad value, e.g.
+#   `abs(bits.grad.item()) < 1e-3` or `torch.abs(w.grad).max() < 0.5`
+# We use a permissive lookahead: any `abs(...)` containing `.grad` somewhere
+# inside, followed (within ~80 chars) by a comparison operator.
+_GRAD_MAGNITUDE_REGEX = re.compile(
+    r"abs\([^\n]*\.grad[^\n]{0,80}?[<>=!]=?"
+    r"|\.grad\.abs\(\)[^=<>!\n]{0,80}?[<>=!]"
+)
+
+
+def _scan_test_file_for_grad_direction(
+    path: Path, repo_root: Path
+) -> list[str]:
+    """For every test_* function that touches an autograd.Function backward,
+    flag if it does not assert grad direction / value.
+
+    Heuristic:
+      1. Find the imports/use of `torch.autograd.Function` subclasses in the
+         file (grep for `(torch.autograd.Function)` in class defs OR
+         `<Name>.apply(` calls where Name was bound to such a class earlier
+         in the file or imported).
+      2. For each top-level `def test_*` function: if the function body
+         references `.grad` AND any of the autograd.Function symbols, then
+         require one of `_GRAD_DIRECTION_PATTERNS` to also appear in the
+         function body. Otherwise FLAG.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    # Only scan test files
+    if "tests/" not in rel_s and "/tests/" not in rel_s:
+        return []
+    if not path.name.startswith("test_"):
+        return []
+
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return []
+
+    # 1. Collect names that are autograd.Function subclasses, either defined
+    #    here or imported. Conservative: any imported name from a *quant*,
+    #    *ste*, *self_compress*, *frozen_bit*, *fp4*, *fp8*, *learnable_bit*
+    #    module is suspicious. Plus any class def that subclasses
+    #    `torch.autograd.Function` or `Function` directly.
+    autograd_function_names: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                base_repr = ast.unparse(base) if hasattr(ast, "unparse") else ""
+                if "autograd.Function" in base_repr or base_repr == "Function":
+                    autograd_function_names.add(node.name)
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").lower()
+            # Heuristic: imports from known STE-bearing modules.
+            if any(tok in mod for tok in (
+                "quantization", "quant", "ste", "self_compress",
+                "frozen_bit", "fp4", "fp8", "learnable_bit",
+            )):
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    # Likely STE / Function-shaped name
+                    if (
+                        "STE" in name
+                        or name.endswith("Quantize")
+                        or name.endswith("Quant")
+                        or name.endswith("FakeQuant")
+                        or "Function" in name
+                    ):
+                        autograd_function_names.add(name)
+
+    if not autograd_function_names:
+        return []
+
+    # Build a quick line-table for waiver detection.
+    lines = text.splitlines()
+
+    violations: list[str] = []
+
+    # 2. Walk top-level test_* functions.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+
+        # Get function source-text body (use line range).
+        start = node.lineno - 1
+        end = (node.end_lineno or node.lineno)
+        body_lines = lines[start:end]
+        body_text = "\n".join(body_lines)
+
+        # Same-line waiver on the def-line itself counts.
+        def_line = lines[start] if start < len(lines) else ""
+        if _GRAD_DIRECTION_WAIVER_TOKEN in def_line:
+            continue
+
+        # Same-line waiver on ANY line inside the function body counts.
+        if _GRAD_DIRECTION_WAIVER_TOKEN in body_text:
+            continue
+
+        # Does the function reference any autograd.Function symbol?
+        touches_function = any(
+            name in body_text for name in autograd_function_names
+        )
+        if not touches_function:
+            continue
+
+        # Does the function reference `.grad`?
+        if ".grad" not in body_text:
+            continue
+
+        # Check: does the body include any direction / value assertion?
+        has_direction = (
+            any(pat in body_text for pat in _GRAD_DIRECTION_PATTERNS)
+            or bool(_GRAD_DIRECTION_REGEX.search(body_text))
+            or bool(_GRAD_MAGNITUDE_REGEX.search(body_text))
+        )
+        if has_direction:
+            continue
+
+        # Acceptable also: a numeric `.grad` index/comparison via subscript
+        # like `grad[0].item() == ...`. The patterns above cover this via
+        # `pytest.approx` / `==` / `<` / `>` etc.
+
+        violations.append(
+            f"{rel}:{node.lineno}: test '{node.name}' touches an autograd."
+            f"Function backward but only checks `grad is not None` / "
+            f"`isfinite(grad)` — NO direction/value assertion. Add one of: "
+            f"`pytest.approx(...)`, `torch.allclose(...)`, `assert grad < 0`, "
+            f"or a loss-decrease check after a gradient step. "
+            f"(Round 22 bit-STE sign bug hid for 4 review rounds because "
+            f"of this exact gap.) Waive with same-line "
+            f"`# {_GRAD_DIRECTION_WAIVER_TOKEN}<reason>`."
+        )
+
+    return violations
+
+
+def check_gradient_direction_tests_exist(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Backward tests for autograd.Function must check grad direction/value.
+
+    Reference: Round 22 bit-STE sign-bug post-mortem. The Round 12/13/14/18
+    council reviews dismissed the sign bug because the only `bits.grad`
+    assertion was `is not None`. Round 21 caught it via a hand-derived
+    numeric value. Structural fix: every test that exercises an autograd.
+    Function backward MUST assert sign, value, or a reference comparison.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    test_dir = root / "src" / "tac" / "tests"
+    if test_dir.exists():
+        for p in sorted(test_dir.rglob("test_*.py")):
+            if "__pycache__" in p.parts:
+                continue
+            n_scanned += 1
+            violations.extend(_scan_test_file_for_grad_direction(p, root))
+
+    if verbose:
+        if violations:
+            print(
+                f"  [grad-direction-tests] {len(violations)} violation(s) "
+                f"across {n_scanned} test file(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … (+{len(violations) - 20} more)")
+        else:
+            print(
+                f"  [grad-direction-tests] OK: {n_scanned} test file(s) "
+                f"scanned"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "GRADIENT-DIRECTION TESTS MISSING:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nRound 22 bit-STE sign bug hid for 4 review rounds because "
+            "the only assertion was `grad is not None`. Add direction/value "
+            "checks (pytest.approx, torch.allclose, sign comparison, or a "
+            "post-step loss-decrease check). Waive on the def-line with "
+            f"`# {_GRAD_DIRECTION_WAIVER_TOKEN}<reason>`."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 44b (2026-05-02): gradient-guided PoseNet proposal tools must patch
+#                         upstream no-grad preprocessing before backprop.
+#
+# The official upstream PoseNet preprocess path calls rgb_to_yuv6 through a
+# @torch.no_grad barrier. Gradient-guided proposal code that backprops through
+# `posenet.preprocess_input(...)` without patching it either crashes or produces
+# no usable direction signal. Exact rounded archive evaluation remains the score
+# truth; this check only protects proposal generation from a dead gradient.
+#
+# Same-line/file waiver: `POSENET_GRAD_PREPROCESS_WAIVER:<reason>`
+# ════════════════════════════════════════════════════════════════════════════
+
+_POSENET_GRAD_PREPROCESS_WAIVER_TOKEN = "POSENET_GRAD_PREPROCESS_WAIVER:"
+_POSENET_GRAD_PATCH_TOKENS = (
+    "patch_posenet_for_differentiable_search",
+    "make_scorers_differentiable",
+    "load_differentiable_scorers",
+    "patch_scorers_for_training",
+    "PoseNet preprocess_input kills gradients",
+)
+
+
+def _looks_like_posenet_gradient_proposal_tool(text: str) -> bool:
+    return (
+        "posenet.preprocess_input" in text
+        and (".backward(" in text or "torch.autograd.grad" in text)
+        and (
+            "gradient_delta_sets" in text
+            or "gradient-guided" in text
+            or "gradient guided" in text
+            or "proposal" in text
+        )
+    )
+
+
+def check_posenet_gradient_preprocess_patch(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard gradient-guided PoseNet proposal paths against dead gradients.
+
+    This is intentionally narrower than all scorer uses: exact eval and
+    inference paths should use the official no-grad scorer. The blocker is only
+    for optimization/proposal tools that explicitly backpropagate through
+    PoseNet preprocessing.
+    """
+    root = repo_root or REPO_ROOT
+    candidates = [
+        root / "experiments" / "line_search_pose_refinement.py",
+    ]
+    violations: list[str] = []
+    scanned = 0
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, FileNotFoundError):
+            continue
+        if _POSENET_GRAD_PREPROCESS_WAIVER_TOKEN in text:
+            continue
+        if not _looks_like_posenet_gradient_proposal_tool(text):
+            continue
+        scanned += 1
+        rel = path.relative_to(root) if path.is_absolute() else path
+        if not any(token in text for token in _POSENET_GRAD_PATCH_TOKENS):
+            violations.append(
+                f"{rel}: gradient-guided PoseNet proposal path calls "
+                "`posenet.preprocess_input(...)` and backpropagates, but does "
+                "not patch the upstream no-grad preprocessing. Call "
+                "`patch_posenet_for_differentiable_search(posenet)` or "
+                "`make_scorers_differentiable(...)` before optimization."
+            )
+        if "if not loss.requires_grad" not in text:
+            violations.append(
+                f"{rel}: gradient-guided PoseNet proposal path lacks an "
+                "`if not loss.requires_grad` fail-closed guard, so a future "
+                "preprocess refactor can silently remove the proposal signal."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [posenet-grad-preprocess] {len(violations)} violation(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(
+                "  [posenet-grad-preprocess] OK: "
+                f"{scanned} gradient proposal file(s) scanned"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "POSENET GRADIENT PREPROCESS PATCH VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nThe upstream PoseNet preprocess path has a no-grad YUV "
+            "conversion barrier. Gradient proposal tools must patch it and "
+            "also assert `loss.requires_grad` before backward. Waive only with "
+            f"`{_POSENET_GRAD_PREPROCESS_WAIVER_TOKEN}<reason>`."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 44c (2026-05-02): scorer/profile proposal tools must fail before
+#                          remote paid work when upstream scorer deps or DALI
+#                          are absent.
+#
+# The H100 active-subspace line-search runner failed twice before scoring:
+# first on missing `timm`, then after that fix on missing `nvidia.dali`.
+# This check pins the meta-pattern: tools that directly load upstream scorer
+# modules and `DaliVideoDataset` need an explicit dependency preflight that
+# includes the hash-pinned DALI bootstrap path, not only the Python scorer deps.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def check_line_search_scorer_runtime_preflight(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard GT-backed line-search tools against missing scorer/DALI deps."""
+    root = repo_root or REPO_ROOT
+    path = root / "experiments" / "line_search_pose_refinement.py"
+    violations: list[str] = []
+    if not path.exists():
+        return violations
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return violations
+
+    rel = path.relative_to(root) if path.is_absolute() else path
+    if "DaliVideoDataset" not in text and "upstream.modules" not in text:
+        return violations
+
+    required_tokens = {
+        "SCORER_RUNTIME_MODULES": "declares the scorer runtime dependency tuple",
+        '"nvidia.dali"': "requires DALI before GT-backed profile/search work",
+        '"timm"': "requires upstream PoseNet/FastViT deps before scorer imports",
+        "assert_scorer_runtime_dependencies_available": "has a reusable preflight helper",
+        "scripts/bootstrap_dali_hash_pinned.py": "points operators at the hash-pinned DALI bootstrap",
+    }
+    for token, reason in required_tokens.items():
+        if token not in text:
+            violations.append(f"{rel}: missing {token!r} ({reason})")
+
+    load_posenet_idx = text.find("def load_posenet")
+    helper_idx = text.find("assert_scorer_runtime_dependencies_available()", load_posenet_idx)
+    import_idx = text.find("from upstream.modules import PoseNet", load_posenet_idx)
+    if load_posenet_idx >= 0 and (helper_idx < 0 or (import_idx >= 0 and helper_idx > import_idx)):
+        violations.append(
+            f"{rel}: `load_posenet` must call "
+            "`assert_scorer_runtime_dependencies_available()` before importing "
+            "`upstream.modules.PoseNet`."
+        )
+
+    if verbose:
+        if violations:
+            print("  [line-search-scorer-runtime] " f"{len(violations)} violation(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print("  [line-search-scorer-runtime] OK: dependency preflight is fail-closed")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LINE-SEARCH SCORER RUNTIME PREFLIGHT VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+            + "\n\nGT-backed pose/search tools import upstream scorer modules "
+            "and DALI datasets. Missing runtime deps must fail before paid "
+            "remote work; use the repo runtime extra plus the hash-pinned "
+            "DALI bootstrap."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 45 (2026-04-28): tests of *loss* functions/classes must include at
+#                        least one convergence (loss-decrease) check.
+#
+# Companion to Check 44. Loss functions can return finite values that are
+# nonetheless un-minimisable (gradient pointing the wrong way). Tests that
+# only assert `loss.shape == ()` or `torch.isfinite(loss)` cannot detect
+# this. CLAUDE.md anti-arbitrariness: a loss-function test must demonstrate
+# the loss DECREASES under gradient descent (or has a known minimum at a
+# known point).
+#
+# Same-line waiver: `# LOSS_CONVERGENCE_NOT_REQUIRED:<reason>`
+# ════════════════════════════════════════════════════════════════════════════
+
+_LOSS_CONVERGENCE_WAIVER_TOKEN = "LOSS_CONVERGENCE_NOT_REQUIRED:"
+
+# Patterns that indicate a real loss-decrease / convergence assertion at the
+# FILE level. If a loss-touching file has any of these patterns, we accept
+# that file as a whole. Conservative on purpose: false-negatives are okay,
+# false-positives (telling a clean test it's broken) are not.
+_LOSS_CONVERGENCE_PATTERNS = (
+    "loss_after",
+    "loss_before",
+    "loss_decrease",
+    "loss_initial",
+    "loss_final",
+    "after_step",
+    "before_step",
+    "minimize",  # any reference to a minimisation / minimisable claim
+    "monotonic",
+    "decreases",
+    ".step()",  # SGD/Adam step → loss recomputed → can compare
+    "torch.optim",
+    "gradient descent",  # docstring marker
+    "GD step",
+    "convergence",
+    # Numeric anchor patterns (loss known to equal X at known input).
+    "pytest.approx",
+    "approx(",
+    "torch.allclose",
+    "torch.equal",
+    "assert_close",
+)
+
+
+def _scan_test_file_for_loss_convergence(
+    path: Path, repo_root: Path
+) -> list[str]:
+    """For each test file whose name contains 'loss' as a token (case-
+    insensitive), require that the file as a whole demonstrates a
+    convergence check.
+
+    "Loss" must appear as a token, not as a fragment ("lossless" does NOT
+    qualify — that's the lossless-coding test family, not a loss-function
+    test).
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    name = path.name.lower()
+    if not name.startswith("test_"):
+        return []
+    # Tokenize on '_' / '.' boundaries; require "loss" as its own token.
+    # 'lossless' / 'lossy' fragments do NOT count (different bug class).
+    tokens = re.split(r"[_.]", name)
+    if "loss" not in tokens:
+        return []
+
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    # Same-line waiver anywhere in the file for the WHOLE file.
+    if _LOSS_CONVERGENCE_WAIVER_TOKEN in text:
+        return []
+
+    # File-level acceptance: any of the convergence patterns in the file.
+    if any(pat in text for pat in _LOSS_CONVERGENCE_PATTERNS):
+        return []
+
+    # Find the first def test_* line for the violation lineno.
+    lineno = 1
+    for i, line in enumerate(text.splitlines(), start=1):
+        if line.lstrip().startswith("def test_"):
+            lineno = i
+            break
+
+    return [
+        f"{rel}:{lineno}: loss-function test file has no convergence check "
+        f"(no loss_after/loss_before pattern, no `.step()`, no "
+        f"`pytest.approx` / `torch.allclose` numeric anchor). A loss "
+        f"function can return finite values whose gradient still points the "
+        f"wrong way — finiteness is NOT a correctness gate. Add a "
+        f"loss-decrease assertion or a known-minimum numeric check. "
+        f"Waive with `# {_LOSS_CONVERGENCE_WAIVER_TOKEN}<reason>` anywhere "
+        f"in the file."
+    ]
+
+
+def check_test_assertion_strength_for_loss_functions(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Tests of *loss* functions must include a convergence / numeric anchor.
+
+    Companion to Check 44. A finite-but-wrong-direction loss is a known
+    failure mode (Lane B 6.5h proxy-MSE-only TTO produced 0.0007 proxy /
+    0.246 auth = 350× gap). Convergence tests catch this in seconds.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    test_dir = root / "src" / "tac" / "tests"
+    if test_dir.exists():
+        # Glob is permissive ("loss" anywhere); the scanner enforces the
+        # "loss as a token (not fragment)" rule and discards "lossless" /
+        # "lossy" filenames that are not loss-function tests.
+        for p in sorted(test_dir.rglob("test_*loss*.py")):
+            if "__pycache__" in p.parts:
+                continue
+            v = _scan_test_file_for_loss_convergence(p, root)
+            # Only count files actually validated (token check passed).
+            # Determine that by re-running the token check inline.
+            tokens = re.split(r"[_.]", p.name.lower())
+            if "loss" in tokens:
+                n_scanned += 1
+            violations.extend(v)
+
+    if verbose:
+        if violations:
+            print(
+                f"  [loss-convergence-tests] {len(violations)} violation(s) "
+                f"across {n_scanned} loss-test file(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [loss-convergence-tests] OK: {n_scanned} loss-test file(s) scanned"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LOSS-FUNCTION TESTS MISSING CONVERGENCE CHECK:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 46 (2026-04-28): every public quantizer / encoder needs a roundtrip
+#                        test (`unquantize(quantize(x))` ≈ `x`).
+#
+# A quantizer that silently drops dynamic range (or saturates / shifts) can
+# pass forward-shape and finiteness tests but corrupt the artifact at
+# inflate time. Roundtrip tests catch the failure mode in seconds.
+#
+# Same-line waiver: `# ROUNDTRIP_NOT_REQUIRED:<reason>`
+# ════════════════════════════════════════════════════════════════════════════
+
+_ROUNDTRIP_WAIVER_TOKEN = "ROUNDTRIP_NOT_REQUIRED:"
+
+# File-name globs: which modules count as "quantizer / encoder" producers.
+_QUANTIZER_FILE_PATTERNS = (
+    "*quant*.py",
+    "*codec*.py",
+    "*entropy*.py",
+)
+
+# Substrings in the corresponding test file that count as a roundtrip
+# assertion (decode/encode pair on the SAME tensor with allclose / equal).
+_ROUNDTRIP_PATTERNS = (
+    "torch.allclose",
+    "allclose(",
+    "torch.equal",
+    "torch.testing.assert_close",
+    "assert_close(",
+    "round_trip",
+    "roundtrip",
+    "round-trip",
+    "decode(encode",
+    "encode(decode",
+    "unquantize(quantize",
+    "dequantize(quantize",
+    "decompress(compress",
+    "decompress_archive",
+    "inverse_transform",
+)
+
+
+def _module_basename(p: Path) -> str:
+    return p.stem
+
+
+def _quantizer_modules(repo_root: Path) -> list[Path]:
+    out: list[Path] = []
+    src_dir = repo_root / "src" / "tac"
+    if not src_dir.exists():
+        return out
+    seen: set[Path] = set()
+    for pattern in _QUANTIZER_FILE_PATTERNS:
+        for p in src_dir.glob(pattern):
+            if p in seen:
+                continue
+            if p.name.startswith("test_"):
+                continue
+            seen.add(p)
+            out.append(p)
+    return sorted(out)
+
+
+def _has_public_class_or_function(path: Path) -> bool:
+    """True iff the module exposes at least one public top-level class or def."""
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
+            if not node.name.startswith("_"):
+                return True
+    return False
+
+
+def _find_test_files_for_module(
+    module_path: Path, repo_root: Path
+) -> list[Path]:
+    """Return test files that import from this module."""
+    test_dir = repo_root / "src" / "tac" / "tests"
+    if not test_dir.exists():
+        return []
+    mod_basename = _module_basename(module_path)
+    needle = f"tac.{mod_basename}"
+    out: list[Path] = []
+    # Direct convention: test_<basename>.py
+    direct = test_dir / f"test_{mod_basename}.py"
+    if direct.exists():
+        out.append(direct)
+    # Anything else that imports `tac.<basename>`
+    for p in test_dir.rglob("test_*.py"):
+        if "__pycache__" in p.parts:
+            continue
+        if p in out:
+            continue
+        try:
+            text = p.read_text()
+        except (UnicodeDecodeError, FileNotFoundError):
+            continue
+        if needle in text:
+            out.append(p)
+    return out
+
+
+def _scan_quantizer_for_roundtrip_test(
+    module_path: Path, repo_root: Path
+) -> list[str]:
+    rel = module_path.relative_to(repo_root) if module_path.is_absolute() else module_path
+    if not _has_public_class_or_function(module_path):
+        return []
+
+    # File-level waiver on the module itself.
+    try:
+        mod_text = module_path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    if _ROUNDTRIP_WAIVER_TOKEN in mod_text:
+        return []
+
+    test_files = _find_test_files_for_module(module_path, repo_root)
+    if not test_files:
+        return [
+            f"{rel}: quantizer/encoder module has no test file at "
+            f"src/tac/tests/test_{_module_basename(module_path)}.py and no "
+            f"other test imports it. Add a roundtrip test "
+            f"(`assert torch.allclose(decode(encode(x)), x, atol=...)`) or "
+            f"waive in the module with "
+            f"`# {_ROUNDTRIP_WAIVER_TOKEN}<reason>`."
+        ]
+
+    # If ANY test file for this module has a roundtrip pattern, accept.
+    for tf in test_files:
+        try:
+            ttext = tf.read_text()
+        except (UnicodeDecodeError, FileNotFoundError):
+            continue
+        if _ROUNDTRIP_WAIVER_TOKEN in ttext:
+            return []
+        if any(pat in ttext for pat in _ROUNDTRIP_PATTERNS):
+            return []
+
+    return [
+        f"{rel}: quantizer/encoder module has tests "
+        f"({', '.join(t.name for t in test_files)}) but no roundtrip "
+        f"assertion (no `torch.allclose`, no `decode(encode(...))`, no "
+        f"`roundtrip` substring, no `assert_close`). Add "
+        f"`assert torch.allclose(unquantize(quantize(x)), x, atol=...)` or "
+        f"waive on the module with `# {_ROUNDTRIP_WAIVER_TOKEN}<reason>`."
+    ]
+
+
+def check_quantizer_modules_have_round_trip_test(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Every public quantizer / encoder needs a `decode(encode(x)) ≈ x` test.
+
+    Reference: archive measurement disasters (2026-04-21) — quantizers
+    silently dropped dynamic range, passing forward-shape tests but
+    corrupting the inflated artifact. Roundtrip tests catch this in seconds.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for mod in _quantizer_modules(root):
+        n_scanned += 1
+        violations.extend(_scan_quantizer_for_roundtrip_test(mod, root))
+
+    if verbose:
+        if violations:
+            print(
+                f"  [quantizer-roundtrip-tests] {len(violations)} violation(s) "
+                f"across {n_scanned} quantizer/encoder module(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [quantizer-roundtrip-tests] OK: {n_scanned} module(s) scanned"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "QUANTIZER MODULES MISSING ROUNDTRIP TEST:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 47 (2026-04-28): scripts/remote_lane_*.sh that build an archive must
+#                        ASSERT the archive size BEFORE calling
+#                        contest_auth_eval / inflate.sh.
+#
+# Reference: Lane B class disasters where archive composition silently
+# changed the rate term (renderer-only 119 KB instead of 338 KB full
+# submission → 0.108 rate error per CLAUDE.md). The shell idiom
+# `ARCHIVE_BYTES=$(stat -c '%s' "$ARCHIVE" ...) && [ "$ARCHIVE_BYTES" -gt N ]`
+# OR a Python `os.path.getsize(...) >= N` assertion catches the failure
+# mode at compose time, not after a $0.50 eval.
+#
+# Same-line waiver: `# ARCHIVE_SIZE_NOT_REQUIRED:<reason>`
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARCHIVE_SIZE_WAIVER_TOKEN = "ARCHIVE_SIZE_NOT_REQUIRED:"
+
+# Substrings that indicate the script BUILDS an archive (vs. just consuming
+# one for eval). If none of these patterns appear, the script is exempt.
+_ARCHIVE_BUILD_MARKERS = (
+    "build_archive",
+    "submission_archive",
+    "ZipFile(",
+    "zipfile.ZipFile",
+    "zip.write",
+    "z.write(",
+    "shutil.copy",  # often used to assemble an archive directory
+)
+
+# Substrings that indicate auth eval / inflate is being invoked.
+_AUTH_EVAL_MARKERS = (
+    "contest_auth_eval",
+    "auth_eval_renderer",
+    "inflate.sh",
+    "evaluate.py",
+)
+
+# Substrings that satisfy the size-assertion gate. Either a shell-side
+# `[ "$X" -gt N ]` / `-le 0` style check OR a Python-side numeric compare.
+_ARCHIVE_SIZE_ASSERTION_PATTERNS = (
+    # Shell numeric guards on a captured size variable.
+    'ARCHIVE_BYTES',
+    'ARCHIVE_SIZE',
+    "stat -c '%s'",
+    'stat -c "%s"',
+    "stat -f '%z'",
+    'stat -f "%z"',
+    "wc -c",
+    "du -b",
+    "du -sb",
+    # Python-side: os.path.getsize / Path(...).stat().st_size etc with a
+    # numeric compare (we use the `assert ... getsize` substring as the
+    # gate; printing alone is NOT enough, but most scripts that check size
+    # also assert).
+    "assert os.path.getsize",
+    "assert os.stat",
+    "raise SystemExit",  # often used as size gate in inline Python
+    "size empty or zero",  # canonical lane_a_optimized phrasing
+    "refusing to call auth_eval",
+    " -le 0",
+    " -lt ",
+    " -gt ",
+)
+
+
+def _scan_remote_lane_for_archive_size_assertion(
+    path: Path, repo_root: Path
+) -> list[str]:
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    # File-level waiver.
+    if _ARCHIVE_SIZE_WAIVER_TOKEN in text:
+        return []
+
+    builds = any(m in text for m in _ARCHIVE_BUILD_MARKERS)
+    evals = any(m in text for m in _AUTH_EVAL_MARKERS)
+    if not (builds and evals):
+        return []
+
+    # Does the script include any size-assertion pattern?
+    if any(pat in text for pat in _ARCHIVE_SIZE_ASSERTION_PATTERNS):
+        return []
+
+    # Find the first auth-eval marker line for the violation lineno.
+    lineno = 1
+    for i, line in enumerate(text.splitlines(), start=1):
+        if any(m in line for m in _AUTH_EVAL_MARKERS):
+            lineno = i
+            break
+
+    return [
+        f"{rel}:{lineno}: lane script builds an archive AND invokes auth "
+        f"eval, but does not assert archive byte-size before the eval call. "
+        f"Add a guard like:\n"
+        f"      ARCHIVE_BYTES=$(stat -c '%s' \"$ARCHIVE\" 2>/dev/null || stat -f '%z' \"$ARCHIVE\")\n"
+        f"      [ \"$ARCHIVE_BYTES\" -gt 0 ] || {{ echo 'FATAL: archive empty'; exit 2; }}\n"
+        f"    Lane B-class disasters (renderer-only 119 KB vs 338 KB full "
+        f"submission) cost 0.108 rate points per CLAUDE.md. "
+        f"Waive with `# {_ARCHIVE_SIZE_WAIVER_TOKEN}<reason>`."
+    ]
+
+
+def check_lane_deploy_scripts_have_archive_size_assertion(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Lane scripts that build an archive must assert size before auth eval.
+
+    Reference: CLAUDE.md "Auth eval measurement — non-negotiable" — every
+    auth eval MUST use the EXACT archive that will be submitted, and the
+    archive size must be reported. Lane B's 119 KB renderer-only archive
+    silently inflated the rate term by 0.108 across multiple sessions. A
+    one-line shell guard catches this at compose time.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    scripts_dir = root / "scripts"
+    if scripts_dir.exists():
+        for p in sorted(scripts_dir.glob("remote_lane_*.sh")):
+            n_scanned += 1
+            violations.extend(
+                _scan_remote_lane_for_archive_size_assertion(p, root)
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [lane-archive-size] {len(violations)} violation(s) "
+                f"across {n_scanned} remote_lane_*.sh file(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [lane-archive-size] OK: {n_scanned} remote_lane_*.sh file(s) scanned"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE SCRIPTS MISSING ARCHIVE-SIZE ASSERTION:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check 48: orphan src/tac modules (no profile / CLI / script reference) ──
+#
+# CATCHES: a contributor adds src/tac/new_thing.py, never wires it into a
+# profile, CLI flag, or deploy script — silent dead code that bloats the
+# wheel and confuses future agents about what's actually shipped. Live at
+# session start (2026-04-28 evening): unknown count; check ships warn-only
+# initially because the audit is a real cleanup task, not a regression
+# blocker. Promotion to STRICT once the violation count is driven to 0.
+#
+# Reference: project_killed_lanes_forensic_audit_20260428 (Lane V channel
+# bug shipped because the 88K DSConv path was orphaned from real testing).
+
+
+# Modules that are intentionally library-only (imported by other tac
+# modules but not user-facing via a profile / CLI / script). Excluding
+# these prevents false positives — they're EXPECTED to be referenced only
+# via Python imports, not via a deploy script or profile knob.
+_ORPHAN_CHECK_EXEMPT_MODULES = {
+    "__init__", "__main__",
+    # Top-level entry / config modules (referenced by name from many places,
+    # not via `tac.<name>` import — exempt from this check's grep heuristic).
+    "profiles", "preflight", "cli", "entrypoints", "__main__",
+    # Library helpers / utilities (imported by other tac.* modules)
+    "bootstrap_codegen", "checkpoint_names", "cost_tracker",
+    "data", "models", "checkpoint", "evaluate", "parametrize_strip",
+}
+
+
+def check_no_orphan_src_tac_modules(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch src/tac/*.py modules with no profile / CLI / script reference.
+
+    For every src/tac/<name>.py (excluding tests/, tools/, experiments/, and
+    library-only exempts), at least one of the following must reference it:
+      1. An import inside src/tac/profiles.py (e.g., a profile knob calls it)
+      2. An import inside src/tac/experiments/train_renderer.py (CLI dispatch)
+      3. A `from tac.<name>` or `import tac.<name>` in any
+         scripts/remote_lane_*.sh's inline Python OR any experiments/*.py
+         actively used by remote scripts.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    src_tac = root / "src" / "tac"
+    if not src_tac.is_dir():
+        return []
+
+    # Enumerate candidate modules.
+    candidates: list[str] = []
+    for p in sorted(src_tac.glob("*.py")):
+        stem = p.stem
+        if stem in _ORPHAN_CHECK_EXEMPT_MODULES:
+            continue
+        if stem.startswith("_"):
+            continue
+        candidates.append(stem)
+
+    # Build the union of all reference texts.
+    profiles_text = ""
+    train_text = ""
+    profiles_path = src_tac / "profiles.py"
+    train_path = src_tac / "experiments" / "train_renderer.py"
+    try:
+        profiles_text = profiles_path.read_text()
+    except (OSError, UnicodeDecodeError):
+        pass
+    try:
+        train_text = train_path.read_text()
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    scripts_text = ""
+    scripts_dir = root / "scripts"
+    if scripts_dir.is_dir():
+        for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+            try:
+                scripts_text += sh.read_text() + "\n"
+            except (OSError, UnicodeDecodeError):
+                continue
+    experiments_text = ""
+    exp_dir = root / "experiments"
+    if exp_dir.is_dir():
+        for py in sorted(exp_dir.glob("*.py")):
+            try:
+                experiments_text += py.read_text() + "\n"
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    haystack = profiles_text + "\n" + train_text + "\n" + scripts_text + "\n" + experiments_text
+    violations: list[str] = []
+    for name in candidates:
+        # Match `tac.<name>` (import / from-import) — covers all 4 reference types.
+        pattern = rf"\btac\.{re.escape(name)}\b"
+        if not re.search(pattern, haystack):
+            violations.append(
+                f"src/tac/{name}.py: no reference in profiles.py / train_renderer.py / "
+                f"remote_lane_*.sh / experiments/*.py — orphan module suspected. "
+                f"If intentional library-only helper, add to _ORPHAN_CHECK_EXEMPT_MODULES."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [no-orphan-src-tac] {len(violations)} violation(s) "
+                f"across {len(candidates)} candidate module(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … and {len(violations) - 20} more")
+        else:
+            print(
+                f"  [no-orphan-src-tac] OK: {len(candidates)} module(s) all referenced"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "ORPHAN SRC/TAC MODULES (no profile / CLI / script reference):\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check 49: every profile loss_mode must be in train_renderer validator ──
+#
+# CATCHES: the Lane J-JBL exit class. A profile sets loss_mode="jbl" but
+# train_renderer.py's _VALID_LOSS_MODES allowlist (~line 888) doesn't
+# include "jbl" — the validator raises SystemExit at boot, the lane exits
+# unexpectedly. Lane J-JBL hit this on 2026-04-28; ~$0.05 burned + 1
+# debugging cycle. Catching at preflight time means the violation surfaces
+# at commit/PR, not after deploy.
+#
+# Reference: project_killed_lanes_forensic_audit_20260428 (Lane J-JBL section).
+
+
+def check_profile_loss_modes_in_validator_allowlist(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch profile.loss_mode values not in train_renderer.py allowlist.
+
+    Iterate every PROFILES entry; if it sets loss_mode, the value MUST
+    appear in _VALID_LOSS_MODES inside train_renderer.py. Otherwise the
+    validator raises at boot and the lane exits silently.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    train_path = root / "src" / "tac" / "experiments" / "train_renderer.py"
+    profiles_path = root / "src" / "tac" / "profiles.py"
+    if not train_path.is_file() or not profiles_path.is_file():
+        return []
+
+    try:
+        train_text = train_path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    # Extract the _VALID_LOSS_MODES tuple via regex (multi-line tuple support).
+    m = re.search(
+        r"_VALID_LOSS_MODES\s*=\s*\(([^)]*)\)",
+        train_text,
+        re.DOTALL,
+    )
+    if not m:
+        # Allowlist not present — can't validate. Treat as a warning, not a
+        # failure (the allowlist itself is enforced by code review).
+        if verbose:
+            print(
+                "  [profile-loss-mode-allowlist] WARN: _VALID_LOSS_MODES "
+                "tuple not found in train_renderer.py — skipping check"
+            )
+        return []
+    allowlist_raw = m.group(1)
+    allowed = set(re.findall(r'["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']', allowlist_raw))
+
+    # Import-time profile loading is fragile from preflight (heavy deps).
+    # Static-scan profiles.py for `"loss_mode":\s*"<value>"` literal pairs.
+    try:
+        profiles_text = profiles_path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    violations: list[str] = []
+    seen_values: set[str] = set()
+    # Match e.g. `"loss_mode": "jbl"` or `"loss_mode":"jbl"`.
+    for m2 in re.finditer(
+        r'["\']loss_mode["\']\s*:\s*["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']',
+        profiles_text,
+    ):
+        val = m2.group(1)
+        seen_values.add(val)
+    for val in sorted(seen_values):
+        if val not in allowed:
+            violations.append(
+                f"profiles.py declares loss_mode={val!r} but "
+                f"train_renderer.py _VALID_LOSS_MODES = {sorted(allowed)} "
+                f"does NOT include it. Profile will SystemExit at boot. "
+                f"Add {val!r} to _VALID_LOSS_MODES OR remove from profile."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [profile-loss-mode-allowlist] {len(violations)} "
+                f"violation(s) — allowed: {sorted(allowed)}"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [profile-loss-mode-allowlist] OK: profile loss_mode "
+                f"values {sorted(seen_values)} all in allowlist {sorted(allowed)}"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PROFILE LOSS_MODE NOT IN VALIDATOR ALLOWLIST:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ── Check 50: every deploy script --profile X must reference a real profile ──
+#
+# CATCHES: a deploy script passes `--profile some_typo` that never existed
+# in PROFILES; train_renderer.py raises KeyError after 5+ minutes of setup
+# burn (NVDEC probe, env init, package install). Catching at preflight
+# means the violation surfaces at commit time, before any GPU spend.
+#
+# Reference: project_killed_lanes_forensic_audit_20260428 (Lane H-V3
+# revival authoring required this check to land before the launch).
+
+
+def check_deploy_script_profiles_exist_in_registry(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Catch deploy scripts whose --profile X references unknown PROFILES.
+
+    For every scripts/remote_lane_*.sh file, extract every `--profile X`
+    invocation and verify X exists as a key in PROFILES (parsed statically
+    from src/tac/profiles.py — no Python import to keep preflight cheap).
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    profiles_path = root / "src" / "tac" / "profiles.py"
+    if not profiles_path.is_file():
+        return []
+
+    try:
+        profiles_text = profiles_path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    # Static-extract every PROFILES key. Match patterns like:
+    #   "h_v3_joint_halfframe": H_V3_JOINT_HALFFRAME,
+    # Inside the PROFILES dict.
+    # Conservative: just extract every double-quoted key from the file. A
+    # false-positive registration is acceptable (profile MIGHT exist); a
+    # false-negative is the bug class we want to catch.
+    registered: set[str] = set()
+    # Find the PROFILES = { ... } block bounds (best-effort: from PROFILES = { to the matching closing brace).
+    pm = re.search(r"PROFILES\s*=\s*\{", profiles_text)
+    if pm:
+        # Walk char-by-char to find the matching brace.
+        start = pm.end() - 1
+        depth = 0
+        end = len(profiles_text)
+        for i in range(start, len(profiles_text)):
+            c = profiles_text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        block = profiles_text[start:end]
+        # Extract keys: matching `"<name>":` at start of trimmed lines (best-effort).
+        for m2 in re.finditer(r'^\s*["\']([a-z_][a-z0-9_]*)["\']\s*:', block, re.MULTILINE):
+            registered.add(m2.group(1))
+
+    if not registered:
+        if verbose:
+            print(
+                "  [deploy-script-profile-exists] WARN: failed to "
+                "extract PROFILES keys — skipping check"
+            )
+        return []
+
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        return []
+
+    violations: list[str] = []
+    n_scanned = 0
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        n_scanned += 1
+        try:
+            text = sh.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = sh.relative_to(root)
+        # Match `--profile <name>` (next-token). Also match
+        # `--profile=<name>` and bash interpolations starting with $.
+        for m3 in re.finditer(
+            r"--profile[\s=]+([a-zA-Z0-9_\$\{\}-]+)",
+            text,
+        ):
+            ref = m3.group(1)
+            # Skip bash interpolations (operator-supplied at runtime).
+            if "$" in ref:
+                continue
+            # Skip dynamic placeholders.
+            if not re.fullmatch(r"[a-z_][a-z0-9_]*", ref):
+                continue
+            if ref not in registered:
+                violations.append(
+                    f"{rel}: --profile {ref!r} not in PROFILES registry. "
+                    f"Add to src/tac/profiles.py PROFILES dict OR fix typo. "
+                    f"Available: {sorted(registered)[:5]}…"
+                )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [deploy-script-profile-exists] {len(violations)} "
+                f"violation(s) across {n_scanned} remote_lane_*.sh:"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [deploy-script-profile-exists] OK: {n_scanned} "
+                f"remote_lane_*.sh scanned, all --profile X resolve in PROFILES"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "DEPLOY SCRIPT --profile X REFERENCES MISSING PROFILE:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check 51: bare `except:` and `except Exception: pass` ─────────────────────
+#
+# CATCHES the silent-swallow bug class: any handler that catches all
+# exceptions without logging or re-raising hides bugs forever. We saw this
+# in tools/fleet_dashboard_live.py (commit on 2026-04-28) where a
+# `try: tag = cmd.split("--tag")[1].strip().split()[0]; except: pass` masked
+# real failures. This check forbids:
+#   - Bare `except:` (catches BaseException including KeyboardInterrupt)
+#   - `except Exception: pass` (silent-swallow with no log)
+#
+# Allowed:
+#   - Specific exceptions: `except IndexError:`, `except (OSError, ValueError):`
+#   - Bare `except Exception` followed by logging / re-raise / clear handling
+#
+# Exemptions: tests/, vendored upstream/, this preflight.py file itself
+# (where regex pattern strings include `except:` literal text), and any line
+# with a SAME-LINE waiver marker `# noqa: E722` or `# silent-swallow-OK:`.
+#
+# Reference: feedback_deep_hardening_pass_2_patterns_20260428 +
+# 2026-04-28 deep DX hardening pass.
+
+_BARE_EXCEPT_RE = re.compile(r"^\s*except\s*:\s*(?:#.*)?$")
+_EXCEPT_EXCEPTION_PASS_RE = re.compile(
+    r"^\s*except\s+Exception\s*(?:as\s+\w+)?\s*:\s*pass\s*(?:#.*)?$"
+)
+
+
+def check_no_bare_except(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid bare except: and `except Exception: pass`.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    skip_dirs = {
+        "tests", "test", "upstream", "node_modules", ".venv", "venv",
+        "build", "dist", "__pycache__",
+    }
+    for py_path in sorted(root.rglob("*.py")):
+        # Skip the preflight file itself (contains regex patterns like
+        # `except:` as string literals that would false-positive).
+        if py_path.resolve() == Path(__file__).resolve():
+            continue
+        # Skip vendored / test / build dirs.
+        rel_parts = py_path.relative_to(root).parts
+        if any(p in skip_dirs for p in rel_parts):
+            continue
+        # Only scan src/tac, scripts/, tools/, experiments/.
+        top = rel_parts[0] if rel_parts else ""
+        if top not in {"src", "scripts", "tools", "experiments"}:
+            continue
+        try:
+            text = py_path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        n_scanned += 1
+        for i, line in enumerate(text.splitlines(), start=1):
+            # Honor same-line waiver markers.
+            if "# noqa: E722" in line or "# silent-swallow-OK" in line:
+                continue
+            if _BARE_EXCEPT_RE.match(line):
+                rel = py_path.relative_to(root)
+                violations.append(
+                    f"{rel}:{i}: bare `except:` — catches BaseException "
+                    f"including KeyboardInterrupt. Use specific exception type "
+                    f"OR add `# noqa: E722` if intentional."
+                )
+            elif _EXCEPT_EXCEPTION_PASS_RE.match(line):
+                rel = py_path.relative_to(root)
+                violations.append(
+                    f"{rel}:{i}: `except Exception: pass` silently swallows "
+                    f"errors. Log the exception OR catch a specific subclass "
+                    f"OR add `# silent-swallow-OK: <reason>`."
+                )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [no-bare-except] {len(violations)} violation(s) "
+                f"across {n_scanned} files:"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(f"  [no-bare-except] OK: {n_scanned} files clean")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "BARE EXCEPT / SILENT-SWALLOW VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check 52: subprocess.run() returncode must be checked ─────────────────────
+#
+# CATCHES the silent-success bug class: `result = subprocess.run(...)` with
+# no `.returncode` check downstream, no `check=True`, and no explicit
+# discard. This is exactly how the LANE-B `set -uo pipefail` cascade hid
+# silent failures (memory: feedback_zip_dep_bootstrap_trap). At Python
+# level the equivalent is:
+#
+#   result = subprocess.run([...])
+#   # ... no result.returncode check anywhere ...
+#
+# Allowed:
+#   - `subprocess.run([...], check=True)` — raises CalledProcessError
+#   - `r = subprocess.run([...]); if r.returncode != 0: ...` — explicit
+#   - `subprocess.run([...], check=False)` — explicit opt-out
+#   - Same-line `# subprocess-no-check-OK: <reason>` waiver
+#
+# Heuristic: scan for `subprocess.run(` and verify ONE of:
+#   1. `check=True` in the call's parens (single-line)
+#   2. The return value is captured AND `.returncode` appears within the
+#      next 50 lines.
+#   3. Same-line waiver.
+#
+# This is intentionally a loose check (warn-only initially) because perfect
+# AST analysis of variable lifetimes is brittle. Promote to strict after
+# a one-time cleanup pass.
+
+def check_subprocess_run_checked(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Warn on `subprocess.run(...)` without check=True or returncode check.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    skip_dirs = {
+        "tests", "test", "upstream", "node_modules", ".venv", "venv",
+        "build", "dist", "__pycache__",
+        # Vendored python interpreter trees harvested from remote runs
+        "site-packages", "uv_project_env", "uv-cache", ".cache",
+    }
+    # Vendored / third-party intake snapshots — same exclude markers as the
+    # MPS-fallback check above. We can't fix code we don't own; intake
+    # directories are evidence of public-PR state, not our authored code.
+    _VENDORED_INTAKE_MARKERS = (
+        "/pr_heads/",
+        "/leaderboard_intel_",
+        "/reverse_engineering_",
+        "/public_runtime_adapters_",
+        "/raw/kaggle_ingest/",
+        "/vendored/",
+        "_intake_",
+        "/av1_crf31_bicubic/",
+    )
+    for py_path in sorted(root.rglob("*.py")):
+        if py_path.resolve() == Path(__file__).resolve():
+            continue
+        rel_parts = py_path.relative_to(root).parts
+        if any(p in skip_dirs for p in rel_parts):
+            continue
+        top = rel_parts[0] if rel_parts else ""
+        if top not in {"src", "scripts", "tools", "experiments"}:
+            continue
+        rel_s = str(py_path.relative_to(root))
+        if any(marker in rel_s for marker in _VENDORED_INTAKE_MARKERS):
+            continue
+        try:
+            text = py_path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        n_scanned += 1
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if "subprocess.run(" not in line:
+                continue
+            # Skip pure-comment lines (text mention, not actual call site).
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            # Same-line waiver
+            if "# subprocess-no-check-OK" in line:
+                continue
+            # Common safe patterns on the same line
+            if "check=True" in line or "check = True" in line:
+                continue
+            # Multi-line call: scan next 8 lines for check=True
+            window = "\n".join(lines[i:i + 8])
+            if "check=True" in window or "check = True" in window:
+                continue
+            if "check=False" in window or "check = False" in window:
+                # Explicit opt-out — accept (operator made an active choice).
+                continue
+            # If the return value is captured (e.g., `r =` or `result =`),
+            # look forward up to 50 lines for a `.returncode` reference.
+            assignment = re.match(r"^\s*(\w+)\s*=\s*subprocess\.run", line)
+            if assignment:
+                varname = assignment.group(1)
+                lookahead = "\n".join(lines[i:i + 50])
+                if f"{varname}.returncode" in lookahead:
+                    continue
+                if f"{varname}.check_returncode" in lookahead:
+                    continue
+            else:
+                # Not assigned — if the call discards the result and is in a
+                # context where failures don't matter (e.g., bootstrap script),
+                # the operator should waive explicitly.
+                pass
+            rel = py_path.relative_to(root)
+            violations.append(
+                f"{rel}:{i + 1}: subprocess.run() without check=True or "
+                f"returncode check. Use check=True OR capture + check "
+                f"`.returncode` OR add `# subprocess-no-check-OK: <reason>`."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [subprocess-run-checked] {len(violations)} violation(s) "
+                f"across {n_scanned} files (warn-only — promote after cleanup):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(f"  [subprocess-run-checked] OK: {n_scanned} files clean")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SUBPROCESS.RUN WITHOUT CHECK= VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check 53: tools/*.py must have non-empty --help ───────────────────────────
+#
+# CATCHES the operator-discoverability bug: a tool ships without argparse
+# wired up, so `--help` either errors or prints nothing. Operators then
+# can't find the tool's options without reading the source. This check
+# verifies every executable script under tools/ AND scripts/*.py
+# (excluding bootstrap shell scripts) accepts `--help` AND emits non-empty
+# output.
+#
+# Heuristic: STATIC scan only (no subprocess invocation at preflight time
+# because that would require imports to succeed and may have side effects).
+# Verify that the file contains either:
+#   - `argparse.ArgumentParser(`
+#   - `import argparse` AND `add_argument(`
+#   - `import click` (click auto-generates --help)
+#   - Same-line `# no-argparse-OK: <reason>` waiver in a top-level comment
+#
+# Skipped: __init__.py, anything starting with `_`.
+
+def check_tools_have_argparse(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Verify tools/*.py have argparse / click for --help discoverability.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for tools_dir_name in ("tools", "scripts"):
+        tools_dir = root / tools_dir_name
+        if not tools_dir.is_dir():
+            continue
+        for py_path in sorted(tools_dir.glob("*.py")):
+            if py_path.name.startswith("_") or py_path.name == "__init__.py":
+                continue
+            try:
+                text = py_path.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            n_scanned += 1
+            # Same-line waiver in any top-level comment within the first 30 lines.
+            head = "\n".join(text.splitlines()[:30])
+            if "# no-argparse-OK" in head:
+                continue
+            # Must have a `__main__` entry to be a CLI.
+            if "__name__" not in text or "__main__" not in text:
+                continue  # library helper, not a CLI
+            has_argparse = "ArgumentParser(" in text or (
+                "import argparse" in text and "add_argument(" in text
+            )
+            has_click = "import click" in text or "from click" in text
+            if not (has_argparse or has_click):
+                rel = py_path.relative_to(root)
+                violations.append(
+                    f"{rel}: __main__ entry but no argparse/click — operators "
+                    f"can't discover options via --help. Add an "
+                    f"argparse.ArgumentParser OR `# no-argparse-OK: <reason>` "
+                    f"in the top docstring."
+                )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [tools-have-argparse] {len(violations)} violation(s) "
+                f"across {n_scanned} CLI scripts:"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(f"  [tools-have-argparse] OK: {n_scanned} CLI scripts clean")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "CLI SCRIPTS WITHOUT --help:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 54 (54th meta-bug): scripts/launch_lane_on_vastai.py phase2-launch
+#                          MUST call _poll_setup_log_for_outcome OR
+#                          honor a skip_post_verify opt-in. Closes the
+#                          "phase2-launch returns success before lane
+#                          starts" regression class.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: Today wasted ~$10 on 87% NVDEC_BAD Vast.ai 4090 hosts because
+# phase2-launch returned success the moment SSH+tmux backgrounded the lane
+# wrapper — but setup_full.sh would then crash on Stage 4 NVDEC probe and
+# the operator only learned about it 5+ minutes later via heartbeat.
+#
+# Fix landed in two layers:
+#   Layer 1 DETECTION (commit 58e55890): scripts/probe_nvdec.sh
+#     --lightweight at setup_full.sh Stage 0.5 catches ~95% of
+#     NVDEC-missing hosts BEFORE the 5-minute DALI install.
+#   Layer 2 ACTION  (commit 5acebb88-ish): launch_lane_on_vastai.py
+#     phase2-launch Stage 2 polls setup.log via
+#     _poll_setup_log_for_outcome() and auto-destroys NVDEC_BAD hosts.
+#
+# Without Layer 2, the canonical workflow regresses to fire-and-forget
+# silent-failure mode. This check makes Layer 2 structurally permanent:
+# any future refactor that drops the post-launch poll fails preflight.
+#
+# Memory: feedback_canonical_nvdec_workflow_GUARD_20260428,
+#         feedback_vastai_launch_returns_success_before_lane_starts.
+
+def check_phase2_launch_polls_setup_log(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid phase2-launch refactors that drop the post-launch outcome poll.
+
+    The launcher's phase2-launch must either:
+      (a) call ``_poll_setup_log_for_outcome(host, port, instance_id, ...)``
+          to detect NVDEC_BAD / SETUP_COMPLETE on the lane host, OR
+      (b) honor a ``skip_post_verify`` opt-in (``getattr(args,
+          "skip_post_verify", False)``) for explicit fire-and-forget.
+
+    Closes the "phase2-launch returns success before lane starts"
+    regression class (see feedback_canonical_nvdec_workflow_GUARD_20260428).
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    target = root / "scripts" / "launch_lane_on_vastai.py"
+    violations: list[str] = []
+
+    if not target.is_file():
+        if verbose:
+            print(f"  [phase2-launch-poll] SKIP: {target} not present")
+        return violations
+
+    try:
+        text = target.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        violations.append(f"{target.relative_to(root)}: cannot read — {e}")
+        if strict:
+            raise MetaBugViolation(violations[0])
+        return violations
+
+    try:
+        tree = ast.parse(text, filename=str(target))
+    except SyntaxError as e:
+        violations.append(
+            f"{target.relative_to(root)}: SyntaxError ({e}) — cannot AST-scan"
+        )
+        if strict:
+            raise MetaBugViolation(violations[0])
+        return violations
+
+    # Locate the cmd_phase2_launch function definition.
+    target_func: ast.FunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_phase2_launch":
+            target_func = node
+            break
+
+    if target_func is None:
+        violations.append(
+            f"{target.relative_to(root)}: cmd_phase2_launch function not "
+            f"found — the launcher must define a phase2-launch subcommand "
+            f"that polls setup.log for NVDEC_BAD outcomes."
+        )
+    else:
+        has_poll_call = False
+        has_skip_opt_in = False
+        for sub in ast.walk(target_func):
+            if isinstance(sub, ast.Call):
+                func_str = (
+                    ast.unparse(sub.func) if hasattr(ast, "unparse") else ""
+                )
+                # Match _poll_setup_log_for_outcome(...) or any call whose
+                # function name ends with that token (allows future module
+                # qualification, e.g. helpers._poll_setup_log_for_outcome).
+                if (
+                    func_str == "_poll_setup_log_for_outcome"
+                    or func_str.endswith("._poll_setup_log_for_outcome")
+                ):
+                    has_poll_call = True
+                # Match getattr(args, "skip_post_verify", False) opt-in
+                # (any 3-arg getattr whose 2nd literal is the flag name).
+                if (
+                    func_str == "getattr"
+                    and len(sub.args) >= 2
+                    and isinstance(sub.args[1], ast.Constant)
+                    and sub.args[1].value == "skip_post_verify"
+                ):
+                    has_skip_opt_in = True
+        if not (has_poll_call and has_skip_opt_in):
+            missing = []
+            if not has_poll_call:
+                missing.append("_poll_setup_log_for_outcome(...) call")
+            if not has_skip_opt_in:
+                missing.append('getattr(args, "skip_post_verify", False) opt-in')
+            violations.append(
+                f"{target.relative_to(root)}: cmd_phase2_launch missing "
+                f"{' AND '.join(missing)}. Closes the "
+                f"phase2-launch-returns-success-before-lane-starts regression "
+                f"class. See feedback_canonical_nvdec_workflow_GUARD_20260428."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [phase2-launch-poll] {len(violations)} violation(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [phase2-launch-poll] OK: cmd_phase2_launch polls "
+                f"setup.log AND honors skip_post_verify opt-in"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PHASE2-LAUNCH POLL VIOLATIONS — the launcher's phase2-launch "
+            "must call _poll_setup_log_for_outcome AND honor a "
+            "skip_post_verify opt-in. Without the poll, NVDEC-bad hosts "
+            "burn $0.05-0.10 each (today's wave: ~$10 on 87% NVDEC_BAD).\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 55 (55th meta-bug): scripts/remote_setup_full.sh MUST invoke
+#                          probe_nvdec.sh --lightweight at Stage 0.5
+#                          BEFORE Stage 3 nvidia-dali-cuda120 install.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: companion to Check 54. The deep DALI-based NVDEC probe at
+# Stage 4 runs AFTER a 5-minute `pip install nvidia-dali-cuda120` in
+# Stage 3, costing $0.05+ per bad-NVDEC host. The lightweight pre-probe
+# at Stage 0.5 dlopens libnvcuvid.so + cuvidGetDecoderCaps via ctypes —
+# DALI-free, ~3s, catches ~95% of NVDEC-missing hosts BEFORE the heavy
+# install.
+#
+# This check enforces ordering: if the script defines BOTH
+# probe_nvdec.sh --lightweight AND a nvidia-dali-cuda120 install, the
+# probe must come FIRST. A script that has neither is exempt (opt-out:
+# the canonical setup is the only one in-tree, but third-party variants
+# may not need DALI).
+
+def check_setup_full_probe_before_dali(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid setup_full.sh refactors that move the lightweight NVDEC
+    probe AFTER the DALI install (defeating the savings purpose).
+
+    Scans ``scripts/remote_setup_full.sh`` for the FIRST occurrence of:
+      - ``probe_nvdec.sh --lightweight``  → line N1
+      - ``nvidia-dali-cuda120`` install OR ``Stage 3`` marker  → line N2
+
+    Asserts N1 < N2. A file with neither is exempt (no DALI install ⇒
+    no savings to defeat).
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    target = root / "scripts" / "remote_setup_full.sh"
+    violations: list[str] = []
+
+    if not target.is_file():
+        if verbose:
+            print(f"  [setup-full-probe-order] SKIP: {target} not present")
+        return violations
+
+    try:
+        text = target.read_text(errors="ignore")
+    except OSError as e:
+        violations.append(f"{target.relative_to(root)}: cannot read — {e}")
+        if strict:
+            raise MetaBugViolation(violations[0])
+        return violations
+
+    # Strip comment-only lines so docstring references don't count for
+    # the ordering check (preserve line indices via space-padding).
+    scan_lines: list[str] = []
+    for line in text.split("\n"):
+        if line.lstrip().startswith("#"):
+            scan_lines.append(" " * len(line))
+        else:
+            scan_lines.append(line)
+
+    # Match `probe_nvdec.sh` (allowing intervening quotes/whitespace from
+    # `bash "$WORKSPACE/scripts/probe_nvdec.sh" --lightweight`) followed by
+    # `--lightweight` flag anywhere on the same line.
+    probe_re = re.compile(r"probe_nvdec\.sh[\"'\s]*--lightweight\b")
+    probe_line: int | None = None
+    dali_line: int | None = None
+    for i, line in enumerate(scan_lines, start=1):
+        if probe_line is None and probe_re.search(line):
+            probe_line = i
+        if dali_line is None and (
+            "nvidia-dali-cuda120" in line
+            or "=== Stage 3" in line
+        ):
+            dali_line = i
+
+    # Opt-out: neither marker present ⇒ no DALI savings to defeat.
+    if probe_line is None and dali_line is None:
+        if verbose:
+            print(
+                f"  [setup-full-probe-order] OK: {target.relative_to(root)} "
+                f"has neither probe nor DALI install (opt-out)"
+            )
+        return violations
+
+    if probe_line is None:
+        violations.append(
+            f"{target.relative_to(root)}: nvidia-dali-cuda120 install "
+            f"present (line {dali_line}) but no `probe_nvdec.sh "
+            f"--lightweight` Stage 0.5 pre-probe. Add the lightweight "
+            f"probe BEFORE Stage 3 to save $0.05+/bad-NVDEC host."
+        )
+    elif dali_line is None:
+        # Probe but no DALI — fine, nothing to defeat.
+        if verbose:
+            print(
+                f"  [setup-full-probe-order] OK: probe present (line "
+                f"{probe_line}); no DALI install to defeat"
+            )
+        return violations
+    elif probe_line >= dali_line:
+        violations.append(
+            f"{target.relative_to(root)}: `probe_nvdec.sh --lightweight` "
+            f"at line {probe_line} runs AFTER nvidia-dali-cuda120 install "
+            f"at line {dali_line} — defeats the savings purpose. Move "
+            f"probe to Stage 0.5 BEFORE Stage 3 DALI install. See "
+            f"feedback_canonical_nvdec_workflow_GUARD_20260428."
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [setup-full-probe-order] {len(violations)} violation(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [setup-full-probe-order] OK: probe@line{probe_line} "
+                f"runs BEFORE DALI@line{dali_line}"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "SETUP_FULL NVDEC PROBE ORDER VIOLATIONS — the lightweight "
+            "NVDEC pre-probe must run BEFORE Stage 3 DALI install. "
+            "Without it, every bad-NVDEC host pays the 5-minute DALI "
+            "install cost before failing.\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 56 (56th meta-bug): scripts/verify_vast_instances.py auto-destroy
+#                          path must use BOTH IDLE stale-minutes AND
+#                          SETUP setup-stale-minutes thresholds.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: companion to the R31 cross-cutting SETUP-stuck cost-leak
+# fix. The verify script's --auto-destroy-stale path originally only
+# fired on IDLE/CRASHED — but a TRULY hung setup_full.sh (deadlocked,
+# no heartbeat ever written) is classified SETUP, not IDLE. The IDLE
+# stale-minutes threshold compares heartbeat freshness; with no
+# heartbeat, that comparison never fires, so the instance accrues
+# cost silently forever.
+#
+# This check enforces the dual-threshold pattern: any future refactor
+# that drops EITHER the IDLE timer OR the SETUP timer fails preflight.
+# Class of bug: heuristic-based health classifier with no timeout for
+# the in-flight SETUP state.
+
+def check_verify_vast_setup_stuck_dual_threshold(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid verify_vast_instances.py refactors that drop the
+    SETUP-stale or IDLE-stale half of the dual-threshold auto-destroy.
+
+    Scans ``scripts/verify_vast_instances.py`` for:
+      1. CLI flag definition: ``--setup-stale-minutes``
+      2. CLI flag definition: ``--stale-minutes``
+      3. Auto-destroy path consults SETUP age (``setup_age_minutes``
+         or ``setup_stale_minutes`` referenced inside the
+         ``auto_destroy_stale`` branch)
+      4. Auto-destroy path consults IDLE/CRASHED classification
+
+    A repo missing the file is exempt (skip).
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    target = root / "scripts" / "verify_vast_instances.py"
+    violations: list[str] = []
+
+    if not target.is_file():
+        if verbose:
+            print(
+                f"  [verify-vast-dual-threshold] SKIP: "
+                f"{target} not present"
+            )
+        return violations
+
+    try:
+        text = target.read_text(errors="ignore")
+    except OSError as e:
+        violations.append(f"{target.relative_to(root)}: cannot read — {e}")
+        if strict:
+            raise MetaBugViolation(violations[0])
+        return violations
+
+    # 1. CLI flag definitions.
+    if '"--setup-stale-minutes"' not in text and "'--setup-stale-minutes'" not in text:
+        violations.append(
+            f"{target.relative_to(root)}: missing CLI flag "
+            f"`--setup-stale-minutes` definition. Without it, SETUP-"
+            f"stuck instances (deadlocked setup_full.sh, never write "
+            f"heartbeat) accrue cost silently forever — the IDLE "
+            f"timer never fires because there's no heartbeat to be "
+            f"stale. See feedback_setup_stuck_cost_leak_FIXED_20260428."
+        )
+    if '"--stale-minutes"' not in text and "'--stale-minutes'" not in text:
+        violations.append(
+            f"{target.relative_to(root)}: missing CLI flag "
+            f"`--stale-minutes` definition (IDLE heartbeat-age "
+            f"threshold). Half of the dual-threshold pattern."
+        )
+
+    # 2. Locate the auto-destroy block. Tolerate either snake_case
+    # (args.auto_destroy_stale) or hyphenated CLI form references in
+    # comments/strings; only the snake_case attribute matters.
+    if "args.auto_destroy_stale" not in text:
+        violations.append(
+            f"{target.relative_to(root)}: missing "
+            f"`args.auto_destroy_stale` branch — the auto-destroy "
+            f"path is the only place the dual-threshold matters."
+        )
+    else:
+        # Slice from the auto_destroy_stale branch onwards. We don't
+        # need exact AST analysis — substring presence in the rest of
+        # the file is sufficient evidence the path consults each
+        # threshold.
+        idx = text.find("args.auto_destroy_stale")
+        tail = text[idx:]
+
+        # 3. SETUP-side: must reference either the per-health setup
+        # age field OR the CLI flag.
+        if (
+            "setup_age_minutes" not in tail
+            and "setup_stale_minutes" not in tail
+        ):
+            violations.append(
+                f"{target.relative_to(root)}: auto-destroy branch "
+                f"doesn't reference `setup_age_minutes` or "
+                f"`setup_stale_minutes` — SETUP-stuck instances "
+                f"will leak cost. Add a stuck-SETUP filter to the "
+                f"to_destroy list."
+            )
+
+        # 4. IDLE-side: must still classify on IDLE/CRASHED.
+        if '"IDLE"' not in tail and "'IDLE'" not in tail:
+            violations.append(
+                f"{target.relative_to(root)}: auto-destroy branch "
+                f"doesn't reference the IDLE classification — half of "
+                f"the dual-threshold pattern is gone."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [verify-vast-dual-threshold] "
+                f"{len(violations)} violation(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [verify-vast-dual-threshold] OK: "
+                f"--stale-minutes (IDLE) AND --setup-stale-minutes "
+                f"(SETUP) both wired into auto-destroy"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "VERIFY_VAST_INSTANCES DUAL-THRESHOLD VIOLATIONS — the "
+            "auto-destroy path must use BOTH --stale-minutes (IDLE "
+            "heartbeat freshness) AND --setup-stale-minutes "
+            "(SETUP first-seen age). Dropping either half re-introduces "
+            "the SETUP-stuck cost-leak class.\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 57 (57th meta-bug): scripts/remote_lane_*.sh git-sync MUST use the
+#                          canonical fetch+reset pattern, NOT bare
+#                          `git pull --ff-only`.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: Lane Q-FAITHFUL (highest-EV lane, predicted [0.40, 0.80]) crashed
+# with `FATAL: git pull failed -- remote has uncommitted/conflicting changes`
+# after Vast.ai reused a workspace from a prior failed deploy. `git pull
+# --ff-only` aborts on uncommitted local junk; the canonical fix is
+#
+#   git fetch origin main && git reset --hard origin/main
+#
+# which discards local divergence and syncs to origin/main exactly. ANY future
+# refactor that re-introduces bare `git pull --ff-only` (without a SAME-LINE
+# `# GIT_SYNC_OPT_OUT:<reason>` waiver) fails preflight at commit/PR time.
+#
+# This check enforces:
+#   1. Any lane script that performs git sync (uses `git pull`, `git fetch`,
+#      OR `git reset` against origin) MUST use the canonical fetch+reset
+#      pattern.
+#   2. Bare `git pull --ff-only` is FORBIDDEN unless a SAME-LINE waiver
+#      `# GIT_SYNC_OPT_OUT:<reason>` is present.
+#   3. Lane scripts that do NO git sync at all are exempt (they trust the
+#      parent launcher to deploy a clean checkout).
+#
+# Live count after Fix 1 (canonical-pattern landing): 0.
+
+def check_lane_scripts_use_canonical_git_sync(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid lane scripts from using fragile `git pull --ff-only` which
+    aborts on stale Vast.ai workspaces. Require the canonical
+    `git fetch origin main && git reset --hard origin/main` pattern.
+
+    Scans ``scripts/remote_lane_*.sh``.
+
+    Waiver: same-line ``# GIT_SYNC_OPT_OUT:<reason>`` marker on the bare
+    `git pull --ff-only` line.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(
+                f"  [canonical-git-sync] SKIP: "
+                f"{scripts_dir} not present"
+            )
+        return violations
+
+    lane_scripts = sorted(scripts_dir.glob("remote_lane_*.sh"))
+    if not lane_scripts:
+        if verbose:
+            print(
+                f"  [canonical-git-sync] SKIP: "
+                f"no remote_lane_*.sh scripts found"
+            )
+        return violations
+
+    # Accept both bare form and `git -C <path>` form (e.g.,
+    # `git -C "$WORKSPACE" fetch origin main`).
+    import re as _re
+    canonical_re_a = _re.compile(r"\bgit(?:\s+-C\s+\S+)?\s+fetch\s+origin\s+main\b")
+    canonical_re_b = _re.compile(r"\bgit(?:\s+-C\s+\S+)?\s+reset\s+--hard\s+origin/main\b")
+    waiver_substr = "# GIT_SYNC_OPT_OUT:"
+
+    for script in lane_scripts:
+        try:
+            text = script.read_text(errors="ignore")
+        except OSError as e:
+            violations.append(
+                f"{script.relative_to(root)}: cannot read — {e}"
+            )
+            continue
+
+        # Walk lines and flag any non-comment `git pull --ff-only` that
+        # lacks a same-line waiver. Track waivered lines separately so a
+        # file-level waiver also exempts the file-level canonical-pattern
+        # check below.
+        offending_lines: list[tuple[int, str]] = []
+        file_has_waiver = False
+        for lineno, raw_line in enumerate(text.splitlines(), start=1):
+            stripped = raw_line.lstrip()
+            # Skip pure-comment lines — they're documentation, not code.
+            if stripped.startswith("#"):
+                continue
+            if "git pull --ff-only" not in raw_line:
+                continue
+            # Same-line waiver allows opt-out.
+            if waiver_substr in raw_line:
+                file_has_waiver = True
+                continue
+            offending_lines.append((lineno, raw_line.strip()))
+
+        if offending_lines:
+            for lineno, line in offending_lines:
+                violations.append(
+                    f"{script.relative_to(root)}:{lineno}: bare "
+                    f"`git pull --ff-only` is FORBIDDEN — replace with "
+                    f"`git fetch origin main && git reset --hard origin/main` "
+                    f"or add same-line `# GIT_SYNC_OPT_OUT:<reason>` waiver. "
+                    f"Line: {line}"
+                )
+            continue
+
+        # If a same-line waiver was found, the operator has explicitly
+        # opted out of the canonical pattern — exempt the file.
+        if file_has_waiver:
+            continue
+
+        # If the script does ANY git sync (pull/fetch/reset against origin),
+        # enforce that the canonical pattern is present.
+        does_git_sync = (
+            "git pull" in text
+            or "git fetch" in text
+            or ("git reset" in text and "origin" in text)
+        )
+        if not does_git_sync:
+            # Lane script trusts parent launcher — fine.
+            continue
+
+        if not (canonical_re_a.search(text) and canonical_re_b.search(text)):
+            violations.append(
+                f"{script.relative_to(root)}: performs git sync but does "
+                f"NOT use the canonical `git fetch origin main && "
+                f"git reset --hard origin/main` pattern. Stale Vast.ai "
+                f"workspaces will crash on bare `git pull --ff-only` "
+                f"(memory: feedback_canonical_git_sync_pattern_20260428)."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [canonical-git-sync] "
+                f"{len(violations)} violation(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [canonical-git-sync] OK: "
+                f"all {len(lane_scripts)} lane script(s) either skip git "
+                f"sync OR use canonical fetch+reset pattern"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "CANONICAL GIT SYNC VIOLATIONS — lane scripts must use "
+            "`git fetch origin main && git reset --hard origin/main` "
+            "(NOT bare `git pull --ff-only` which crashes on stale "
+            "Vast.ai workspaces).\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 58 (58th meta-bug): launcher offer-search --max-dph must NOT be
+#                          hardcoded below 0.40, which would over-restrict
+#                          the host pool and starve the search (today's
+#                          NVDEC_BAD on 87% of 4090s burned ~$10 because
+#                          the survivor pool was tiny).
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: deep hardening pass 3 dimension 2. The launcher's
+# argparse default (`p1.add_argument("--max-dph", type=float, default=0.50)`)
+# is broad enough that the search returns ~5 offers reliably. But operators
+# (or downstream calling scripts) sometimes hardcode a tighter cap to chase
+# cheaper instances; this check forbids that for any value below 0.40 so the
+# survivor pool is always > ~3 hosts even after NVDEC_BAD attrition.
+#
+# Static scan only: looks for `--max-dph <value>` and `max_dph=<value>` in
+# scripts/launch_lane_on_vastai.py and any caller under scripts/. Same-line
+# `# MAX_DPH_OK:<reason>` waiver allowed for known-safe cases.
+
+def check_launcher_max_dph_floor(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    floor: float = 0.40,
+) -> list[str]:
+    """Forbid hardcoded launcher --max-dph below the floor (default 0.40).
+
+    Scans scripts/launch_lane_on_vastai.py + scripts/*.sh for hardcoded
+    --max-dph or max_dph= values; flags any below the floor without a
+    same-line `# MAX_DPH_OK:<reason>` waiver.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    if not scripts_dir.is_dir():
+        if verbose:
+            print(f"  [launcher-max-dph-floor] SKIP: {scripts_dir} not present")
+        return violations
+
+    import re as _re
+    pat_cli = _re.compile(r"--max-dph[= ]([0-9]+\.?[0-9]*)")
+    pat_kw = _re.compile(r"\bmax_dph\s*=\s*([0-9]+\.?[0-9]*)")
+    # argparse default like `default=0.30` (only when --max-dph is on the same line)
+    pat_default = _re.compile(r"--max-dph.*?\bdefault\s*=\s*([0-9]+\.?[0-9]*)")
+    waiver = "# MAX_DPH_OK:"
+
+    targets = sorted(scripts_dir.glob("launch_lane_on_vastai.py")) + sorted(
+        scripts_dir.glob("*.sh")
+    )
+    for path in targets:
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for lineno, raw_line in enumerate(text.splitlines(), start=1):
+            stripped = raw_line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if waiver in raw_line:
+                continue
+            matched = False
+            for pat in (pat_cli, pat_kw, pat_default):
+                m = pat.search(raw_line)
+                if not m:
+                    continue
+                try:
+                    val = float(m.group(1))
+                except ValueError:
+                    continue
+                if val < floor:
+                    violations.append(
+                        f"{path.relative_to(root)}:{lineno}: hardcoded "
+                        f"--max-dph={val} is below the {floor} floor — too few "
+                        f"hosts after NVDEC_BAD attrition. Raise the cap or add "
+                        f"same-line `{waiver}<reason>` waiver. Line: {raw_line.strip()}"
+                    )
+                    matched = True
+                    break  # don't double-report the same line
+            if matched:
+                continue
+
+    if verbose:
+        if violations:
+            print(f"  [launcher-max-dph-floor] {len(violations)} violation(s):")
+            for v in violations[:10]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [launcher-max-dph-floor] OK: no hardcoded --max-dph below "
+                f"{floor} across launcher + lane scripts"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            f"LAUNCHER --max-dph BELOW FLOOR ({floor}) — pool too small for "
+            f"NVDEC attrition. Raise cap or waive.\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 59 (59th meta-bug): launcher cmd_phase2_extract MUST auto-destroy
+#                          the instance on CUDA-probe failure (idle cost
+#                          accrues otherwise).
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: deep hardening pass 3 dimension 2. The launcher's
+# phase2-extract calls `lightweight_nvdec_probe(host, port)` and on failure
+# MUST call `destroy_instance(instance_id)` (unless --no-destroy-on-fail
+# is explicitly set). Today's session lost an instance ~$0.05 because an
+# earlier version of the function let the operator's terminal session end
+# without destroying.
+#
+# Static scan: parse cmd_phase2_extract function body and verify both
+# `lightweight_nvdec_probe` AND `destroy_instance` are referenced inside
+# the function.
+
+def check_phase2_extract_destroys_on_failure(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Verify cmd_phase2_extract destroys the instance on CUDA-probe failure.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    launcher = root / "scripts" / "launch_lane_on_vastai.py"
+    violations: list[str] = []
+    if not launcher.exists():
+        if verbose:
+            print("  [phase2-extract-cleanup] SKIP: launcher not present")
+        return violations
+    try:
+        text = launcher.read_text()
+    except OSError:
+        return violations
+    # Find the function body for cmd_phase2_extract
+    import re as _re
+    m = _re.search(
+        r"def cmd_phase2_extract\([^)]*\)[^:]*:\n((?:    [^\n]*\n|\n)+)",
+        text,
+    )
+    if not m:
+        violations.append(
+            "scripts/launch_lane_on_vastai.py: cmd_phase2_extract function "
+            "definition not found — has the launcher been refactored? Update "
+            "this check or restore the function."
+        )
+    else:
+        body = m.group(1)
+        if "lightweight_nvdec_probe" not in body:
+            violations.append(
+                "scripts/launch_lane_on_vastai.py:cmd_phase2_extract: missing "
+                "`lightweight_nvdec_probe(...)` call — Stage 2 CUDA probe is "
+                "the canonical NVDEC_BAD detection step."
+            )
+        if "destroy_instance" not in body:
+            violations.append(
+                "scripts/launch_lane_on_vastai.py:cmd_phase2_extract: missing "
+                "`destroy_instance(...)` call — failed CUDA probe must auto-"
+                "destroy the instance to stop cost accrual (unless "
+                "--no-destroy-on-fail is set explicitly)."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [phase2-extract-cleanup] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                "  [phase2-extract-cleanup] OK: cmd_phase2_extract probes NVDEC "
+                "AND destroys on failure"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "PHASE2-EXTRACT MUST AUTO-DESTROY ON CUDA-PROBE FAILURE.\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 60 (60th meta-bug): MEMORY.md must stay under 250 lines (warns
+#                          when exceeded — the auto-memory file accumulates
+#                          across sessions and silently bloats context).
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: deep hardening pass 3 dimension 2. The Claude Code system
+# message warns at 200 lines: "Only part of it was loaded. Keep index
+# entries to one line under ~200 chars; move detail into topic files." We
+# adopt 250 as a soft ceiling (50-line buffer) so the operator gets warned
+# before the loader truncates context silently.
+#
+# Heuristic: hunt for MEMORY.md under either Claude home (`~/.claude/...`)
+# or repo root. Flag if line count > ceiling.
+
+def check_memory_md_size_under_ceiling(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+    ceiling: int = 250,
+) -> list[str]:
+    """Warn when MEMORY.md exceeds the soft line-count ceiling.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    import os
+    candidates: list[Path] = []
+    home_memory = (
+        Path.home()
+        / ".claude" / "projects"
+        / "-Users-adpena-Projects-pact" / "memory" / "MEMORY.md"
+    )
+    if home_memory.exists():
+        candidates.append(home_memory)
+    root = repo_root or REPO_ROOT
+    repo_memory = root / "MEMORY.md"
+    if repo_memory.exists():
+        candidates.append(repo_memory)
+
+    violations: list[str] = []
+    for path in candidates:
+        try:
+            n = sum(1 for _ in path.open("r", errors="ignore"))
+        except OSError:
+            continue
+        if n > ceiling:
+            violations.append(
+                f"{path}: {n} lines (> {ceiling} ceiling). Consolidate index "
+                f"entries to one line each (move detail into topic files), or "
+                f"prune obsolete entries to keep context windows from "
+                f"silently truncating the file."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [memory-md-size] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            if candidates:
+                print(
+                    f"  [memory-md-size] OK: {len(candidates)} MEMORY.md file(s) "
+                    f"all under {ceiling} lines"
+                )
+            else:
+                print("  [memory-md-size] SKIP: no MEMORY.md found")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            f"MEMORY.md EXCEEDS {ceiling}-LINE CEILING.\n"
+            + "\n".join(f"  • {v}" for v in violations[:5])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 61 (61st meta-bug): canonical lane bootstraps (remote_train_bootstrap.sh
+#                          + remote_pose_tto_bootstrap.sh) MUST write
+#                          provenance.json (git_hash + gpu_name + cost_cap +
+#                          predicted_band fields).
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: deep hardening pass 3 dimension 2. Memory:
+# `feedback_canonical_remote_bootstraps`. The 2 canonical bootstrap scripts
+# (and any new variants) MUST write a provenance.json file at the START of
+# their run so post-mortem analysis on Vast.ai instances has a deterministic
+# anchor. Lane scripts (remote_lane_*.sh) call these bootstraps; the
+# bootstrap is responsible for writing provenance.
+#
+# Static scan: look for `provenance.json` writes in canonical bootstrap
+# scripts. Currently warn-only since broader audit needed for all
+# remote_lane_*.sh that bypass the canonical bootstraps.
+
+def check_canonical_bootstraps_write_provenance(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Verify canonical bootstrap scripts write provenance.json.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    if not scripts_dir.is_dir():
+        if verbose:
+            print("  [bootstrap-provenance] SKIP: scripts/ not present")
+        return violations
+    canonical = [
+        "remote_train_bootstrap.sh",
+        "remote_pose_tto_bootstrap.sh",
+        "remote_pose_tto_only_bootstrap.sh",
+    ]
+    n_checked = 0
+    for name in canonical:
+        path = scripts_dir / name
+        if not path.exists():
+            continue
+        n_checked += 1
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        if "provenance.json" not in text:
+            violations.append(
+                f"scripts/{name}: does not write provenance.json — required "
+                f"for post-mortem traceability per "
+                f"feedback_canonical_remote_bootstraps."
+            )
+            continue
+        # Look for the required fields anywhere in the script body.
+        required_fields = ["git_hash", "gpu_name"]
+        missing = [f for f in required_fields if f not in text]
+        if missing:
+            violations.append(
+                f"scripts/{name}: provenance.json write is present but missing "
+                f"fields {missing}. Required: git_hash, gpu_name. "
+                f"Recommended: cost_cap, predicted_band (lane-specific)."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [bootstrap-provenance] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [bootstrap-provenance] OK: {n_checked} canonical bootstrap(s) "
+                f"write provenance.json with required fields"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "CANONICAL BOOTSTRAPS MUST WRITE provenance.json.\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+def check_lightning_exact_eval_manifest_runtime_closure(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard exact-eval submit-time manifest/runtime closure.
+
+    Exact CUDA eval can be correct in the job command and still be doomed if
+    the staged source manifest omits ``submissions/robust_current/config.env``.
+    T4/g4dn jobs also need an explicit inflate-side Torch pin because older
+    drivers can resolve CUDA-13 wheels that fail at runtime.
+    """
+    import argparse
+    import importlib.util
+    import json
+    import tempfile
+
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    cli = root / "scripts" / "launch_lightning_batch_job.py"
+    try:
+        spec = importlib.util.spec_from_file_location("launch_lightning_batch_job_preflight", cli)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"could not load {cli}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "manifest.json"
+            args = argparse.Namespace(
+                dry_run=False,
+                studio="pact",
+                source_manifest=str(manifest),
+                archive="/repo/archive.zip",
+                repo_dir="/repo",
+                queue_metadata=[],
+                env=[],
+                machine="T4",
+            )
+            # Use machine="T4" so the studio-machine validator (added 2026-05-04
+            # to gate the deprecated symbolic L40S route in favour of g6e.4xlarge)
+            # short-circuits and we actually exercise the manifest closure path
+            # we are trying to test here.  L40S manifest closure is now exercised
+            # below via machine="g6e.4xlarge" instead.
+            manifest.write_text(json.dumps({"files": [{"path": "archive.zip"}]}) + "\n")
+            try:
+                module._validate_exact_eval_submit_inputs(args)
+            except SystemExit as exc:
+                msg = str(exc)
+                if "inflate runtime closure" not in msg or "config.env" not in msg:
+                    violations.append(
+                        "exact-eval manifest closure rejected archive-only manifest "
+                        f"with the wrong message: {msg}"
+                    )
+            else:
+                violations.append(
+                    "exact-eval manifest closure accepted archive-only manifest "
+                    "without inflate.sh/config.env"
+                )
+
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "files": [
+                            {"path": "archive.zip"},
+                            {"path": "submissions/robust_current/inflate.sh"},
+                            {"path": "submissions/robust_current/config.env"},
+                        ]
+                    }
+                )
+                + "\n"
+            )
+            args.env = [
+                "INFLATE_TORCH_SPEC=torch==2.5.1+cu124",
+                "UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124",
+                "UV_INDEX_STRATEGY=unsafe-best-match",
+            ]
+            try:
+                module._validate_exact_eval_submit_inputs(args)
+            except SystemExit as exc:
+                violations.append(f"exact-eval manifest closure rejected complete T4 manifest: {exc}")
+            args.env = []
+
+            args.machine = "g4dn.xlarge"
+            args.env = []
+            try:
+                module._validate_exact_eval_submit_inputs(args)
+            except SystemExit as exc:
+                if "INFLATE_TORCH_SPEC" not in str(exc):
+                    violations.append(f"T4/g4dn torch pin gate rejected with wrong message: {exc}")
+            else:
+                violations.append("T4/g4dn exact-eval submit accepted missing INFLATE_TORCH_SPEC")
+
+            args.env = [
+                "INFLATE_TORCH_SPEC=torch==2.5.1+cu124",
+                "UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124",
+                "UV_INDEX_STRATEGY=unsafe-best-match",
+            ]
+            try:
+                module._validate_exact_eval_submit_inputs(args)
+            except SystemExit as exc:
+                violations.append(f"T4/g4dn exact-eval submit rejected complete cu124 pin: {exc}")
+    except Exception as exc:
+        violations.append(f"could not run exact-eval manifest runtime closure preflight: {exc!r}")
+
+    if verbose:
+        if violations:
+            print(f"  [lightning-exact-eval-runtime-closure] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                "  [lightning-exact-eval-runtime-closure] OK: manifest runtime "
+                "closure and T4 torch pin gates are fail-closed"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LIGHTNING EXACT-EVAL RUNTIME CLOSURE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_remote_archive_only_eval_custody_closure(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard archive-only exact-eval custody and runtime hardening.
+
+    H100/L40S archive-only diagnostics are fast enough to run often, which also
+    makes path drift dangerous: a result directory must preserve the exact
+    archive bytes that produced its JSON, plus the scorer/runtime dependency
+    and cleanup guards that avoid repeated remote bug classes.
+    """
+    root = repo_root or REPO_ROOT
+    script = root / "scripts" / "remote_archive_only_eval.sh"
+    violations: list[str] = []
+    try:
+        text = script.read_text()
+    except FileNotFoundError:
+        violations.append("scripts/remote_archive_only_eval.sh is missing")
+        text = ""
+
+    required_substrings = {
+        "archive custody sidecar": "archive_custody.json",
+        "archive custody copy": "CUSTODY_ARCHIVE",
+        "archive custody drift fail-close": "archive custody copy drifted",
+        "scorer dependency bootstrap": "ensure_scorer_runtime_deps",
+        "scorer dependency probe": "scorer_deps_probe.json",
+        "heavy eval cleanup": "eval_work/inflated",
+        "contest JSON preservation": "contest_auth_eval.json",
+        "contest provenance preservation": "provenance.contest_auth_eval.json",
+        "driver-compatible torch selection": "torch==2.5.1+cu124",
+        "canonical uv bootstrap": "scripts/ensure_remote_uv.sh",
+    }
+    for label, needle in required_substrings.items():
+        if needle not in text:
+            violations.append(f"remote archive-only wrapper missing {label}: {needle}")
+
+    if verbose:
+        if violations:
+            print(f"  [remote-archive-only-custody] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                "  [remote-archive-only-custody] OK: archive custody, scorer deps, "
+                "driver pins, and cleanup guards are present"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE ARCHIVE-ONLY EVAL CUSTODY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+_CMG3A_REMOTE_DISPATCH_BUILDERS = (
+    "experiments/build_cmg3_adaptive_runs_candidate.py",
+    "experiments/build_c067_multimask_reconciler_candidate.py",
+)
+_CMG3A_REMOTE_DISPATCH_RISK_FLAGS = (
+    "--target-body-bytes",
+    "--target-extra-runs",
+)
+_CMG3A_REMOTE_DISPATCH_POSE_SAFE_TOKENS = (
+    "--field-policy-json",
+    "--hard-pair-indices",
+    "--hard-frame-indices",
+    "--class-weights-json",
+    "CMG3A_POSE_COLLAPSE_REVIEWED",
+)
+
+_PMG_REMOTE_DISPATCH_RISK_TOKENS = (
+    "pmg_hotspot",
+    "PMG-HOTSPOT",
+    "row_span_stride_class_predictor",
+    "build_pmg_hotspot_candidate.py",
+    "build_cmg3_rowspan_candidate.py",
+    "masks.cmg3",
+)
+_PMG_REMOTE_DISPATCH_EXEC_TOKENS = (
+    "remote_archive_only_eval.sh",
+    "launch_lightning_batch_job.py",
+    "contest_auth_eval.py",
+    "ARCHIVE_PATH",
+)
+_PMG_REMOTE_DISPATCH_ESCAPE_TOKENS = (
+    "PMG_GEOMETRY_ESCAPE_REVIEWED",
+    "PMG_EXACT_NEGATIVE_REPLAY_GUARD",
+    "--geometry-escape-json",
+    "--pose-safe-plan-json",
+    "--learned-mask-contract-json",
+    "predictive_mask_grammar_runtime_readiness_plan.json",
+)
+
+
+def _shell_continuation_blocks(text: str) -> list[tuple[int, str]]:
+    blocks: list[tuple[int, str]] = []
+    current: list[str] = []
+    start_line = 0
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.rstrip()
+        if not current:
+            start_line = line_no
+        current.append(stripped)
+        if stripped.endswith("\\"):
+            continue
+        blocks.append((start_line, "\n".join(current)))
+        current = []
+    if current:
+        blocks.append((start_line, "\n".join(current)))
+    return blocks
+
+
+def _cmg3a_dispatch_rel(path: Path, repo_root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _scan_remote_script_for_plain_cmg3a_dispatch(path: Path, repo_root: Path) -> list[str]:
+    """Catch remote CMG3A byte/run-count dispatches lacking pose-safety review."""
+    rel = _cmg3a_dispatch_rel(path, repo_root)
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return [f"{rel}: unreadable for CMG3A dispatch scan: {exc}"]
+    if not any(builder in text for builder in _CMG3A_REMOTE_DISPATCH_BUILDERS):
+        return []
+    violations: list[str] = []
+    for start_line, block in _shell_continuation_blocks(text):
+        if not any(builder in block for builder in _CMG3A_REMOTE_DISPATCH_BUILDERS):
+            continue
+        if not any(flag in block for flag in _CMG3A_REMOTE_DISPATCH_RISK_FLAGS):
+            continue
+        if any(token in block for token in _CMG3A_REMOTE_DISPATCH_POSE_SAFE_TOKENS):
+            continue
+        violations.append(
+            f"{rel}:{start_line}: plain CMG3A target-body/extra-run dispatch "
+            "after exact PoseNet-collapse negatives needs --field-policy-json, "
+            "--hard-pair-indices/--hard-frame-indices, --class-weights-json, "
+            "or CMG3A_POSE_COLLAPSE_REVIEWED:<reason>"
+        )
+    return violations
+
+
+def _scan_remote_script_for_plain_pmg_dispatch(path: Path, repo_root: Path) -> list[str]:
+    """Catch PMG/row-span remote dispatches without geometry-escape review."""
+    rel = _cmg3a_dispatch_rel(path, repo_root)
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return [f"{rel}: unreadable for PMG dispatch scan: {exc}"]
+    if not any(token in text for token in _PMG_REMOTE_DISPATCH_RISK_TOKENS):
+        return []
+    if any(token in text for token in _PMG_REMOTE_DISPATCH_ESCAPE_TOKENS):
+        return []
+    violations: list[str] = []
+    for start_line, block in _shell_continuation_blocks(text):
+        if not any(token in block for token in _PMG_REMOTE_DISPATCH_RISK_TOKENS):
+            continue
+        if not any(token in block for token in _PMG_REMOTE_DISPATCH_EXEC_TOKENS):
+            continue
+        if any(token in block for token in _PMG_REMOTE_DISPATCH_ESCAPE_TOKENS):
+            continue
+        violations.append(
+            f"{rel}:{start_line}: PMG/row-span mask-grammar remote dispatch "
+            "after exact PoseNet-collapse negatives needs "
+            "PMG_GEOMETRY_ESCAPE_REVIEWED:<reason>, "
+            "PMG_EXACT_NEGATIVE_REPLAY_GUARD, --geometry-escape-json, "
+            "--pose-safe-plan-json, or --learned-mask-contract-json"
+        )
+    return violations
+
+
+def check_cmg3a_remote_dispatch_requires_pose_safety(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Block new remote GPU spend on the measured-bad plain CMG3A shape.
+
+    Local builders stay usable for planning and byte screens. The guard is
+    scoped to dispatch surfaces, where a bad command burns remote queue time
+    before exact evidence can correct the operator.
+    """
+    root = repo_root or REPO_ROOT
+    paths: list[Path] = []
+    scripts_root = root / "scripts"
+    if scripts_root.exists():
+        paths.extend(
+            p
+            for p in scripts_root.rglob("*")
+            if p.is_file() and p.suffix in {".sh", ".py"}
+        )
+    violations: list[str] = []
+    for path in sorted(paths):
+        violations.extend(_scan_remote_script_for_plain_cmg3a_dispatch(path, root))
+    if verbose:
+        if violations:
+            print(f"  [cmg3a-pose-safety] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [cmg3a-pose-safety] OK: remote CMG3A dispatches carry pose-safety review")
+    if violations and strict:
+        raise MetaBugViolation(
+            "CMG3A REMOTE DISPATCH POSE-SAFETY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_pmg_remote_dispatch_requires_geometry_escape(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Block repeated PMG/row-span remote spend without an escape proof.
+
+    This is scoped to remote dispatch surfaces. Local PMG/CMG3 planners remain
+    available for byte screens and geometry analysis.
+    """
+    root = repo_root or REPO_ROOT
+    paths: list[Path] = []
+    scripts_root = root / "scripts"
+    if scripts_root.exists():
+        paths.extend(
+            p
+            for p in scripts_root.rglob("*")
+            if p.is_file() and p.suffix in {".sh", ".py"}
+        )
+    violations: list[str] = []
+    for path in sorted(paths):
+        violations.extend(_scan_remote_script_for_plain_pmg_dispatch(path, root))
+    if verbose:
+        if violations:
+            print(f"  [pmg-geometry-escape] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [pmg-geometry-escape] OK: remote PMG dispatches carry geometry-escape review")
+    if violations and strict:
+        raise MetaBugViolation(
+            "PMG REMOTE DISPATCH GEOMETRY-ESCAPE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_contest_component_trace_runtime_parity(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard standalone component-trace runtime parity and profile feedback.
+
+    ``experiments/contest_component_trace.py`` is not promotion evidence, but
+    its per-pair deltas feed hard-pair selection, Lagrangian water filling, and
+    low-dimensional active-subspace searches. A trace produced through a
+    different ffmpeg color contract or a shared/mutated uv environment can
+    poison the optimizer even when the archive itself is valid.
+    """
+    root = repo_root or REPO_ROOT
+    script = root / "experiments" / "contest_component_trace.py"
+    violations: list[str] = []
+    try:
+        text = script.read_text()
+    except FileNotFoundError:
+        violations.append("experiments/contest_component_trace.py is missing")
+        text = ""
+
+    required_substrings = {
+        "parity ffmpeg resolver": "_ensure_parity_ffmpeg_env",
+        "explicit ffmpeg override rejection": "FFMPEG_BIN={explicit!r} is not executable",
+        "ffmpeg scale option list": "REQUIRED_FFMPEG_SCALE_OPTIONS",
+        "in_range color contract": '"in_range"',
+        "out_range color contract": '"out_range"',
+        "in_color_matrix color contract": '"in_color_matrix"',
+        "in_primaries color contract": '"in_primaries"',
+        "in_transfer color contract": '"in_transfer"',
+        "isolated inflate uv env": "_ensure_isolated_inflate_uv_env",
+        "uv copy mode": "UV_LINK_MODE",
+        "runtime environment sidecar": "component_trace_runtime_env.json",
+        "diagnostic evidence grade": "diagnostic_component_trace",
+        "non-promotable score claim": '"score_claim": False',
+        "contest auth cross-check": "contest_auth_eval_cross_check",
+    }
+    for label, needle in required_substrings.items():
+        if needle not in text:
+            violations.append(f"component trace missing {label}: {needle}")
+
+    if verbose:
+        if violations:
+            print(f"  [component-trace-runtime-parity] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                "  [component-trace-runtime-parity] OK: parity ffmpeg, isolated "
+                "uv env, runtime sidecar, and non-promotable cross-check guards "
+                "are present"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "CONTEST COMPONENT TRACE RUNTIME PARITY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+def check_dispatch_claim_helper_present(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard the cross-agent paid-dispatch claim helper."""
+    root = repo_root or REPO_ROOT
+    helper = root / "tools" / "claim_lane_dispatch.py"
+    lightning_launcher = root / "scripts" / "launch_lightning_batch_job.py"
+    agents = root / "AGENTS.md"
+    violations: list[str] = []
+    try:
+        helper_text = helper.read_text()
+    except FileNotFoundError:
+        helper_text = ""
+        violations.append("tools/claim_lane_dispatch.py is missing")
+    else:
+        if not os.access(helper, os.X_OK):
+            violations.append("tools/claim_lane_dispatch.py is not executable")
+    for needle in (
+        "fcntl.flock",
+        "REFUSING_DISPATCH",
+        "active claim(s) already exist",
+        "--allow-parallel",
+        "--child-of",
+        "TERMINAL_PREFIXES",
+        "closed_instance_job_ids",
+        "ttl-hours",
+    ):
+        if needle not in helper_text:
+            violations.append(f"dispatch claim helper missing required guard: {needle}")
+    try:
+        launcher_text = lightning_launcher.read_text()
+    except FileNotFoundError:
+        launcher_text = ""
+        violations.append("scripts/launch_lightning_batch_job.py is missing")
+    for needle in (
+        "_require_dispatch_claim_for_submit",
+        "--dispatch-lane-id",
+        "--allow-missing-dispatch-claim-reason",
+        "missing active dispatch claim",
+        "dispatch_claim_skip_reason",
+    ):
+        if needle not in launcher_text:
+            violations.append(f"Lightning launcher missing dispatch-claim guard: {needle}")
+    try:
+        agents_text = agents.read_text()
+    except FileNotFoundError:
+        agents_text = ""
+        violations.append("AGENTS.md is missing")
+    if "tools/claim_lane_dispatch.py claim" not in agents_text:
+        violations.append("AGENTS.md does not require the dispatch claim helper")
+    if "newer terminal row as closing" not in agents_text:
+        violations.append("AGENTS.md does not document terminal claim-row closure")
+
+    if verbose:
+        if violations:
+            print(f"  [dispatch-claim-helper] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [dispatch-claim-helper] OK: paid-dispatch claim helper is present")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "DISPATCH CLAIM HELPER VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 63 (63rd meta-bug): every lane script that calls contest_auth_eval.py
+#                          MUST verify config.env exists with PYTHON_INFLATE=
+#                          renderer BEFORE the call (or rely on the canonical
+#                          guard inside contest_auth_eval.py itself, which
+#                          F5 added).
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 2026-04-28: Codex F5. Lane RM-d ran 1+ hour pose TTO, built archive, then
+# crashed at Stage 3 contest_auth_eval because submissions/robust_current/
+# config.env was not on the remote (the launcher tarball silently excluded
+# .env files). inflate.sh fell into its ffmpeg path and tried to open
+# extracted/0.mkv which never exists in a renderer-archive layout.
+#
+# The canonical fix is now layered:
+#  1. scripts/launch_lane_on_vastai.py includes .env in the tarball suffix list
+#  2. experiments/contest_auth_eval.py hard-fails if config.env is missing
+#  3. THIS CHECK ensures lane scripts call the GUARDED contest_auth_eval (not
+#     a stale local copy) and don't try to bypass the guard.
+#
+# Static scan: grep every scripts/remote_lane_*.sh for `contest_auth_eval`
+# and verify the script either (a) calls the canonical
+# experiments/contest_auth_eval.py (which has the guard) OR (b) has its own
+# `config.env` / `PYTHON_INFLATE` precondition check before the eval call.
+#
+# Live count at wire-in: 0 (verified post-F5 fix). Ships STRICT.
+
+def check_lane_scripts_set_up_inflate_environment(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Verify lane scripts that call contest_auth_eval set up the env correctly.
+
+    Every scripts/remote_lane_*.sh that invokes contest_auth_eval MUST
+    either:
+      (a) Call experiments/contest_auth_eval.py (which has the F5 guard
+          for missing config.env), OR
+      (b) Have its own pre-check that verifies submissions/robust_current/
+          config.env exists with PYTHON_INFLATE=renderer.
+
+    Catches the F5 bug class: lanes that train + build archive successfully
+    but crash at Stage 3 because the inflate environment is incomplete.
+    Reference: feedback_codex_review_5_findings_FIXED_20260428 +
+    Lane RM-d 0.mkv crash post-mortem.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    n_scanned = 0
+    if not scripts_dir.is_dir():
+        if verbose:
+            print("  [lane-inflate-env] SKIP: scripts/ not present")
+        return violations
+
+    canonical_module_substr = "experiments/contest_auth_eval.py"
+    canonical_guard_grep = "PYTHON_INFLATE=renderer"
+
+    for path in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        n_scanned += 1
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        # Skip scripts that do NOT invoke contest_auth_eval at all
+        if "contest_auth_eval" not in text:
+            continue
+        # Acceptance path (a): calls the canonical experiments/contest_auth_eval.py
+        # which has the F5 guard built in.
+        if canonical_module_substr in text:
+            continue
+        # Acceptance path (b): has its own PYTHON_INFLATE=renderer pre-check
+        if canonical_guard_grep in text:
+            continue
+        # Otherwise this lane bypasses both guards — flag it.
+        rel = str(path.relative_to(root))
+        violations.append(
+            f"{rel}: calls contest_auth_eval but neither (a) routes through "
+            f"experiments/contest_auth_eval.py (which has the F5 config.env "
+            f"guard) nor (b) checks PYTHON_INFLATE=renderer locally. The lane "
+            f"may train successfully then crash at Stage 3 with extracted/0.mkv "
+            f"missing. See Codex F5 (2026-04-28)."
+        )
+
+    if verbose:
+        if violations:
+            print(f"  [lane-inflate-env] {len(violations)} violation(s) across "
+                  f"{n_scanned} remote_lane_*.sh file(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [lane-inflate-env] OK: {n_scanned} remote_lane_*.sh "
+                  f"scripts checked; all set up inflate env correctly")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE SCRIPTS MUST SET UP INFLATE ENV (Codex F5 2026-04-28).\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ── Check 64: lane scripts must have a recent E2E smoke proof ─────────────────
+#
+# Reference: feedback_canonical_e2e_smoke_PERMANENT_GUARD_20260428.
+#
+# The structural gap this check closes: 63 STRICT preflight checks before
+# Check 64 are STATIC analysis — code-pattern guards. None of them actually
+# run the deploy → inflate → contest_auth_eval pipeline locally. A lane can
+# pass every static check and still ship to Vast.ai with a broken pipeline.
+#
+# Lane RM-d (2026-04-28) is the canonical example: trained 3.5h on Vast.ai,
+# built archive successfully, then crashed at Stage 3 because the inflate.sh
+# ffmpeg path tried to read extracted/0.mkv (file that never exists in a
+# renderer archive). The F5 fix in contest_auth_eval.py closes that specific
+# bug, but the structural gap — "we never proved the lane will actually
+# inflate end-to-end before dispatch" — remained.
+#
+# Check 64 enforces: every scripts/remote_lane_*.sh must have an entry in
+# .omx/state/lane_e2e_smoke_proofs.json that is < 7 days old. The proof is
+# written by experiments/canonical_local_auth_eval_smoke.py, which runs the
+# full pipeline locally against a known-good fixture archive.
+#
+# Operators MUST run the smoke before dispatching a new lane. Without a
+# proof, the preflight FAILS, blocking the dispatch.
+
+
+SMOKE_PROOFS_REL = ".omx/state/lane_e2e_smoke_proofs.json"
+SMOKE_PROOF_MAX_AGE_DAYS = 7
+
+
+def check_lane_scripts_have_e2e_smoke_proof(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Verify every scripts/remote_lane_*.sh has a recent E2E smoke proof.
+
+    A smoke proof is an entry in .omx/state/lane_e2e_smoke_proofs.json
+    written by experiments/canonical_local_auth_eval_smoke.py. Each proof
+    asserts the lane's archive would inflate cleanly through the canonical
+    pipeline (extract → whitelist → renderer-magic → masks → config.env →
+    inflate.sh dispatch → inflate_renderer.py imports → upstream/evaluate.py
+    arity → GT video present → launcher includes .env).
+
+    Acceptance paths per lane:
+      (a) Proof exists with timestamp_utc < SMOKE_PROOF_MAX_AGE_DAYS old.
+      (b) Lane script has same-line `# E2E_SMOKE_OPT_OUT:<reason>` comment
+          (for lanes that genuinely cannot be smoke-tested locally — e.g.
+          require 60GB GPU memory for archive build).
+
+    Otherwise the lane FAILS this check.
+
+    Returns list of violations. Raises MetaBugViolation if strict and any.
+    """
+    import datetime as _dt
+    import json as _json
+
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    proofs_path = root / SMOKE_PROOFS_REL
+    violations: list[str] = []
+    n_scanned = 0
+    n_proven = 0
+    n_waived = 0
+
+    if not scripts_dir.is_dir():
+        if verbose:
+            print("  [e2e-smoke-proof] SKIP: scripts/ not present")
+        return violations
+
+    # Load proofs file (may not exist on a fresh repo). A missing file means
+    # ZERO proofs — every lane will violate. That is by design: the operator
+    # must run canonical_local_auth_eval_smoke.py at least once.
+    proofs: dict = {}
+    if proofs_path.exists():
+        try:
+            proofs = _json.loads(proofs_path.read_text())
+            if not isinstance(proofs, dict):
+                proofs = {}
+        except (_json.JSONDecodeError, OSError):
+            proofs = {}
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(days=SMOKE_PROOF_MAX_AGE_DAYS)
+
+    for path in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        n_scanned += 1
+        lane_name = path.stem  # e.g. "remote_lane_g_v3_corrected_kl_weight"
+        rel = str(path.relative_to(root))
+
+        # Acceptance path (b): same-line opt-out waiver
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            text = ""
+        if "# E2E_SMOKE_OPT_OUT:" in text:
+            # Require a non-empty reason after the colon (anchor: at least 4
+            # chars to discourage `# E2E_SMOKE_OPT_OUT:.` placeholder).
+            import re as _re
+            m = _re.search(r"#\s*E2E_SMOKE_OPT_OUT:\s*(\S.*)", text)
+            if m and len(m.group(1).strip()) >= 4:
+                n_waived += 1
+                continue
+            violations.append(
+                f"{rel}: has '# E2E_SMOKE_OPT_OUT:' marker but no reason "
+                f"(must be at least 4 chars)"
+            )
+            continue
+
+        # Acceptance path (a): proof exists + recent
+        proof = proofs.get(lane_name)
+        if proof is None:
+            violations.append(
+                f"{rel}: no smoke proof in {SMOKE_PROOFS_REL} "
+                f"(run: python experiments/canonical_local_auth_eval_smoke.py "
+                f"--lane {lane_name})"
+            )
+            continue
+
+        ts_str = proof.get("timestamp_utc")
+        if not ts_str:
+            violations.append(
+                f"{rel}: proof exists but missing 'timestamp_utc' field "
+                f"(corrupt proof — re-run smoke)"
+            )
+            continue
+
+        try:
+            # Parse the canonical UTC ISO timestamp written by the smoke tool.
+            ts = _dt.datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")
+            ts = ts.replace(tzinfo=_dt.timezone.utc)
+        except ValueError:
+            violations.append(
+                f"{rel}: proof has malformed timestamp_utc={ts_str!r} "
+                f"(re-run smoke)"
+            )
+            continue
+
+        if ts < cutoff:
+            age_days = (now - ts).days
+            violations.append(
+                f"{rel}: smoke proof too old ({age_days} days, max "
+                f"{SMOKE_PROOF_MAX_AGE_DAYS}). Re-run: python "
+                f"experiments/canonical_local_auth_eval_smoke.py --lane "
+                f"{lane_name}"
+            )
+            continue
+
+        n_proven += 1
+
+    if verbose:
+        if violations:
+            print(f"  [e2e-smoke-proof] {len(violations)} violation(s) across "
+                  f"{n_scanned} remote_lane_*.sh file(s) "
+                  f"(proven={n_proven} waived={n_waived}):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... and {len(violations) - 20} more")
+        else:
+            print(f"  [e2e-smoke-proof] OK: {n_scanned} remote_lane_*.sh "
+                  f"scripts checked (proven={n_proven} waived={n_waived})")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE SCRIPTS MUST HAVE E2E SMOKE PROOF (Check 64 — closes the "
+            "static-vs-pipeline gap that cost Lane RM-d 3.5h GPU on the "
+            "0.mkv crash). Run:\n"
+            "  python experiments/canonical_local_auth_eval_smoke.py "
+            "--backfill-all\n"
+            "to regenerate proofs for every lane.\n\nViolations:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ----------------------------------------------------------------------------
+# Check 65 — lane-class auto-scan for pipeline proof
+# ----------------------------------------------------------------------------
+# Background: Lane RM-d (2026-04-28) crashed at the auth_eval stage AFTER 3.5h
+# of training on a remote Vast.ai instance. The crash exposed a structural
+# gap: while we have ~64 STATIC preflight checks for code patterns, no check
+# verifies that a NEW LANE CLASS (e.g., the first "renderer-replacement" or
+# "pose-replacement" lane) actually completed a full
+# dispatch → train → archive → auth_eval cycle anywhere on record. New lane
+# classes can ship into the codebase, run for hours on Vast.ai, and crash at
+# auth_eval — and no preflight catches that BEFORE the GPU spend.
+#
+# Check 65 enforces: every lane CLASS in scripts/remote_lane_*.sh must have at
+# least one proof in .omx/state/lane_class_proofs.json showing a complete
+# pipeline cycle. The proof can come from (a) a real production deploy that
+# landed an authoritative score or (b) a `--proof-only` Modal/local dry-run
+# that demonstrated the pipeline end-to-end.
+
+LANE_CLASS_PROOFS_REL = ".omx/state/lane_class_proofs.json"
+
+# Mapping from filename keyword to canonical lane class. Edit here when new
+# classes emerge; the scanner picks the FIRST match in declaration order, so
+# put more-specific keywords above generic ones.
+_LANE_CLASS_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("pose_tto", "pose-tto"),
+    ("pose_replacement", "pose-replacement"),
+    ("posenet_distill", "pose-distill"),
+    ("renderer_replacement", "renderer-replacement"),
+    ("renderer_distill", "renderer-distill"),
+    ("halfframe", "halfframe-mask"),
+    ("entropy_archive", "entropy-archive"),
+    ("archive_codec", "archive-codec"),
+    ("cool_chic", "cool-chic-sidecar"),
+    ("self_compress", "self-compress"),
+    ("uniward", "uniward-distortion"),
+    ("calibrated_pe", "calibrated-pe"),
+    ("hessian", "hessian-bit-allocator"),
+    ("lagrangian", "lagrangian-rate-distortion"),
+    ("kl_distill", "kl-distill"),
+    ("kl_weight", "kl-distill"),
+    ("kldistill", "kl-distill"),
+    ("fp4_qat", "fp4-qat"),
+    ("fp8", "fp8-quant"),
+    ("mae", "mae-pretrain"),
+    ("optimized", "renderer-optimized"),
+    ("sweep", "sweep-orchestrator"),
+    ("rescue", "rescue-recovery"),
+    ("training", "training-baseline"),
+    ("smoke", "smoke-only"),
+)
+
+
+def _classify_lane_script(path: Path) -> str:
+    """Return the canonical lane class for a remote_lane_*.sh path.
+
+    Heuristic: lowercase the stem, normalize separators, and pick the first
+    matching keyword from _LANE_CLASS_KEYWORDS. Falls back to "uncategorized"
+    so the check always assigns a class (the proof still has to exist).
+    """
+    stem = path.stem.lower().replace("-", "_")
+    for kw, cls in _LANE_CLASS_KEYWORDS:
+        if kw in stem:
+            return cls
+    return "uncategorized"
+
+
+def check_lane_classes_have_pipeline_proof(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Verify every lane CLASS has at least one complete-pipeline proof.
+
+    Acceptance: a class is "proven" when ``.omx/state/lane_class_proofs.json``
+    contains an entry like::
+
+        {
+          "renderer-replacement": {
+            "proven_by_lane": "lane_d_v3_full_engineering",
+            "proof_kind": "production-deploy",       // or "modal-dry-run"
+            "score": 1.05,                           // optional but recommended
+            "score_lane_tag": "[contest-CUDA]",      // CLAUDE.md non-neg
+            "timestamp_utc": "2026-04-28T22:07:00Z",
+            "notes": "Lane G v3 corrected KL weight, archive 694 KB"
+          },
+          ...
+        }
+
+    A new lane CLASS without a proof = FAIL. This catches the Lane RM-d class
+    of bug PERMANENTLY: the first time a brand-new lane class ships, the
+    operator MUST register a proof or the launcher refuses to deploy.
+
+    SHIPS WARN-ONLY initially (strict=False) so the existing 70 lanes have
+    a backfill window. Promotion plan: backfill _LANE_CLASS_PROOFS_REL with
+    one proof per existing class (~10-15 entries), then flip strict=True via
+    the standard Lane A → strict pattern.
+    """
+    import json as _json
+
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    proofs_path = root / LANE_CLASS_PROOFS_REL
+    violations: list[str] = []
+
+    if not scripts_dir.is_dir():
+        if verbose:
+            print("  [lane-class-proof] SKIP: scripts/ not present")
+        return violations
+
+    # Collect (class -> example_lane) for every remote_lane_*.sh.
+    classes: dict[str, list[str]] = {}
+    for path in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        cls = _classify_lane_script(path)
+        classes.setdefault(cls, []).append(path.stem)
+
+    if not classes:
+        if verbose:
+            print("  [lane-class-proof] SKIP: no remote_lane_*.sh found")
+        return violations
+
+    # Load proofs (missing file => zero proofs => every class violates).
+    proofs: dict = {}
+    if proofs_path.exists():
+        try:
+            data = _json.loads(proofs_path.read_text())
+            if isinstance(data, dict):
+                proofs = data
+        except (_json.JSONDecodeError, OSError):
+            proofs = {}
+
+    n_proven = 0
+    for cls, lanes in sorted(classes.items()):
+        proof = proofs.get(cls)
+        if not proof or not isinstance(proof, dict):
+            example = lanes[0]
+            violations.append(
+                f"lane class {cls!r} has no proof in {LANE_CLASS_PROOFS_REL} "
+                f"(example lane: {example}). Register one via Modal "
+                f"(experiments/modal_auth_eval.py) or canonical local smoke."
+            )
+            continue
+        # Soft schema: require proven_by_lane + timestamp_utc at minimum.
+        if not proof.get("proven_by_lane"):
+            violations.append(
+                f"lane class {cls!r} proof missing 'proven_by_lane' field"
+            )
+            continue
+        if not proof.get("timestamp_utc"):
+            violations.append(
+                f"lane class {cls!r} proof missing 'timestamp_utc' field"
+            )
+            continue
+        n_proven += 1
+
+    if verbose:
+        if violations:
+            print(
+                f"  [lane-class-proof] {len(violations)} violation(s) across "
+                f"{len(classes)} lane class(es) (proven={n_proven}):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... and {len(violations) - 20} more")
+        else:
+            print(
+                f"  [lane-class-proof] OK: {len(classes)} lane class(es) "
+                f"all proven"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE CLASSES MUST HAVE PIPELINE PROOF (Check 65 — closes the "
+            "Lane RM-d class of bug). New lane classes shipping without a "
+            "complete dispatch → train → archive → auth_eval proof on file. "
+            "Add an entry to .omx/state/lane_class_proofs.json — see check "
+            "docstring for schema.\n\nViolations:\n"
+            + "\n".join(f"  • {v}" for v in violations[:50])
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Selfcomp / Lane MM checks (2026-04-29)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Two new STRICT checks land at 0 live violations after the Selfcomp paradigm
+# port. Reference: project session 2026-04-29 forking Selfcomp 0.38.
+#   * grayscale-LUT consistency: any archive that ships grayscale.mkv must
+#     dispatch via the segmap or renderer_grayscale arm in inflate.sh
+#     (otherwise the legacy ffmpeg path tries to read masks.mkv that
+#     doesn't exist and silently writes a blank .raw -> 100x score).
+#   * block-FP qint/exp pairing: weight_qint without a sibling
+#     weight_exponents reference cannot reconstruct -- any code that
+#     reads ``weight_qint`` from a payload must also read ``weight_exponents``
+#     in the same dict access (Selfcomp inflate.py L168-169 invariant).
+
+
+def check_segmap_grayscale_lut_consistency(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Archives shipping grayscale.mkv must use the segmap/renderer_grayscale arm.
+
+    Scans every remote_lane_*.sh that builds an archive containing
+    grayscale.mkv (or the segmap PYTHON_INFLATE arm), and verifies that
+    the inflate config for that lane sets PYTHON_INFLATE to either
+    ``segmap`` or ``renderer_grayscale``. The legacy ffmpeg / renderer
+    arms expect masks.mkv and would silently produce a blank output if
+    handed a grayscale.mkv-only archive.
+
+    Returns list of violations. Raises PreflightError if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    n_scanned = 0
+    if scripts_dir.is_dir():
+        for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+            n_scanned += 1
+            try:
+                txt = sh.read_text()
+            except OSError:
+                continue
+            ships_grayscale = (
+                "grayscale.mkv" in txt
+                or "PYTHON_INFLATE=segmap" in txt
+                or "PYTHON_INFLATE=renderer_grayscale" in txt
+            )
+            if not ships_grayscale:
+                continue
+            uses_correct_arm = (
+                "PYTHON_INFLATE=segmap" in txt
+                or "PYTHON_INFLATE=renderer_grayscale" in txt
+            )
+            if not uses_correct_arm:
+                violations.append(
+                    f"{sh.relative_to(root)}: ships grayscale.mkv but does not set "
+                    f"PYTHON_INFLATE=segmap or PYTHON_INFLATE=renderer_grayscale. "
+                    f"The legacy ffmpeg / renderer arms read masks.mkv and would "
+                    f"silently emit blank output. Set PYTHON_INFLATE accordingly "
+                    f"in the lane's config.env override."
+                )
+    if verbose:
+        if violations:
+            print(f"  [grayscale-lut-consistency] {len(violations)} violation(s) across {n_scanned} script(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [grayscale-lut-consistency] OK: {n_scanned} remote_lane_*.sh script(s) clean")
+    if violations and strict:
+        raise PreflightError(
+            "GRAYSCALE-LUT CONSISTENCY violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane MM / Selfcomp paradigm guard: any archive that contains "
+            "grayscale.mkv must be inflated through the segmap or "
+            "renderer_grayscale PYTHON_INFLATE arm. Otherwise the legacy "
+            "ffmpeg path tries to read masks.mkv that does not exist and "
+            "silently writes blank frames -> catastrophic score. "
+            "Reference: 2026-04-29 Selfcomp port."
+        )
+    return violations
+
+
+def check_block_fp_exponents_alongside_qint(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Any code reading ``weight_qint`` from a dict must also read ``weight_exponents``.
+
+    The Selfcomp block-FP codec stores per-channel exponents alongside the
+    int8 qint tensor; reconstruction is ``weight = qint * 2 ** exponents``
+    (see tac.block_fp_codec.decode_conv_weight + Selfcomp inflate.py
+    L167-172). Reading ONLY weight_qint produces nonsense (off by 2**exp
+    per channel, typically a 64x error band).
+
+    Returns list of violations. Raises PreflightError if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, _META_PY_SCAN_DIRS + ["submissions/robust_current"]):
+        try:
+            text = py.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        n_scanned += 1
+        # Skip the codec module itself: it DEFINES the pair semantics
+        # (encoder writes one and reader of weight_qint without exponents
+        # is by definition the codec implementation).
+        rel = py.relative_to(root) if py.is_absolute() else py
+        rel_str = str(rel)
+        if rel_str.endswith("block_fp_codec.py") or rel_str.endswith("test_block_fp_codec.py"):
+            continue
+        # Skip test files in general — tests may reference qint without
+        # exp for the encoder/decoder boundary verification.
+        if "/tests/" in rel_str:
+            continue
+        if "weight_qint" in text:
+            if "weight_exponents" not in text:
+                violations.append(
+                    f"{rel}: references 'weight_qint' but not 'weight_exponents'. "
+                    f"The block-FP codec invariant requires both: weight = qint * 2^exp. "
+                    f"Reading qint alone produces 64x-error-band output."
+                )
+    if verbose:
+        if violations:
+            print(f"  [block-fp-qint-exp-pair] {len(violations)} violation(s) across {n_scanned} files:")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [block-fp-qint-exp-pair] OK: {n_scanned} file(s) scanned")
+    if violations and strict:
+        raise PreflightError(
+            "BLOCK-FP QINT/EXP PAIRING violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nThe Selfcomp block-FP codec stores int8 qint + int32 "
+            "exponents per output channel; reconstruction is "
+            "weight = qint * 2 ** exponents. Any consumer reading "
+            "weight_qint without weight_exponents produces 64x-error-band "
+            "output. See tac.block_fp_codec.decode_conv_weight."
+        )
+    return violations
+
+
+def check_segmap_export_calls_verify_roundtrip(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """SegMap export sites SHOULD call verify_roundtrip before shipping.
+
+    WARN-ONLY initially per the Lane A pattern: this is the gate that
+    catches block-FP encoder bugs (e.g. wrong exponent picker, HWOI
+    permute confusion) before they ship a lane archive. Promotion plan:
+    flip strict=True after the first SegMap-paradigm lane lands and the
+    pattern is established.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, ["src/tac", "experiments", "submissions/robust_current"]):
+        try:
+            text = py.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        n_scanned += 1
+        rel = py.relative_to(root) if py.is_absolute() else py
+        rel_str = str(rel)
+        if rel_str.endswith("block_fp_codec.py") or rel_str.endswith("segmap_renderer.py"):
+            continue
+        if "/tests/" in rel_str:
+            continue
+        # Heuristic: any file that CALLS pack_payload_tar_xz() (not unpack,
+        # not just docstring mention) should also call verify_roundtrip()
+        # in the same module so a broken codec cannot silently degrade an
+        # archive. Use a regex so 'unpack_payload_tar_xz' does not match.
+        import re as _re
+        calls_pack = bool(_re.search(r"\bpack_payload_tar_xz\s*\(", text))
+        if calls_pack and "verify_roundtrip" not in text:
+            violations.append(
+                f"{rel}: calls pack_payload_tar_xz but does not call verify_roundtrip. "
+                f"The codec roundtrip gate is the only thing standing between a "
+                f"broken encoder and a shipped archive."
+            )
+    if verbose:
+        if violations:
+            print(f"  [segmap-export-verify-roundtrip] {len(violations)} warn(s) across {n_scanned} files:")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [segmap-export-verify-roundtrip] OK: {n_scanned} file(s) scanned")
+    if violations and strict:
+        raise PreflightError(
+            "SEGMAP-EXPORT-VERIFY-ROUNDTRIP violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nEvery pack_payload_tar_xz call site should be paired with "
+            "verify_roundtrip(state_dict, payload_path) BEFORE the archive "
+            "ships, so a broken codec cannot silently degrade auth eval."
+        )
+    return violations
+
+
+def check_segmap_hm_sa_lossy_pack_contract(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """HM-S/SA SegMap block-FP exports must declare the lossy contract.
+
+    These lanes use Selfcomp-style block-FP as a deliberately lossy renderer
+    weight codec. A strict lossless-style ``tol=1e-6`` post-training check
+    aborts valid trained checkpoints after GPU spend. The safe contract is:
+    relaxed per-tensor MSE gate + explicit lossy metadata + canonical CUDA
+    archive eval before any score claim.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    targets = (
+        scripts_dir / "remote_lane_hm_s_segmap_homography.sh",
+        scripts_dir / "remote_lane_sa_segmap_clone.sh",
+    )
+    violations: list[str] = []
+    n_scanned = 0
+    for path in targets:
+        if not path.is_file():
+            continue
+        n_scanned += 1
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = path.relative_to(root) if path.is_absolute() else path
+        if "segmap_weights.tar.xz" not in text:
+            continue
+        if re.search(r"verify_roundtrip\s*\([^)]*tol\s*=\s*1e-6", text, re.DOTALL):
+            violations.append(
+                f"{rel}: uses verify_roundtrip(..., tol=1e-6) for SegMap "
+                "block-FP. That codec is lossy; use "
+                "SEGMAP_LOSSY_ROUNDTRIP_MSE_TOL plus contract metadata."
+            )
+        required = {
+            "segmap_lossy_contract_metadata": "writes the explicit lossy contract",
+            "SEGMAP_LOSSY_ROUNDTRIP_MSE_TOL": "uses the reviewed lossy MSE tolerance",
+            "lossy_contract=contract": "embeds the contract in segmap_weights.tar.xz",
+            "segmap_pack_roundtrip.json": "preserves measured per-key pack errors",
+            "archive_level_exact_eval_required": "marks pre-exact-eval evidence as empirical",
+            "experiments/contest_auth_eval.py": "gates the archive through canonical auth eval",
+            "--device cuda": "uses CUDA for the archive-level gate",
+        }
+        for needle, reason in required.items():
+            if needle not in text:
+                violations.append(f"{rel}: missing {needle!r} ({reason}).")
+
+    if verbose:
+        if violations:
+            print(
+                f"  [segmap-hm-sa-lossy-pack-contract] {len(violations)} "
+                f"violation(s) across {n_scanned} file(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [segmap-hm-sa-lossy-pack-contract] OK: {n_scanned} "
+                "file(s) scanned"
+            )
+    if violations and strict:
+        raise PreflightError(
+            "SEGMAP HM-S/SA LOSSY PACK CONTRACT violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nThese lanes must either fail statically before GPU spend "
+            "or proceed only as lossy block-FP archives gated by exact CUDA "
+            "contest_auth_eval evidence."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 91 (2026-04-30): Lane GP basis-fit kill — forbid polynomial / smooth-
+# basis pose-fits in experiments/fit_pose_*.py without explicit kill-verdict
+# acknowledgement.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Lane GP v3 (89.67 [Modal-T4-CPU]) was killed per the Council #271 + Lane GP
+# v4 design proposal 2026-04-30. The Council Round-1 design verdict was that
+# the actual Lane G v3 baseline pose trajectory is approximately white-noise
+# in dims 1-5 (diff_std > signal_std) with uniformly-distributed spectral
+# support, making ANY low-rank smooth-basis fit (polynomial / cubic B-spline /
+# DCT / natural cubic) infeasible. All four bases plateau at RMSE ≈ 1.2 (near
+# signal std).
+#
+# This check prevents future agents from re-attempting the lane class. Any
+# new experiments/fit_pose_*.py file that imports `numpy.polyfit`,
+# `numpy.polynomial`, `scipy.interpolate.BSpline`, `scipy.interpolate.splrep`,
+# `scipy.interpolate.CubicSpline`, or `scipy.fft.dct` MUST include the marker
+#
+#     # LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:
+#     # Read .omx/research/council_lane_gp_v4_design_20260430.md before
+#     # adding ANY smooth-basis pose-fit experiment.
+#
+# in the same file. Without the marker, the check fires.
+#
+# The current `experiments/fit_pose_gp.py` is exempted via the marker (will
+# be added in the same commit as this check).
+#
+# Reference: .omx/research/council_lane_gp_v4_design_20260430.md
+# Memory: project_lane_gp_v4_killed_basis_fit_infeasible_20260430.md
+def check_pose_basis_fit_kill_acknowledged(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid smooth-basis pose-fits without Lane-GP-v4 kill acknowledgement.
+
+    Scans every `experiments/fit_pose_*.py` file. If the file imports any
+    smooth-basis fitting function (polyfit / BSpline / splrep / CubicSpline /
+    dct), the file MUST contain the marker
+    `LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:` in a comment block. Otherwise the
+    check fires.
+
+    Returns list of violations. Raises PreflightError if strict and any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+
+    SMOOTH_BASIS_PATTERNS = [
+        r"\bnp\.polyfit\b",
+        r"\bnumpy\.polyfit\b",
+        r"\bnumpy\.polynomial\b",
+        r"\bscipy\.interpolate\.BSpline\b",
+        r"\bscipy\.interpolate\.splrep\b",
+        r"\bscipy\.interpolate\.CubicSpline\b",
+        r"\bscipy\.fft\.dct\b",
+        r"\bfrom\s+scipy\.interpolate\s+import\s+(BSpline|splrep|CubicSpline)\b",
+        r"\bfrom\s+scipy\.fft\s+import\s+dct\b",
+        r"\bfrom\s+numpy\s+import\s+polyfit\b",
+        r"\bfrom\s+numpy\.polynomial\b",
+    ]
+    KILL_MARKER = "LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:"
+
+    # Round 1 council finding (Contrarian Q2): scan BOTH experiments/fit_pose_*.py
+    # AND src/tac/pose_*_fit.py / src/tac/pose_*_basis.py to close the
+    # module-level evasion path. A future agent might place a smooth-basis
+    # pose-fit module under src/tac/ instead of experiments/ — this gate
+    # catches that pattern too.
+    candidate_globs: list[Path] = []
+    exp_dir = root / "experiments"
+    if exp_dir.is_dir():
+        candidate_globs.extend(sorted(exp_dir.glob("fit_pose_*.py")))
+    tac_dir = root / "src" / "tac"
+    if tac_dir.is_dir():
+        candidate_globs.extend(sorted(tac_dir.glob("pose_*_fit.py")))
+        candidate_globs.extend(sorted(tac_dir.glob("pose_*_basis.py")))
+        candidate_globs.extend(sorted(tac_dir.glob("pose_*_polynomial.py")))
+        candidate_globs.extend(sorted(tac_dir.glob("pose_*_spline.py")))
+        candidate_globs.extend(sorted(tac_dir.glob("pose_*_dct.py")))
+        candidate_globs.extend(sorted(tac_dir.glob("pose_*_wavelet.py")))
+        # The existing pose_gaussian_process.py is exempted by name + marker
+        # path: it uses np.polyfit and IS the killed module — we add the
+        # marker there in this same commit.
+        candidate_globs.extend(sorted(tac_dir.glob("pose_gaussian_process.py")))
+
+    if not candidate_globs:
+        if verbose:
+            print(f"  [pose-basis-fit-kill] OK: no candidate files found, skipped")
+        return violations
+
+    for py in candidate_globs:
+        n_scanned += 1
+        try:
+            text = py.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Skip test files — they may legitimately exercise the patterns.
+        rel_str = str(py.relative_to(root)) if py.is_absolute() else str(py)
+        if "/tests/" in rel_str:
+            continue
+        # Strip docstrings and comments? We allow the patterns to match
+        # anywhere — even mention in docstring suggests intent. The kill
+        # marker is the only valid waiver.
+        triggers: list[str] = []
+        for pat in SMOOTH_BASIS_PATTERNS:
+            if re.search(pat, text):
+                triggers.append(pat)
+        if not triggers:
+            continue
+        if KILL_MARKER in text:
+            continue
+        rel = py.relative_to(root) if py.is_absolute() else py
+        violations.append(
+            f"{rel}: imports/uses smooth-basis fit ({', '.join(triggers[:3])}"
+            + (", ..." if len(triggers) > 3 else "")
+            + ") without `# LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:` marker. "
+            "Read .omx/research/council_lane_gp_v4_design_20260430.md before "
+            "any new smooth-basis pose-fit experiment. The lane class is "
+            "structurally infeasible on the Lane G v3 baseline (white-noise "
+            "trajectory)."
+        )
+
+    if verbose:
+        if violations:
+            print(f"  [pose-basis-fit-kill] {len(violations)} violation(s) across {n_scanned} candidate file(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [pose-basis-fit-kill] OK: {n_scanned} candidate file(s) scanned")
+
+    if violations and strict:
+        raise PreflightError(
+            "POSE-BASIS-FIT KILL violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane GP (any smooth-basis pose-fit variant) was killed "
+            "2026-04-30 per Council #271 + Lane GP v4 design verdict. The "
+            "baseline pose trajectory is approximately white-noise in dims "
+            "1-5 — no smooth basis can fit it below RMSE ≈ 1.2. Read "
+            ".omx/research/council_lane_gp_v4_design_20260430.md and add "
+            "`# LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:` comment to override "
+            "(only legitimate use: archival of the original failed v3 lane)."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 90 (2026-04-30): Lane Maturity Registry consistency.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: every lane MUST be tracked in .omx/state/lane_registry.json via
+# tools/lane_maturity.py. The registry encodes the 7-gate Level-3 production-
+# hardened standard (CLAUDE.md "Lane maturity registry — non-negotiable" +
+# memory feedback_production_hardened_standard_definition_20260430). Without
+# this check, a hand-edit could mark a lane Level 3 without the corresponding
+# 7 gates true, defeating the standard.
+#
+# This check delegates to tools/lane_maturity.py validate_registry(), which
+# verifies:
+#   1. Schema version matches expected (catches manual format drift).
+#   2. No duplicate lane ids (catches copy-paste mistakes).
+#   3. Every lane has all 7 gates present (so a missing gate cannot silently
+#      be treated as "satisfied").
+#   4. Each lane's stored `level` matches the COMPUTED level from its gates
+#      (catches hand-edits that bumped level without bumping gates).
+#   5. Every evidence string that LOOKS LIKE a file path (heuristic: contains
+#      `/` and starts with src/, tests/, scripts/, .omx/, reports/, memory/,
+#      experiments/, tools/, submissions/, docs/, configs/, upstream/, /)
+#      MUST point to a file that actually exists on disk.
+#
+# Lands STRICT @ 0 violations on the seeded registry (verified 2026-04-30
+# against the 23 seeded lanes from the Phase 1/1.5/2/3 audit).
+
+
+def check_lane_registry_consistent(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Validate .omx/state/lane_registry.json consistency.
+
+    Delegates to tools/lane_maturity.validate_registry() so the rules live
+    in one place. Returns the list of validation errors (empty = clean).
+    Raises MetaBugViolation if strict and any errors found.
+
+    Memory: feedback_production_hardened_standard_definition_20260430.md
+    Memory: project_lane_maturity_harness_landed_20260430.md
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+
+    # Import lazily so the import cycle stays clean and so test environments
+    # without the tools/ dir on sys.path don't break.
+    try:
+        # Make `tools.` importable.
+        tools_root = str(root)
+        if tools_root not in sys.path:
+            sys.path.insert(0, tools_root)
+        from tools import lane_maturity as lm  # type: ignore[import-untyped]
+    except (ImportError, FileNotFoundError) as e:
+        violations.append(
+            f"could not import tools.lane_maturity: {e}. "
+            f"This is a setup bug — the harness was supposed to land here."
+        )
+        if verbose:
+            print(f"  [lane-registry] WARN: {violations[-1]}")
+        if strict:
+            raise MetaBugViolation(
+                "LANE-REGISTRY check failed:\n  • " + violations[-1]
+            )
+        return violations
+
+    try:
+        data = lm.load_registry(repo_root=root)
+    except (FileNotFoundError, ValueError) as e:
+        violations.append(f"registry load failed: {e}")
+        if verbose:
+            print(f"  [lane-registry] FAIL: {violations[-1]}")
+        if strict:
+            raise MetaBugViolation(
+                "LANE-REGISTRY check failed:\n  • " + violations[-1]
+            )
+        return violations
+
+    errors = lm.validate_registry(data, repo_root=root)
+    violations.extend(errors)
+
+    if verbose:
+        if violations:
+            print(
+                f"  [lane-registry] {len(violations)} consistency error(s) "
+                f"across {len(data.get('lanes', []))} lane(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [lane-registry] OK: {len(data.get('lanes', []))} lane(s) "
+                f"validated cleanly"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE-REGISTRY consistency violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix via tools/lane_maturity.py (mark/unmark/add-lane). "
+            "Bare hand-edits of .omx/state/lane_registry.json are FORBIDDEN — "
+            "see CLAUDE.md 'Lane maturity registry — non-negotiable'."
+        )
+    return violations
+
+
+# ── Check 93: logit-margin loss callers pass explicit threshold ──────────────
+# Lane 19 (SegNet logit-margin boundary loss) — see council memo
+# .omx/research/council_lane_19_logit_margin_design_20260430.md.
+#
+# Bug class: silent-default-on-boundary-loss. The Lane 19 module raises
+# ValueError when threshold is None at runtime, but a caller that hard-codes
+# `threshold=1.0` via a positional default (or via getattr without an
+# explicit profile resolver) would NOT trip the runtime check. STRICT
+# preflight enforces caller-side hygiene: every invocation of
+# `logit_margin_loss`, `logit_margin_loss_with_teacher`,
+# `compute_segnet_logit_margin_aux`, or `fragility_weights` MUST pass an
+# explicit `threshold=` kwarg.
+#
+# Why STRICT @ 0 violations: the loss zeros out for confident pixels by
+# design; if threshold is silently set wrong (e.g., 0.0 → all weights 1.0
+# = standard CE; 100.0 → all weights ~1.0 also = standard CE), the loss
+# silently degrades to standard CE and the lane's wedge is invalidated.
+# Explicit-threshold-from-profile is the only audit-safe contract.
+#
+# Memory: feedback_silent_default_bug_class_findings_20260429.md
+# (3 real bugs landed in train_renderer.py from the same class). This
+# preflight is the structural fix for the Lane 19 instance.
+
+_LANE_19_LOSS_NAMES = frozenset({
+    "logit_margin_loss",
+    "logit_margin_loss_with_teacher",
+    "compute_segnet_logit_margin_aux",
+    "fragility_weights",
+})
+
+
+def _scan_lane19_threshold_calls(py_path: Path, root: Path) -> list[str]:
+    """Return list of violations: Lane 19 loss calls without explicit threshold=.
+
+    Walks the AST. For every Call node whose `.func` resolves to one of the
+    Lane 19 loss names, check that `threshold=` appears in keywords. If not,
+    record a violation at `<file>:<line>: <funcname>(...) missing threshold=`.
+    """
+    try:
+        text = py_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    if not any(name in text for name in _LANE_19_LOSS_NAMES):
+        return []
+    try:
+        tree = ast.parse(text, filename=str(py_path))
+    except SyntaxError:
+        return []  # syntax errors caught by other checks
+    violations: list[str] = []
+    rel = str(py_path.relative_to(root))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Resolve callable name.
+        fn = node.func
+        if isinstance(fn, ast.Name):
+            name = fn.id
+        elif isinstance(fn, ast.Attribute):
+            name = fn.attr
+        else:
+            continue
+        if name not in _LANE_19_LOSS_NAMES:
+            continue
+        # Check for explicit threshold= kwarg.
+        kw_names = {kw.arg for kw in node.keywords if kw.arg is not None}
+        if "threshold" not in kw_names:
+            violations.append(
+                f"{rel}:{node.lineno}: {name}(...) missing explicit "
+                f"threshold= kwarg (Check 93 STRICT — Lane 19 callers MUST "
+                f"pass threshold from profile resolver, never positional/default)."
+            )
+    return violations
+
+
+def check_logit_margin_loss_uses_boundary_mask(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Lane 19 STRICT @ 0: every Lane 19 loss caller passes explicit threshold=.
+
+    Args:
+        repo_root: optional Path to repo root (default REPO_ROOT).
+        strict: if True, raise MetaBugViolation on any violation.
+        verbose: if True, print summary to stdout.
+
+    Returns:
+        List of violation strings (empty = clean).
+
+    Raises:
+        MetaBugViolation: if strict and any violation.
+
+    Memory: .omx/research/council_lane_19_logit_margin_design_20260430.md.
+    Memory: feedback_silent_default_bug_class_findings_20260429.md.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    for py in _iter_python_files(root, _META_PY_SCAN_DIRS):
+        n_scanned += 1
+        violations.extend(_scan_lane19_threshold_calls(py, root))
+
+    if verbose and violations:
+        print(
+            f"  [lane-19-threshold] {len(violations)} violation(s) "
+            f"across {n_scanned} files:"
+        )
+        for v in violations:
+            print(f"    • {v}")
+    elif verbose:
+        print(
+            f"  [lane-19-threshold] OK: {n_scanned} files scanned "
+            f"(0 callers missing threshold=)"
+        )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "Lane 19 logit-margin caller-threshold violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane 19 callers MUST pass an explicit threshold= kwarg "
+            "(Check 93 STRICT). The loss module raises ValueError on None, "
+            "but silent positional defaults bypass that gate. Pass threshold "
+            "from the profile resolver — see council memo "
+            ".omx/research/council_lane_19_logit_margin_design_20260430.md."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 92 (2026-04-30): Lane 8 inflate-time multipass forbidden.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# MultiPassCompressor (src/tac/multipass_compressor.py) is a COMPRESS-time
+# optimizer. Per the strict-scorer-rule in CLAUDE.md, the inflate-time
+# decoder may NOT load the contest scorer. A reference to MultiPassCompressor
+# from inside `submissions/robust_current/inflate_renderer.py` or
+# `submissions/robust_current/inflate.sh` would necessarily attempt a
+# scorer load (the compressor's `scorer` argument is a forward pass through
+# auth_eval_renderer.py), which destroys the rate term (~73MB of scorer
+# weights inside archive.zip).
+#
+# This check forbids the SYMBOL `MultiPassCompressor` and the helper
+# `compress_with_multipass` from appearing in inflate-side files. It also
+# forbids `from tac.multipass_compressor import …` from the same files.
+#
+# Lane 8 implementation lives in:
+#   - src/tac/multipass_compressor.py  (the codec, COMPRESS-time)
+#   - experiments/pipeline.py          (run_compress + step_multipass, COMPRESS-time)
+# Both are explicitly COMPRESS-time and are NOT in the forbidden path list.
+#
+# Same-line waiver: append `STRICT_PREFLIGHT_WAIVED: <reason>` to a line for
+# explicit operator approval (e.g. a documentation reference that mentions
+# the symbol name). Without the waiver, any non-comment line fires.
+#
+# Memory: project_lane_8_multipass_landed_20260430.md (TBD on landing).
+
+
+def check_no_inflate_time_multipass(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid Lane 8 ``MultiPassCompressor`` references at inflate time.
+
+    Scans ``submissions/robust_current/inflate_renderer.py`` and
+    ``submissions/robust_current/inflate.sh`` for any reference to the
+    multipass codec. Lands STRICT @ 0 violations on Lane 8 implementation
+    landing.
+
+    Returns list of violations. Raises ``MetaBugViolation`` on strict + any.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+
+    INFLATE_PATHS = [
+        "submissions/robust_current/inflate_renderer.py",
+        "submissions/robust_current/inflate.sh",
+        "submissions/exact_current/inflate.py",
+        "submissions/exact_current/inflate.sh",
+    ]
+    FORBIDDEN_TOKENS = (
+        "MultiPassCompressor",
+        "compress_with_multipass",
+        "from tac.multipass_compressor",
+        "import multipass_compressor",
+    )
+
+    for rel in INFLATE_PATHS:
+        p = root / rel
+        if not p.exists():
+            continue
+        n_scanned += 1
+        try:
+            text = p.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Strip simple comment lines so a "DO NOT IMPORT MultiPassCompressor"
+        # documentation note doesn't trigger. We use a coarse line filter
+        # — if a line that contains a FORBIDDEN_TOKEN ALSO starts with
+        # `#` or `//` (after strip), it's a documentation reference and is
+        # exempt.
+        for line_idx, raw in enumerate(text.splitlines(), start=1):
+            stripped = raw.lstrip()
+            if not stripped:
+                continue
+            for token in FORBIDDEN_TOKENS:
+                if token not in raw:
+                    continue
+                if stripped.startswith("#") or stripped.startswith("//"):
+                    # comment / documentation — exempt
+                    continue
+                if "STRICT_PREFLIGHT_WAIVED" in raw:
+                    # explicit operator waiver — exempt (must be same-line)
+                    continue
+                violations.append(
+                    f"{rel}:{line_idx}: forbidden inflate-time multipass "
+                    f"token {token!r} on non-comment line. Multi-pass is "
+                    f"compress-time only (strict-scorer-rule per CLAUDE.md)."
+                )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [no-inflate-time-multipass] {len(violations)} violation(s) "
+                f"across {n_scanned} inflate file(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [no-inflate-time-multipass] OK: {n_scanned} inflate "
+                f"file(s) scanned"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "INFLATE-TIME-MULTIPASS violations:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nMultiPassCompressor is COMPRESS-time only per the strict-"
+            "scorer-rule (CLAUDE.md). The compressor's scorer argument is a "
+            "forward pass through auth_eval_renderer.py which loads the "
+            "contest scorer; loading the scorer at inflate destroys the "
+            "rate term (~73MB inside archive.zip). Use the compressor only "
+            "from `experiments/pipeline.py compress --multipass` or your "
+            "own COMPRESS-time wrapper, never from inflate.sh / "
+            "inflate_renderer.py / inflate.py."
+        )
+    return violations
+
+
+# ── Check 94 (2026-04-30, Council Lane 17 IMP design): IMP cycle scripts
+# must (a) instantiate EMA + call ema.update, (b) end the chain with a CUDA
+# auth eval invocation, (c) include a revert-on-regression kill criterion,
+# (d) include a heartbeat loop, and (e) include an NVDEC probe at Stage 0.
+#
+# Bug class this catches: a long-running 10-cycle IMP dispatch that runs
+# 60h on a $25 cap GPU instance and produces no contest-CUDA score because
+# the script never invoked auth_eval at Stage 4 (silent skip), or that
+# burns past a regressing cycle without revert (sunk-cost fallacy in
+# code form), or that loses cycle artifacts because the heartbeat /
+# harvest path was missing.
+#
+# Detection: scan every scripts/remote_lane_*imp*.sh and assert presence
+# of (1) `contest_auth_eval.py` invocation, (2) revert-on-regression
+# token (one of: REVERT_ON_REGRESSION, revert-and-stop, REVERT_THRESHOLD,
+# kill-on-regression, regression-kill, or the council-canonical
+# `cycle_score_floor`), (3) `heartbeat`, (4) `probe_nvdec.sh`. The check
+# is the IMP-specialist sibling of Check 88 (EMA across all training
+# scripts) and Check 22 (auth-eval everywhere).
+#
+# Memory: .omx/research/council_lane_17_imp_design_20260430.md (Q4
+# revert-on-regression 9/10 vote; Q3 per-cycle auth eval 7/10 vote).
+
+
+_IMP_REVERT_TOKENS = (
+    "REVERT_ON_REGRESSION",
+    "revert-on-regression",
+    "revert_and_stop",
+    "REVERT_THRESHOLD",
+    "kill-on-regression",
+    "regression-kill",
+    "cycle_score_floor",
+    "CYCLE_SCORE_FLOOR",
+    # The exact bash variable used in the canonical dispatcher:
+    "BEST_CYCLE_SCORE",
+)
+
+
+def _scan_imp_dispatcher_for_chain_completeness(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Audit one Lane-17 IMP dispatcher for the full chain (auth eval +
+    revert + heartbeat + NVDEC probe). Returns list of violations."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    violations: list[str] = []
+    if "contest_auth_eval.py" not in text:
+        violations.append(
+            f"{rel_s}: IMP dispatcher missing CUDA auth eval invocation "
+            f"(`contest_auth_eval.py`). Add a Stage-4 auth eval block — "
+            f"per CLAUDE.md `Auth eval EVERYWHERE` non-negotiable, every "
+            f"chained experiment must end with a contest-CUDA auth eval."
+        )
+    if not any(tok in text for tok in _IMP_REVERT_TOKENS):
+        violations.append(
+            f"{rel_s}: IMP dispatcher missing revert-on-regression kill "
+            f"criterion. Council Q4 (9/10 vote) requires the dispatcher "
+            f"to revert + STOP if a cycle's auth score regresses >10% "
+            f"from the running best. Add one of: "
+            f"{', '.join(_IMP_REVERT_TOKENS)}. See "
+            f".omx/research/council_lane_17_imp_design_20260430.md§Q4."
+        )
+    if "heartbeat" not in text.lower():
+        violations.append(
+            f"{rel_s}: IMP dispatcher missing heartbeat loop. CLAUDE.md "
+            f"`Remote code parity` non-negotiable: every long-running "
+            f"remote script must write a heartbeat so a watchdog can "
+            f"detect hung processes."
+        )
+    if "probe_nvdec" not in text:
+        violations.append(
+            f"{rel_s}: IMP dispatcher missing NVDEC probe at Stage 0. "
+            f"CLAUDE.md `Vast.ai NVDEC roulette` non-negotiable: every "
+            f"remote_lane_*.sh must run `scripts/probe_nvdec.sh "
+            f"--ensure-dali` before any GPU spend."
+        )
+    return violations
+
+
+def check_imp_cycles_use_ema_and_auth_eval(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Lane 17 IMP dispatcher chain must be complete (Council 2026-04-30).
+
+    Scans ``scripts/remote_lane_*imp*.sh`` (case-insensitive) and asserts
+    each contains:
+      1. ``contest_auth_eval.py`` invocation (auth-eval-everywhere).
+      2. A revert-on-regression token (Council Q4 — kill-criterion).
+      3. ``heartbeat`` loop / variable.
+      4. ``probe_nvdec`` at Stage 0.
+
+    The companion EMA-presence audit is Check 88
+    (``check_training_paths_use_ema_correctly``); this check is the
+    IMP-specialist chain-completeness sibling.
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    n_scanned = 0
+    if scripts_dir.is_dir():
+        for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+            name_lower = sh.name.lower()
+            if "imp" not in name_lower:
+                continue
+            n_scanned += 1
+            violations.extend(
+                _scan_imp_dispatcher_for_chain_completeness(sh, root)
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [imp-dispatcher-chain] {len(violations)} violation(s) "
+                f"across {n_scanned} IMP dispatcher(s):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                f"  [imp-dispatcher-chain] OK: "
+                f"{n_scanned} IMP dispatcher(s) scanned (chain complete)"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE 17 IMP DISPATCHER CHAIN INCOMPLETE:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nCouncil Lane-17 design 2026-04-30 (Q3+Q4) requires "
+            "(1) auth eval, (2) revert-on-regression, (3) heartbeat, "
+            "(4) NVDEC probe. Reference: "
+            ".omx/research/council_lane_17_imp_design_20260430.md."
+        )
+    return violations
+
+
+# ── Check 103 (PCC1): IMP dispatch must invoke train_distill (not just stub) ─
+#
+# 2026-04-30 ~23:00 UTC. The IMP cycle 0 = 1.98 [contest-CUDA] regression
+# metabug was caused by `experiments/train_imp_cycle.py::_finetune` being a
+# documented STUB loop (200 epochs in 3.5s on L40S = ~0.017s/epoch — synthetic
+# tensors, toy L2 loss). The stub's docstring promised "deploy script swaps
+# in train_distill" — but the swap never happened. The promise was a comment,
+# not a contract.
+#
+# Council Option B+assertion (6/3/1 verdict in
+# `feedback_grand_council_imp_permanent_fix_review_20260430.md`): the swap is
+# done by the dispatch script (Stage 1.X between train_imp_cycle.py and the
+# auth-smoke), AND a STRICT preflight check enforces that the swap is wired
+# in every IMP dispatcher.
+#
+# Detection: scan every `scripts/remote_lane_j_imp_*.sh` (the canonical IMP
+# dispatcher pattern). If `experiments/train_imp_cycle.py` is invoked, then
+# `experiments/train_distill.py` (or an equivalent real trainer like
+# `experiments/train_renderer.py` / `experiments/train_renderer_fridrich.py`)
+# MUST also be invoked subsequently in the same script. Without that swap,
+# the dispatcher would be running stub-pretending-to-be-real fine-tunes
+# cycle after cycle — exactly the metabug this check exists to extinguish.
+#
+# Live count at land time: 1 dispatcher (the canonical
+# remote_lane_j_imp_iterative_magnitude_pruning.sh) — verified to invoke
+# train_distill at the Stage 1.X swap landed in the same commit. Strict @ 0.
+#
+# Memory: feedback_grand_council_imp_permanent_fix_review_20260430.md (parent
+# council vote), feedback_grand_council_imp_train_distill_swap_design_20260430.md
+# (this commit's sub-question deliberation: epochs=500 phase1-only, masks =
+# Lane G v3 anchor, auth-smoke AFTER distill).
+
+
+_IMP_REAL_TRAINER_INVOCATIONS = (
+    "experiments/train_distill.py",
+    "experiments/train_renderer.py",
+    "experiments/train_renderer_fridrich.py",
+)
+
+
+def _scan_imp_dispatcher_for_train_distill_swap(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Audit one Lane-17 IMP dispatcher to verify the train_distill swap.
+
+    A dispatcher that invokes train_imp_cycle.py without ALSO invoking a
+    real trainer (train_distill / train_renderer / train_renderer_fridrich)
+    is the cycle 0 = 1.98 metabug class. Returns list of violations.
+
+    Heuristic for "real invocation" (not a python heredoc reference):
+    looks for `"$PYBIN" -u <target>` OR `python -u <target>` patterns. Bare
+    `open('experiments/...')` strings inside python heredocs do NOT count.
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+
+    # Detect an actual invocation by looking for `<runner> -u <target>`.
+    # Acceptable runner tokens: `"$PYBIN"`, `$PYBIN`, `python`, `python3`,
+    # `.venv/bin/python`. The `-u` (unbuffered) flag is the canonical lane-
+    # script pattern (see CLAUDE.md "Vast.ai deployment" rule "Always use
+    # python3 -u for background jobs"). Heredoc references like
+    # `open('experiments/train_imp_cycle.py').read()` lack the `-u` token
+    # so are skipped.
+    import re as _re
+
+    def _has_real_invocation(target: str) -> bool:
+        # Match: optional " or nothing, runner, optional ", whitespace,
+        # then EITHER `-u <target>` OR `-u -m <module>` OR `-m <module>`.
+        # Round 1 council greenup MEDIUM #9: the prior regex required `-u`
+        # AND the file path; legitimate dispatchers using `python -m
+        # experiments.train_distill` were false-positive flagged.
+        runner = r'(?:"?\$PYBIN"?|python3?|\.venv/bin/python)'
+        # File-path form (target ends with .py): `<runner> -u <target.py>`.
+        pattern_filepath = (
+            runner + r'\s+-u\s+' + _re.escape(target)
+        )
+        if _re.search(pattern_filepath, text):
+            return True
+        # Module form: convert `experiments/train_distill.py` →
+        # `experiments.train_distill` and look for `<runner> [-u] -m <module>`.
+        if target.endswith(".py"):
+            module_path = target[:-3].replace("/", ".")
+            pattern_module = (
+                runner + r'\s+(?:-u\s+)?-m\s+'
+                + _re.escape(module_path) + r'\b'
+            )
+            if _re.search(pattern_module, text):
+                return True
+        return False
+
+    invokes_imp_cycle = _has_real_invocation("experiments/train_imp_cycle.py")
+    if not invokes_imp_cycle:
+        # No train_imp_cycle invocation at all — this isn't a real IMP
+        # dispatcher (or it uses some other mechanism). Don't flag.
+        return []
+
+    invokes_real_trainer = any(
+        _has_real_invocation(t) for t in _IMP_REAL_TRAINER_INVOCATIONS
+    )
+    if invokes_real_trainer:
+        return []
+
+    return [
+        f"{rel_s}: IMP dispatcher invokes experiments/train_imp_cycle.py "
+        f"without a subsequent real-trainer invocation (one of: "
+        f"{', '.join(_IMP_REAL_TRAINER_INVOCATIONS)}). "
+        f"train_imp_cycle.py's _finetune is a documented STUB loop "
+        f"(synthetic tensors, toy L2 loss); without the train_distill swap "
+        f"the dispatcher reproduces the cycle 0 = 1.98 [contest-CUDA] "
+        f"metabug (200 epochs in 3.5s = stub pretending to be real "
+        f"training). Council Option B+assertion 6/3/1 verdict in "
+        f"feedback_grand_council_imp_permanent_fix_review_20260430.md "
+        f"requires a Stage 1.X train_distill invocation between "
+        f"train_imp_cycle and the auth-smoke. See "
+        f"scripts/remote_lane_j_imp_iterative_magnitude_pruning.sh "
+        f"Stage 1.X for the canonical pattern."
+    ]
+
+
+def check_imp_dispatch_calls_train_distill(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """PCC1: every IMP dispatcher invoking train_imp_cycle.py MUST also
+    invoke a real trainer (train_distill / train_renderer / train_renderer_fridrich).
+
+    Bug class: stub-pretending-to-be-real (the IMP cycle 0 = 1.98 metabug,
+    2026-04-30). train_imp_cycle.py's `_finetune` at L402+ is a documented
+    in-script stub (synthetic tensors, toy L2 loss, ~0.017s/epoch on L40S);
+    its docstring promises "deploy script swaps in train_distill" but the
+    promise was enforced by NOTHING until this check. PCC3 (the wall-clock
+    assertion in train_imp_cycle.py's main, ~L362-374) catches the bug at
+    runtime; this check catches the bug at preflight time.
+
+    The check is the dispatch-side companion to PCC3 (runtime assertion):
+    PCC3 fails LOUD on the remote if the stub somehow gets shipped; this
+    PCC1 check fails LOUD at commit-time if the dispatch script doesn't
+    even contain the swap.
+
+    Memory: feedback_grand_council_imp_permanent_fix_review_20260430.md
+    (parent council 6/3/1 vote);
+    feedback_grand_council_imp_train_distill_swap_design_20260430.md
+    (sub-question deliberation: 9/10 vote each on epochs=500/masks=anchor/
+    auth-smoke-after-distill).
+    """
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    n_scanned = 0
+    if scripts_dir.is_dir():
+        for sh in sorted(scripts_dir.glob("remote_lane_j_imp_*.sh")):
+            n_scanned += 1
+            violations.extend(
+                _scan_imp_dispatcher_for_train_distill_swap(sh, root)
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [imp-train-distill-swap] {len(violations)} violation(s) "
+                f"across {n_scanned} IMP dispatcher(s):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                f"  [imp-train-distill-swap] OK: {n_scanned} IMP "
+                f"dispatcher(s) scanned (real-trainer swap present)"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE 17 IMP DISPATCHER MISSING train_distill SWAP (PCC1):\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nFix: add a Stage 1.X block to the dispatcher that "
+            "invokes `\"$PYBIN\" -u experiments/train_distill.py "
+            "--resume \"$CYC_DIR/renderer.pt\" --masks \"$ANCHOR_MASKS\" "
+            "--output-dir \"$CYC_DIR/distill\" --only-phase1 "
+            "--phase1-epochs 500 ...` between the train_imp_cycle.py "
+            "invocation and Stage 1.5 auth-smoke. Reference: "
+            "scripts/remote_lane_j_imp_iterative_magnitude_pruning.sh "
+            "+ feedback_grand_council_imp_permanent_fix_review_20260430.md."
+        )
+    return violations
+
+
+# ── Check 95: Lane 12 NeRV codec uses canonical EMA + no MPS + no .round() ──
+#
+# 2026-04-30. Lane 12 (NeRV mask codec) is the Phase 2 ACCELERATE codec lane.
+# CLAUDE.md non-negotiables for any training path apply:
+#   - Trainer instantiates ``tac.training.EMA`` (NOT a local re-implementation
+#     — the Council D wire-in 2026-04-29 PM removed a duplicate `class EMA` in
+#     `train_joint_pair.py`; same risk class for new training paths).
+#   - Trainer refuses ``device='mps'`` (MPS auth-eval drift 23x on PoseNet,
+#     2x on SegNet).
+#   - No bare ``.round()`` inside any forward / training / step / sample /
+#     evaluate function (Council A `.round()` zero-gradient bug class —
+#     5h GPU burned on Lane DARTS-S V1 freeze).
+#   - The standalone trainer (`experiments/train_nerv_mask.py`) must end
+#     the chain with a CUDA auth eval (delegated to the dispatch script
+#     `scripts/remote_lane_nerv.sh` Stage 3).
+#
+# Detection: scan `src/tac/nerv_mask_codec.py` AST for:
+#   1. `from tac.training import EMA` (canonical EMA import).
+#   2. `device.startswith("mps")` raise (MPS refused at trainer construction).
+#   3. No bare `.round()` calls inside method bodies named in
+#      forbidden_contexts (forward / step / _sample_batch / evaluate*).
+# AND scan `experiments/train_nerv_mask.py` for `contest_auth_eval` invocation
+# OR delegation comment to the dispatch script.
+#
+# All 3 land at 0 live violations after Phase C/E + tests landed. Lands
+# STRICT immediately per the Lane-A pattern.
+#
+# Reference: .omx/research/council_lane_12_nerv_design_20260430.md.
+
+
+def _scan_nerv_mask_codec_for_canonical_discipline(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Audit `src/tac/nerv_mask_codec.py` for the canonical training-path
+    discipline. Returns list of violations (empty if clean)."""
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    violations: list[str] = []
+
+    # Trainer must import the canonical EMA class. We accept either the
+    # top-of-file `from tac.training import EMA` OR a deferred import inside
+    # `NeRVMaskTrainer.__init__` (the deferred form is preferred to avoid
+    # heavy `training.py` import cost on codec-only callers).
+    if "from tac.training import EMA" not in text:
+        violations.append(
+            f"{rel_s}: missing canonical EMA import. CLAUDE.md non-negotiable: "
+            f"every training path must use `tac.training.EMA` (decay=0.997). "
+            f"Re-implementing EMA locally is the bug class fixed in Council D "
+            f"2026-04-29 PM (duplicate `class EMA` in train_joint_pair.py)."
+        )
+
+    # Trainer must refuse MPS at construction.
+    if "refuses device='mps'" not in text and "refuses device=\"mps\"" not in text:
+        violations.append(
+            f"{rel_s}: NeRVMaskTrainer must refuse device='mps' (CLAUDE.md "
+            f"`MPS auth eval is NOISE`). Add a ValueError raise at trainer "
+            f"construction matching the SegMapTrainer pattern."
+        )
+
+    # AST scan for bare `.round()` in forbidden contexts (forward / step /
+    # sample / evaluate). The companion test in
+    # `test_nerv_mask_codec.py::test_no_bare_round_in_nerv_mask_codec_source_synthetic`
+    # also enforces this; the preflight check is the static-CI sibling.
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return violations
+    forbidden_contexts = ("forward", "step", "_sample_batch")
+
+    class _RoundFinder(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.fn_stack: list[str] = []
+            self.found: list[tuple[str, int]] = []
+
+        def _enter(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.fn_stack.append(node.name)
+            try:
+                self.generic_visit(node)
+            finally:
+                self.fn_stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._enter(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+            self._enter(node)
+
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "round":
+                if len(node.args) == 0 and len(node.keywords) == 0:
+                    if self.fn_stack:
+                        innermost = self.fn_stack[-1]
+                        if innermost in forbidden_contexts or innermost.startswith(
+                            "evaluate"
+                        ):
+                            self.found.append((innermost, node.lineno))
+            self.generic_visit(node)
+
+    finder = _RoundFinder()
+    finder.visit(tree)
+    for fn_name, lineno in finder.found:
+        violations.append(
+            f"{rel_s}:{lineno}: bare `.round()` inside {fn_name!r} — "
+            f"Council A zero-gradient bug class. Use `Uint8STE.apply()` "
+            f"(from `tac.quantization`) inside any autograd-active forward."
+        )
+
+    return violations
+
+
+def _scan_nerv_trainer_script_for_auth_eval_delegation(
+    path: Path, repo_root: Path,
+) -> list[str]:
+    """Audit `experiments/train_nerv_mask.py` for auth-eval-everywhere
+    discipline. The standalone trainer either invokes `contest_auth_eval`
+    directly OR documents delegation to the dispatch script.
+
+    Comments are stripped before the substring check — a comment cannot
+    satisfy the discipline. Delegation is satisfied when a comment OR a
+    docstring mentions ``remote_lane_nerv.sh`` (a code-side import path
+    is also accepted, but a comment-only delegation is enough since the
+    dispatch script is the actual auth-eval invocation).
+    """
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    rel_s = str(rel)
+    try:
+        text = path.read_text()
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+    violations: list[str] = []
+    # Strip line comments to ensure a comment cannot satisfy the direct
+    # invocation check. Delegation IS allowed via comment / docstring.
+    code_lines = []
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0]
+        code_lines.append(stripped)
+    code_only = "\n".join(code_lines)
+    has_direct = "contest_auth_eval" in code_only
+    has_delegation = "remote_lane_nerv.sh" in text or "delegated to" in text.lower()
+    if not (has_direct or has_delegation):
+        violations.append(
+            f"{rel_s}: trainer must either invoke `contest_auth_eval.py` "
+            f"directly OR document delegation to `scripts/remote_lane_nerv.sh` "
+            f"Stage 3. CLAUDE.md `Auth eval EVERYWHERE` non-negotiable."
+        )
+    return violations
+
+
+def check_nerv_codec_uses_ema_and_no_mps_and_auth_eval(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Lane 12 NeRV codec must follow the canonical training-path discipline.
+
+    Audits both:
+      - `src/tac/nerv_mask_codec.py` for canonical EMA import + MPS refusal
+        + no bare `.round()` in forward/step/sample/evaluate methods.
+      - `experiments/train_nerv_mask.py` for auth-eval invocation OR
+        delegation to the dispatch script.
+
+    Sibling of Check 88 (`check_training_paths_use_ema_correctly`) and
+    Check 86 (`check_no_bare_round_in_eval_roundtrip`); Lane 12 specialist.
+
+    Reference: .omx/research/council_lane_12_nerv_design_20260430.md.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    codec_path = root / "src" / "tac" / "nerv_mask_codec.py"
+    if codec_path.is_file():
+        n_scanned += 1
+        violations.extend(
+            _scan_nerv_mask_codec_for_canonical_discipline(codec_path, root)
+        )
+    trainer_path = root / "experiments" / "train_nerv_mask.py"
+    if trainer_path.is_file():
+        n_scanned += 1
+        violations.extend(
+            _scan_nerv_trainer_script_for_auth_eval_delegation(trainer_path, root)
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [nerv-codec-discipline] {len(violations)} violation(s) "
+                f"across {n_scanned} Lane-12 file(s):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                f"  [nerv-codec-discipline] OK: "
+                f"{n_scanned} Lane-12 file(s) scanned (canonical discipline)"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE 12 NERV CODEC DISCIPLINE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nCLAUDE.md non-negotiables apply: canonical EMA "
+            "(tac.training.EMA decay 0.997), no MPS strategic decisions, "
+            "no bare `.round()` in autograd-active forwards, auth-eval at "
+            "end of chain. Reference: "
+            ".omx/research/council_lane_12_nerv_design_20260430.md."
+        )
+    return violations
+
+
+def _strip_python_comments_and_docstrings(text: str) -> str:
+    """Strip ``#`` line-comments and triple-quoted (doc)strings.
+
+    PRESERVES inline single-line string literals — the BHv1 integrity check
+    looks for ``"static_wins"`` as a sentinel literal in actual code, not
+    in docstrings. Stripping triple-quoted strings + ``#`` comments is
+    enough to defeat the comment-mentions-the-keyword false-positive.
+    """
+    # Remove triple-quoted strings (greedy across lines)
+    import re
+
+    out = re.sub(r'"""[\s\S]*?"""', "", text)
+    out = re.sub(r"'''[\s\S]*?'''", "", out)
+    # Remove # line comments (preserve the newline)
+    out = re.sub(r"#[^\n]*", "", out)
+    return out
+
+
+def _scan_balle_codec_for_side_info_inclusion(path: Path, root: Path) -> list[str]:
+    """Audit ``src/tac/balle_hyperprior_codec.py`` for two CLAUDE.md
+    non-negotiables:
+
+    1. ``encode_qints_full_balle`` MUST emit the hyper_decoder weights inside
+       ``side_info`` (otherwise the inflate-side decode cannot reconstruct
+       per-block σ → roundtrip fails → archive unreadable). This is the
+       Check 91 STRICT predicate.
+    2. ``encode_qints_balle_auto`` MUST keep the static-baseline guard so
+       a regressing codec is never shipped (the kill criterion from Phase A
+       council review §3 in ``.omx/research/council_lane_20_balle_design_20260430.md``).
+    """
+    violations: list[str] = []
+    rel = path.relative_to(root)
+    rel_s = str(rel).replace("\\", "/")
+    raw_text = path.read_text(encoding="utf-8", errors="replace")
+    # Strip comments + string literals so the heuristic only sees executable
+    # code (defeats false-positives when "static_wins" appears in a comment
+    # or docstring on a buggy synthetic test fixture).
+    text = _strip_python_comments_and_docstrings(raw_text)
+
+    # Predicate 1: encode_qints_full_balle must serialize hyper_decoder
+    # weights into side_info. Heuristic: same function body must call
+    # `_serialize_hyper_decoder` AND write the resulting bytes into the
+    # `side_info` BytesIO.
+    if "def encode_qints_full_balle" in text:
+        # Slice the function body out
+        start = text.index("def encode_qints_full_balle")
+        # End: next top-level "def " or end-of-file
+        next_def = text.find("\ndef ", start + 1)
+        body = text[start : next_def if next_def != -1 else len(text)]
+        if "_serialize_hyper_decoder" not in body:
+            violations.append(
+                f"{rel_s}:encode_qints_full_balle: missing call to "
+                f"`_serialize_hyper_decoder` — hyper_decoder weights MUST be "
+                f"in side_info or the inflate-side decode cannot recover σ "
+                f"(Check 91 STRICT)."
+            )
+        if "side_info.write(decoder_blob)" not in body:
+            violations.append(
+                f"{rel_s}:encode_qints_full_balle: hyper_decoder serialized "
+                f"bytes must be written into `side_info` (the BytesIO that is "
+                f"recorded as `side_info_bytes`). Without this, the archive "
+                f"loads but Lane 20 decode silently drifts — this is exactly "
+                f"the bug class CLAUDE.md FORBIDDEN PATTERNS warns against."
+            )
+
+    # Predicate 2: encode_qints_balle_auto must keep the static-baseline
+    # guard. Heuristic: same function body checks ``len(chosen_blob) >= int(
+    # static_baseline_bytes)`` AND returns the static_wins sentinel.
+    if "def encode_qints_balle_auto" in text:
+        start = text.index("def encode_qints_balle_auto")
+        next_def = text.find("\ndef ", start + 1)
+        body = text[start : next_def if next_def != -1 else len(text)]
+        if "static_baseline_bytes" not in body:
+            violations.append(
+                f"{rel_s}:encode_qints_balle_auto: missing "
+                f"`static_baseline_bytes` parameter / guard. The auto path "
+                f"MUST refuse to ship if no candidate beats the static "
+                f"baseline (kill criterion per Phase A council review)."
+            )
+        if "static_wins" not in body:
+            violations.append(
+                f"{rel_s}:encode_qints_balle_auto: missing the "
+                f"`static_wins` sentinel return path."
+            )
+    return violations
+
+
+def check_balle_hyperprior_includes_side_info_in_archive(
+    *, strict: bool = False, verbose: bool = False, repo_root: Path | None = None,
+) -> list[str]:
+    """Lane 20 (Ballé hyperprior) — BHv1 wire-format integrity check.
+
+    Verifies that the production codec at ``src/tac/balle_hyperprior_codec.py``:
+
+    1. Always serializes the hyper_decoder weights into ``side_info`` for
+       the FULL_BALLE mode (otherwise inflate-side decode silently drifts —
+       the FP16 round-trip mismatch debugged 2026-04-30 in Phase B).
+    2. Keeps the ``static_baseline_bytes`` guard in ``encode_qints_balle_auto``
+       so a regressing untrained codec falls back to ``static_wins`` rather
+       than shipping a 5x-larger blob (Phase E empirical: untrained Ballé is
+       ~3x worse than static on FP4 nibble streams; the auto-guard is the
+       only thing that keeps Lane 20 from being a regression).
+
+    Reference: ``.omx/research/council_lane_20_balle_design_20260430.md``;
+    ``feedback_production_hardened_standard_definition_20260430.md`` (the
+    Level 3 bar this check enforces for Lane 20).
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    codec_path = root / "src" / "tac" / "balle_hyperprior_codec.py"
+    if codec_path.is_file():
+        n_scanned += 1
+        violations.extend(
+            _scan_balle_codec_for_side_info_inclusion(codec_path, root)
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [balle-bhv1-integrity] {len(violations)} violation(s) "
+                f"across {n_scanned} Lane-20 file(s):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                f"  [balle-bhv1-integrity] OK: "
+                f"{n_scanned} Lane-20 file(s) scanned (BHv1 wire-format integrity)"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LANE 20 BHv1 WIRE-FORMAT INTEGRITY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nCLAUDE.md non-negotiables apply: side-info MUST contain "
+            "hyper_decoder weights or inflate-side decode silently drifts; "
+            "auto-fallback to static_wins MUST guard against shipping a "
+            "regressing untrained codec. Reference: "
+            ".omx/research/council_lane_20_balle_design_20260430.md."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 96 (2026-04-30): Lane PFP16 — pose stream should use fp16 or smaller.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: Lane GP v4 KILL VERDICT (.omx/research/council_lane_gp_v4_design_20260430.md)
+# surfaced Hotz's dominant-strategy successor: cast `optimized_poses.pt` from
+# fp32 (~15.6 KB pickle) to raw fp16 binary (~7.2 KB) for an 8.4 KB pose
+# stream byte savings at zero distortion (PoseNet runs in fp16 internally
+# during contest CUDA evaluation, so the cast is invisible to scoring).
+# The corresponding implementation lane is Lane PFP16 (`src/tac/pfp16_codec.py`
+# + `experiments/build_lane_g_v3_pfp16_stack.py`).
+#
+# This check guards against future archive build scripts shipping fp32 pose
+# tensors when fp16 is sufficient. It scans every
+# `experiments/build_*_stack.py`, `experiments/build_*_archive.py`, and
+# `experiments/build_lane_*.py` file. If the file calls `torch.save(poses, ...)`
+# WITHOUT first calling `.half()` / `encode_pfp16()` / `save_poses_binary()`
+# / `encode_pose_deltas()` / `encode_pose_delta_v2()` / `encode_lora_*()`,
+# the build is shipping an fp32 pose tensor unnecessarily.
+#
+# Waiver pattern: `# POSE_FP32_REQUIRED:<reason>` — for legitimate exceptions
+# where fp32 precision IS required (e.g., a future renderer that uses pose
+# values outside fp16 dynamic range, or a debug build).
+#
+# Lands STRICT @ 0 violations after Lane PFP16 lands (the only existing
+# archive build that ships poses is `experiments/build_lane_g_v3_omega_w_v2_stack.py`,
+# which copies bit-identical bytes from Lane G v3 — that path is exempted
+# because it is a pure byte-copy with no encode-side decision to make).
+# Memory: project_lane_pfp16_landed_20260430.md.
+
+
+_PFP16_POSE_ENCODE_FUNCTIONS = (
+    "encode_pfp16",
+    "encode_pose_file_pfp16",
+    "save_poses_binary",
+    "encode_pose_deltas",
+    "encode_pose_file",  # pose_delta_codec wrapper
+    "encode_pose_delta_v2",
+    "encode_pose_file_pdv2",
+    "encode_lora_poses",
+    "encode_lora_v2_poses",
+)
+_PFP16_WAIVER_MARKER = "POSE_FP32_REQUIRED:"
+
+
+def check_pose_stream_uses_fp16_or_smaller(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid archive build scripts that ship fp32 pose tensors when fp16
+    is sufficient.
+
+    Scans every `experiments/build_*_stack.py`, `experiments/build_*_archive.py`,
+    `experiments/build_lane_*.py`. A file is FLAGGED if it satisfies BOTH:
+
+      (a) calls `torch.save(...)` on what looks like a pose tensor (the
+          variable name contains `pose` OR the call pattern is
+          `torch.save(poses, ...)` / `torch.save(optimized_poses, ...)`),
+      (b) does NOT use any of the canonical pose-encode functions
+          (`encode_pfp16`, `save_poses_binary`, `encode_pose_deltas`, etc.)
+          AND does NOT carry a `# POSE_FP32_REQUIRED:<reason>` waiver.
+
+    A file is also flagged if it directly writes `tensor.float()` /
+    `tensor.to(torch.float32)` to an `optimized_poses.pt` archive entry.
+
+    Returns list of violations. Raises PreflightError if strict and any.
+
+    Files known to be pure byte-copies of pre-built pose artifacts (e.g.
+    `experiments/build_lane_g_v3_omega_w_v2_stack.py` copying Lane G v3's
+    `optimized_poses.pt` bit-identically) are exempted via path-based filter
+    + the same waiver marker.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+
+    exp_dir = root / "experiments"
+    if not exp_dir.is_dir():
+        if verbose:
+            print(f"  [pose-stream-fp16] OK: experiments/ not present, skipped")
+        return violations
+
+    candidate_globs: list[Path] = []
+    candidate_globs.extend(sorted(exp_dir.glob("build_*_stack.py")))
+    candidate_globs.extend(sorted(exp_dir.glob("build_*_archive.py")))
+    candidate_globs.extend(sorted(exp_dir.glob("build_lane_*.py")))
+    # Dedup (a build script may match multiple globs).
+    candidate_globs = sorted(set(candidate_globs))
+
+    if not candidate_globs:
+        if verbose:
+            print(f"  [pose-stream-fp16] OK: no candidate files found, skipped")
+        return violations
+
+    for py in candidate_globs:
+        n_scanned += 1
+        try:
+            text = py.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = py.relative_to(root) if py.is_absolute() else py
+        rel_str = str(rel)
+
+        # Skip test files — they may legitimately exercise the patterns.
+        if "/tests/" in rel_str:
+            continue
+
+        # Waiver marker exempts the whole file.
+        if _PFP16_WAIVER_MARKER in text:
+            continue
+
+        # If the file uses any canonical pose-encode function, it's compliant.
+        if any(fn in text for fn in _PFP16_POSE_ENCODE_FUNCTIONS):
+            continue
+
+        # Heuristic: does this build script even touch poses? If not, skip.
+        # A build script that doesn't mention "pose" anywhere is not a pose
+        # producer; ignore.
+        text_lower = text.lower()
+        if "pose" not in text_lower:
+            continue
+
+        # Look for torch.save(...) calls — this is the fp32-pickle smoking
+        # gun. Pattern: torch.save(<expr>, ...) where <expr> mentions pose.
+        #
+        # Conservative: flag any torch.save in a pose-touching build script
+        # without a canonical encoder. The waiver marker is the explicit
+        # exemption mechanism for legitimate fp32-required cases.
+        torch_save_pattern = re.compile(
+            r"torch\.save\s*\([^)]*pose[^)]*\)",
+            re.IGNORECASE,
+        )
+        if torch_save_pattern.search(text):
+            violations.append(
+                f"{rel}: calls `torch.save(<pose-tensor>, ...)` without "
+                f"using canonical pose-encode function ({', '.join(_PFP16_POSE_ENCODE_FUNCTIONS[:4])}, "
+                f"...) and without `# POSE_FP32_REQUIRED:<reason>` waiver. "
+                f"This ships fp32 pose tensors when fp16 is sufficient (Lane "
+                f"PFP16 saves ~8 KB at zero distortion). Read "
+                f".omx/research/council_lane_gp_v4_design_20260430.md "
+                f"(Hotz successor option) and either (a) replace torch.save "
+                f"with encode_pfp16 + write_bytes, or (b) add `# POSE_FP32_REQUIRED:<reason>` "
+                f"comment if fp32 is genuinely required."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [pose-stream-fp16] {len(violations)} violation(s) across "
+                  f"{n_scanned} candidate file(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(f"  [pose-stream-fp16] OK: {n_scanned} candidate file(s) "
+                  f"scanned (Lane PFP16 fp16-or-smaller discipline)")
+
+    if violations and strict:
+        raise PreflightError(
+            "POSE-STREAM FP16 VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane PFP16 (Hotz successor option from Lane GP v4 KILL) "
+            "ships pose streams as raw fp16 binary for ~8 KB savings at zero "
+            "distortion. Read .omx/research/council_lane_gp_v4_design_20260430.md "
+            "and use `encode_pfp16` from `src/tac/pfp16_codec.py` (or any of "
+            f"the other canonical pose encoders: {', '.join(_PFP16_POSE_ENCODE_FUNCTIONS)}). "
+            "Override with `# POSE_FP32_REQUIRED:<reason>` comment ONLY when "
+            "fp32 precision is genuinely required (e.g., pose values outside "
+            "fp16 dynamic range)."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 98 (2026-04-30): remote auth-eval JSON adjudication only.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Incident: Lane PFP16 exact CUDA produced a clean contest_auth_eval.json
+# recomputed score of 1.0440481283330025, but the remote script parsed the human
+# report line `Final score: 100*segnet_dist + ... = 1.04` with a generic
+# `final[_ ]?score...` regex and captured the coefficient `100`. The resulting
+# provenance falsely recorded contest_cuda_score=100 and hard_kill_triggered.
+#
+# Rule: any remote_lane_*.sh that consumes contest_auth_eval output must use
+# machine JSON (`eval_work/contest_auth_eval.json` or the strict RESULT_JSON
+# sentinel) and must never scrape human score text or "last JSON-looking blob".
+
+
+_AUTH_EVAL_FRAGILE_LOG_JSON_RE = re.compile(
+    r"grep\s+-Eo\s+(['\"])(?:\\)?\{(?:\\)?\.\*(?:\\)?\}\1"
+)
+
+
+def _scan_remote_lane_auth_eval_fragile_parse(path: Path, repo_root: Path) -> list[str]:
+    """Return fragile contest-auth parse violations for one remote lane script."""
+    violations: list[str] = []
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return violations
+    if "contest_auth_eval" not in text:
+        return violations
+
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    code_text = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+    contest_cuda_claim = "[contest-CUDA]" in text
+    if contest_cuda_claim and "contest_auth_eval.py" in text:
+        if "--keep-work-dir" not in code_text or "--work-dir" not in code_text:
+            violations.append(
+                f"{rel}: [contest-CUDA] auth eval must pass --keep-work-dir "
+                f"AND --work-dir so eval_work/contest_auth_eval.json remains "
+                f"available for custody. RESULT_JSON log lines are diagnostics, "
+                f"not promotion evidence."
+            )
+        auth_device_guarded = (
+            'AUTH_DEVICE" != "cuda"' in code_text
+            or "AUTH_DEVICE' != 'cuda'" in code_text
+            or 'AUTH_EVAL_DEVICE" != "cuda"' in code_text
+            or "AUTH_EVAL_DEVICE' != 'cuda'" in code_text
+            or "ALLOW_NON_CUDA_EVAL" in code_text
+        )
+        if "AUTH_EVAL_DEVICE" in code_text and not auth_device_guarded:
+            violations.append(
+                f"{rel}: [contest-CUDA] auth eval references AUTH_EVAL_DEVICE "
+                f"without a fail-closed cuda guard. Promotable scripts must "
+                f"use `--device cuda` directly, or abort unless the resolved "
+                f"device is exactly cuda and explicitly mark non-cuda runs "
+                f"advisory."
+            )
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if (
+            contest_cuda_claim
+            and "--device" in line
+            and "AUTH_EVAL_DEVICE" in line
+            and "ALLOW_NON_CUDA_EVAL" not in text
+        ):
+            violations.append(
+                f"{rel}:{lineno}: [contest-CUDA] auth eval uses AUTH_EVAL_DEVICE "
+                f"as the --device value. This can silently downgrade to CPU/MPS; "
+                f"use literal `--device cuda` for promotion."
+            )
+        if "final[_ ]?score" in line:
+            violations.append(
+                f"{rel}:{lineno}: parses human `final[_ ]?score` text. "
+                f"Read eval_work/contest_auth_eval.json and use "
+                f"score_recomputed_from_components instead."
+            )
+        if "re.search" in line and "score" in line and "\\s*" in line:
+            violations.append(
+                f"{rel}:{lineno}: regex-scrapes a score from auth-eval text. "
+                f"Use JSON schema fields from contest_auth_eval.json."
+            )
+        if _AUTH_EVAL_FRAGILE_LOG_JSON_RE.search(line):
+            violations.append(
+                f"{rel}:{lineno}: scrapes the last JSON-looking object from "
+                f"auth_eval.log. Require contest_auth_eval.json or a strict "
+                f"RESULT_JSON sentinel instead."
+            )
+    return violations
+
+
+def check_remote_lane_auth_eval_json_adjudication(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid fragile score/log scraping in remote lane auth-eval scripts."""
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    n_scanned = 0
+    if not scripts_dir.is_dir():
+        if verbose:
+            print("  [remote-auth-json] OK: scripts/ not present, skipped")
+        return violations
+
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        n_scanned += 1
+        violations.extend(_scan_remote_lane_auth_eval_fragile_parse(sh, root))
+
+    if verbose:
+        if violations:
+            print(f"  [remote-auth-json] {len(violations)} violation(s) across "
+                  f"{n_scanned} remote_lane_*.sh file(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... {len(violations) - 20} more")
+        else:
+            print(f"  [remote-auth-json] OK: {n_scanned} remote_lane_*.sh "
+                  f"file(s) use machine-readable auth eval adjudication")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE AUTH-EVAL JSON ADJUDICATION VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nDo not parse human report text. Use "
+            "`eval_work/contest_auth_eval.json` and "
+            "`score_recomputed_from_components`; keep `final_score` only as "
+            "rounded display."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 99 (2026-04-30): KL/JBL/distillation promotion provenance.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# KL/JBL/distillation-active lanes can be useful forensic or promotion
+# experiments, but only after exact CUDA archive custody, a frozen
+# distillation_policy_v1 payload, a policy SHA, and explicit PoseNet/SegNet
+# non-collapse gates. The adjudicator enforces this dynamically; this static
+# scan catches remote scripts that wire an adjudicated promotion path without
+# the required policy/gate surface.
+
+
+def _strip_shell_comments(text: str) -> str:
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def _token_float_is_positive(token: str) -> bool:
+    try:
+        return float(token.strip().strip("'\"")) > 0.0
+    except ValueError:
+        return False
+
+
+def _script_has_distillation_runtime_signal(code_text: str) -> bool:
+    if "distillation_policy" in code_text:
+        return True
+    if re.search(r"(?i)(loss_mode['\"]?\s*:\s*['\"]jbl['\"]|--loss-mode\s+jbl)", code_text):
+        return True
+    for match in re.finditer(r"--kl-distill-weight\s+([^\s\\]+)", code_text):
+        if _token_float_is_positive(match.group(1)):
+            return True
+    for match in re.finditer(
+        r"kl_distill_weight['\"]?\s*:\s*['\"]?([^,'\"\s}\)]+)",
+        code_text,
+    ):
+        if _token_float_is_positive(match.group(1)):
+            return True
+    return False
+
+
+def _script_has_distillation_adjudication_path(code_text: str) -> bool:
+    return (
+        "scripts/adjudicate_contest_auth_eval.py" in code_text
+        or "adjudicate_contest_auth_eval.py" in code_text
+        or "PROMOTION_ELIGIBLE" in code_text
+        or '"promotion_eligible": True' in code_text
+        or '"promotion_eligible": true' in code_text
+    )
+
+
+def _scan_remote_distillation_promotion_provenance(path: Path, repo_root: Path) -> list[str]:
+    violations: list[str] = []
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return violations
+    if "contest_auth_eval" not in text:
+        return violations
+
+    code_text = _strip_shell_comments(text)
+    if not _script_has_distillation_runtime_signal(code_text):
+        return violations
+    if not _script_has_distillation_adjudication_path(code_text):
+        return violations
+
+    rel = path.relative_to(repo_root) if path.is_absolute() else path
+    required_tokens = {
+        "distillation_policy": "serialized distillation_policy_v1 payload in provenance",
+        "distillation_policy_sha256": "policy SHA in provenance",
+        "scripts/adjudicate_contest_auth_eval.py": "strict adjudication helper",
+        "--baseline-posenet-dist": "PoseNet reference for non-collapse gate",
+        "--baseline-segnet-dist": "SegNet reference for non-collapse gate",
+        "--max-posenet-relative": "PoseNet relative non-collapse gate",
+        "--max-segnet-relative": "SegNet relative non-collapse gate",
+    }
+    for token, reason in required_tokens.items():
+        if token not in code_text:
+            violations.append(f"{rel}: distillation promotion path missing {token!r} ({reason}).")
+
+    if re.search(r"--device\s+cuda\b", code_text) is None:
+        violations.append(
+            f"{rel}: distillation promotion path must run contest_auth_eval with exact "
+            "literal `--device cuda` before promotion."
+        )
+    if "ARCHIVE_SHA256" not in code_text and "contest_cuda_archive_sha256" not in code_text:
+        violations.append(
+            f"{rel}: distillation promotion path must surface archive SHA custody "
+            "from adjudication before promotion."
+        )
+    if "ARCHIVE_BYTES" not in code_text and "contest_cuda_archive_bytes" not in code_text:
+        violations.append(
+            f"{rel}: distillation promotion path must surface archive byte custody "
+            "from adjudication before promotion."
+        )
+
+    return violations
+
+
+def check_remote_distillation_promotion_provenance(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Require policy SHA, CUDA custody, archive custody, and component gates."""
+    root = repo_root or REPO_ROOT
+    scripts_dir = root / "scripts"
+    violations: list[str] = []
+    n_scanned = 0
+    if not scripts_dir.is_dir():
+        if verbose:
+            print("  [remote-distill-promotion] OK: scripts/ not present, skipped")
+        return violations
+
+    for sh in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        n_scanned += 1
+        violations.extend(_scan_remote_distillation_promotion_provenance(sh, root))
+
+    if verbose:
+        if violations:
+            print(f"  [remote-distill-promotion] {len(violations)} violation(s) across "
+                  f"{n_scanned} remote_lane_*.sh file(s):")
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    ... {len(violations) - 20} more")
+        else:
+            print(f"  [remote-distill-promotion] OK: {n_scanned} remote_lane_*.sh "
+                  f"file(s) have no under-gated distillation promotion path")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "REMOTE DISTILLATION PROMOTION PROVENANCE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nKL/JBL/distillation-active artifacts cannot promote unless "
+            "adjudication sees distillation_policy_v1, distillation_policy_sha256, "
+            "exact CUDA auth eval, archive SHA/bytes, and PoseNet/SegNet "
+            "non-collapse gates."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 100 (2026-04-30): launch retry wrapper single-flight and signal safety.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Incident: an interrupted SA retry dispatch created multiple same-label Vast
+# attempts. One child phase was orphan-risky, one instance had staged repo state,
+# and another had no repo. The correct behavior is fail-closed: one local
+# single-flight process per label, no new attempt if Vast already has a live
+# matching label prefix, and subprocess stages started in killable process
+# groups so parent termination cannot strand phase2 children.
+
+
+def check_launch_retry_wrapper_singleflight_and_signal_safe(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Guard launcher DX against duplicate spend and orphan phase processes."""
+    root = repo_root or REPO_ROOT
+    target = root / "scripts" / "launch_lane_with_retry.py"
+    violations: list[str] = []
+
+    if not target.is_file():
+        violations.append("scripts/launch_lane_with_retry.py missing")
+    else:
+        text = target.read_text(errors="ignore")
+        required_tokens = {
+            "single-flight advisory lock": "LaunchLock",
+            "fcntl non-blocking lock": "fcntl.flock",
+            "per-label lock directory": "launch_locks",
+            "child process group": "start_new_session=True",
+            "process-group kill": "os.killpg",
+            "SIGINT handler": "signal.signal(signal.SIGINT",
+            "SIGTERM handler": "signal.signal(signal.SIGTERM",
+            "live Vast label-prefix guard": "live_instances_with_label_prefix",
+            "duplicate-state sentinel": "UNKNOWN_EXISTING_LABEL_PREFIX",
+            "manual duplicate override flag": "allow_existing_label_prefix",
+            "logical lane duplicate key": "logical_lane_key",
+            "dispatch hold guard": "dispatch_hold_for_label",
+            "dispatch hold sentinel": "FATAL_DISPATCH_HOLD",
+            "Lane 12 retraining gate": "lane12_retraining_gate_violations",
+            "Lane 12 clearance packet": "lane12_nerv_l2_clearance.json",
+            "Lane 12 retraining sentinel": "FATAL_LANE12_RETRAINING_GATE",
+        }
+        for label, token in required_tokens.items():
+            if token not in text:
+                violations.append(
+                    f"scripts/launch_lane_with_retry.py missing {label} token `{token}`"
+                )
+
+    if verbose:
+        if violations:
+            print("  [launch-retry-self-protect] "
+                  f"{len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [launch-retry-self-protect] OK: retry launcher is "
+                  "single-flight, duplicate-aware, and signal-safe")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "LAUNCH RETRY SELF-PROTECTION VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nDispatch orchestration must fail closed. Add a per-label "
+            "single-flight lock, a live Vast label-prefix guard, and "
+            "process-group cleanup for child stages before launching lanes."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 101 (2026-04-30): Modal recovery CLI guidance must be current.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Incident: Modal 1.4.1 no longer exposes `modal call get`, but
+# experiments/modal_train_lane.py and experiments/modal_recover_lane.py still
+# printed it after a detached OWV3 Fisher smoke dispatch. Operators following
+# stale commands can miss harvest windows, duplicate jobs, or mistrust live
+# state. The supported path is:
+#   - poll/harvest through experiments/modal_recover_lane.py
+#   - list/log apps with `modal app list` and `modal app logs <app-id>`
+
+
+def check_modal_recovery_cli_guidance_current(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid stale Modal CLI recovery commands in operator-facing scripts."""
+    root = repo_root or REPO_ROOT
+    targets = [
+        root / "experiments" / "modal_train_lane.py",
+        root / "experiments" / "modal_recover_lane.py",
+    ]
+    violations: list[str] = []
+
+    for target in targets:
+        if not target.is_file():
+            violations.append(f"{target.relative_to(root)} missing")
+            continue
+        text = target.read_text(errors="ignore")
+        rel = target.relative_to(root)
+        if "modal call get" in text:
+            violations.append(
+                f"{rel}: references removed Modal CLI command `modal call get`; "
+                "use experiments/modal_recover_lane.py and `modal app logs <app-id>`."
+            )
+        if "experiments/modal_recover_lane.py --call-id" not in text:
+            violations.append(
+                f"{rel}: does not expose direct recovery via "
+                "`experiments/modal_recover_lane.py --call-id`."
+            )
+        if "modal app logs <app-id>" not in text:
+            violations.append(
+                f"{rel}: does not expose current Modal log command "
+                "`modal app logs <app-id>`."
+            )
+
+    if verbose:
+        if violations:
+            print(f"  [modal-recovery-cli] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [modal-recovery-cli] OK: Modal recovery guidance uses "
+                  "current CLI/API paths")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "MODAL RECOVERY CLI GUIDANCE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nDetached Modal lanes must be recoverable with current "
+            "Modal CLI/API commands. Use `experiments/modal_recover_lane.py` "
+            "for FunctionCall polling and `modal app logs <app-id>` for logs."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 102 (2026-04-30): Modal CPU auth-eval advisory-only telemetry.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Incident class: provider wrappers may force contest_auth_eval to CPU to work
+# around missing NVDEC/DALI on Modal. Those outputs can be useful diagnostics,
+# but they are not CUDA auth-eval truth. Static preflight must prevent operator
+# text, metadata, or recovery output from presenting CPU/MPS scores as
+# promotable evidence.
+
+
+_MODAL_CPU_SCORE_TRUTH_RE = re.compile(
+    r"(?i)(identical scores|modal-t4-cuda|auto-extract(?:ed)? auth score)"
+)
+
+
+def check_modal_cpu_auth_eval_is_advisory_only(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Ensure Modal CPU auth-eval output is labelled non-promotable."""
+    root = repo_root or REPO_ROOT
+    train_path = root / "experiments" / "modal_train_lane.py"
+    recover_path = root / "experiments" / "modal_recover_lane.py"
+    violations: list[str] = []
+
+    texts: dict[str, str] = {}
+    for target in (train_path, recover_path):
+        rel = target.relative_to(root)
+        if not target.is_file():
+            violations.append(f"{rel} missing")
+            continue
+        texts[str(rel)] = target.read_text(errors="ignore")
+
+    for rel, text in texts.items():
+        for match in _MODAL_CPU_SCORE_TRUTH_RE.finditer(text):
+            violations.append(
+                f"{rel}: stale Modal CPU score-truth wording `{match.group(0)}`. "
+                "Modal CPU auth eval is advisory only; exact CUDA auth eval is "
+                "required before promotion/ranking/retirement claims."
+            )
+
+    train_text = texts.get("experiments/modal_train_lane.py", "")
+    recover_text = texts.get("experiments/modal_recover_lane.py", "")
+    forces_cpu = bool(
+        re.search(r"AUTH_EVAL_DEVICE[\"']?\s*[:=]\s*[\"']cpu[\"']", train_text)
+        or re.search(r"AUTH_EVAL_DEVICE\s*=\s*cpu\b", train_text)
+    )
+
+    if forces_cpu:
+        train_required = {
+            "MODAL_AUTH_EVAL_ADVISORY_ONLY": "child environment advisory marker",
+            "SCORE_CLAIM": "child environment score-claim false marker",
+            "PROMOTION_ELIGIBLE": "child environment promotion false marker",
+            "auth_eval_advisory_only": "saved Modal metadata advisory marker",
+            "score_claim": "saved Modal metadata score-claim marker",
+            "promotion_eligible": "saved Modal metadata promotion marker",
+        }
+        for token, reason in train_required.items():
+            if token not in train_text:
+                violations.append(
+                    f"experiments/modal_train_lane.py: AUTH_EVAL_DEVICE=cpu "
+                    f"without {reason} `{token}`."
+                )
+
+        recover_required = {
+            "auth_score_summary_lines": "central score formatter",
+            "score_recomputed_from_components": "recomputed score preference",
+            "ADVISORY AUTH SCORE": "visible advisory header",
+            "NON-PROMOTABLE": "visible non-promotable warning",
+            "device_label == \"cuda\"": "device-aware CUDA branch",
+            "before promotion, ranking, retirement": "operator warning text",
+        }
+        for token, reason in recover_required.items():
+            if token not in recover_text:
+                violations.append(
+                    f"experiments/modal_recover_lane.py: Modal CPU auth eval "
+                    f"recovery missing {reason} `{token}`."
+                )
+
+    if verbose:
+        if violations:
+            print(f"  [modal-cpu-auth-advisory] {len(violations)} violation(s):")
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print("  [modal-cpu-auth-advisory] OK: Modal CPU auth eval is advisory-only")
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "MODAL CPU AUTH-EVAL ADVISORY-ONLY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nModal CPU/MPS auth output is diagnostic telemetry only. "
+            "Rerun exact archive bytes through contest_auth_eval.py --device "
+            "cuda before promotion, ranking, retirement, or stack claims."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 97 (2026-04-30): renderer-codec PoseNet protection.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: Lane Ω-W-V2 stack on 2026-04-30 burnt $0.05 + 50s GPU and produced
+# score 1.07 vs Lane G v3 baseline 1.05. The codec saved -0.034 rate but cost
+# +0.052 PoseNet distortion (PoseNet went from 0.003455 → 0.005644, +63.4%).
+# Memory: feedback_owv2_savings_correction_conv_vs_full_renderer_20260430.md.
+#
+# Root cause: a codec module mutates renderer.bin weights but contains no
+# PoseNet-protection mention (no per-channel Hessian, no PoseNet-FastViT-input-
+# derivative weighting, no protected-layer fp16 fallback). The codec optimizes
+# bytes-saved without measuring score-relevant sensitivity.
+#
+# This check audits codec modules under src/tac/ that mutate state_dict or
+# module weights. Each such module MUST contain a PoseNet-protection signal
+# (one of the inline tags below) OR an explicit waiver.
+#
+# Tag patterns (case-insensitive, must appear inline somewhere in the module):
+#   `[posenet-protected]`            module weights PoseNet-sensitivity-aware
+#   `[posenet-sensitivity-weighted]` per-layer / per-channel sensitivity
+#   `[per-channel-hessian]`          uses Hessian for layer importance
+#   `[fp16-only-fallback]`           protected-layer fallback to fp16/fp32
+#   `[mask-codec-not-renderer]`      not a renderer codec
+#   `[pose-codec-not-renderer]`      not a renderer codec
+#
+# Waiver pattern: a same-line comment containing
+#   `# RENDERER_CODEC_POSENET_PROTECTION_WAIVED:<reason>`
+# anywhere in the module file.
+#
+# Scope: src/tac/*codec*.py and src/tac/owv2_renderer_archive.py (the OWV2
+# module file). Test files, magic registries, library-only utilities, and
+# benchmark wrappers are exempted by name.
+#
+# Lands WARN-ONLY initially per the Lane A → STRICT promotion path because 4
+# codec modules currently miss the tag (visible at audit time 2026-04-30):
+#   - src/tac/neural_weight_codec.py
+#   - src/tac/water_filling_codec_v2.py
+#   - src/tac/balle_hyperprior_codec.py
+#   - src/tac/block_fp_codec.py
+#   - src/tac/owv2_renderer_archive.py (only weak mention)
+# Promotion plan: each module gets the appropriate tag in a dedicated
+# follow-up commit (out of scope for the bug-class-hardening landing — adding
+# the tags requires per-module audit by the codec subagent owners).
+#
+# Reference: feedback_owv2_savings_correction_conv_vs_full_renderer_20260430.md
+# Memory: project_swarm_recovery_state_20260430.md (Finding 1: Ω-W-V2 1.07
+# REGRESSION).
+
+_RENDERER_CODEC_POSENET_TAGS = (
+    "[posenet-protected]",
+    "[posenet-sensitivity-weighted]",
+    "[per-channel-hessian]",
+    "[fp16-only-fallback]",
+    "[mask-codec-not-renderer]",
+    "[pose-codec-not-renderer]",
+)
+_RENDERER_CODEC_WAIVER_MARKER = "RENDERER_CODEC_POSENET_PROTECTION_WAIVED:"
+
+# Modules that touch state_dict but are NOT renderer codecs (mask / pose / pure
+# library / wrapper). Exempted by basename.
+_RENDERER_CODEC_EXEMPT_BASENAMES = frozenset({
+    # Mask codecs (not renderer state_dict mutation):
+    "mask_codec.py",
+    "nerv_mask_codec.py",
+    "argmax_codec.py",
+    "stc_boundary_codec.py",
+    # Pose codecs (not renderer state_dict mutation):
+    "pose_delta_codec.py",
+    "pose_delta_codec_v2.py",
+    "pfp16_codec.py",
+    # Library-only / arithmetic / magic / benchmark:
+    "arithmetic_qint_codec.py",
+    "codec_magic_registry.py",
+    "benchmark_codecs.py",
+    # Sensitivity wrapper (computes weights, doesn't apply them — consumers
+    # in renderer codecs MUST then prove they USE the weights).
+    "neural_weight_codec_sensitivity.py",
+    # Lossless container codecs (don't touch state_dict numerically).
+    "codecs.py",  # src/tac/lossless/codecs.py
+    # MDL framework (meta codec-comparison, no archive bytes).
+    "mdl_bayesian_codec.py",
+    # Pure VQ-VAE codebook (research code, not on the production renderer path).
+    "vqvae_codec.py",
+    # Network codec (already heavily PoseNet-protected — verified 13 mentions
+    # in audit). Stays in the scope but compliance is baked into its design.
+})
+
+
+def _renderer_codec_files(repo_root: Path) -> list[Path]:
+    """Enumerate src/tac/*codec*.py + owv2_renderer_archive.py files."""
+    out: list[Path] = []
+    tac_dir = repo_root / "src" / "tac"
+    if not tac_dir.is_dir():
+        return out
+    # Top-level codec modules.
+    out.extend(sorted(tac_dir.glob("*codec*.py")))
+    # OWV2 module — special case (incident origin).
+    owv2 = tac_dir / "owv2_renderer_archive.py"
+    if owv2.is_file():
+        out.append(owv2)
+    # Subdirectory codecs (lossless/, contrib/).
+    for sub in ("lossless", "contrib"):
+        subdir = tac_dir / sub
+        if subdir.is_dir():
+            out.extend(sorted(subdir.glob("*codec*.py")))
+    # Dedup + sort.
+    return sorted(set(out))
+
+
+def _renderer_codec_touches_state_dict(text: str) -> bool:
+    """Heuristic: does this codec mutate renderer state_dict / weights?
+
+    Looks for `state_dict()`, `state_dict[`, `.weight =`, `param.data =`,
+    `module.weight`, etc. Uses regex over text; conservative (false-positives
+    OK at warn level — they get suppressed via tag or waiver).
+    """
+    patterns = [
+        r"\bstate_dict\s*\(",
+        r"\bstate_dict\s*\[",
+        r"\.weight\s*=",
+        r"\.weight\.data\s*=",
+        r"\bparam\.data\s*=",
+        r"\.copy_\s*\(",  # in-place tensor copy (common in codec apply paths)
+    ]
+    for pat in patterns:
+        if re.search(pat, text):
+            return True
+    return False
+
+
+def check_renderer_codec_has_posenet_protection(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """Forbid renderer-codec modules that mutate weights without PoseNet-protection.
+
+    Bug class motivation: Lane Ω-W-V2 burnt 50s GPU + $0.05 producing score
+    1.07 (regression vs Lane G v3 1.05) because the codec optimized
+    bytes-saved without measuring PoseNet sensitivity. This check audits every
+    `src/tac/*codec*.py` (+ `owv2_renderer_archive.py`) and requires either
+    (a) a PoseNet-protection tag in the module text, or (b) an explicit
+    `# RENDERER_CODEC_POSENET_PROTECTION_WAIVED:<reason>` waiver.
+
+    See `_RENDERER_CODEC_POSENET_TAGS` for the accepted tag list and
+    `_RENDERER_CODEC_EXEMPT_BASENAMES` for the by-name exemption list (mask
+    codecs, pose codecs, library utilities, magic registries, benchmarks).
+
+    Lands WARN-ONLY initially. Promotion plan: per-module owner adds the
+    appropriate tag, then flip strict=True via the Lane A pattern.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+
+    candidates = _renderer_codec_files(root)
+    if not candidates:
+        if verbose:
+            print(f"  [renderer-codec-posenet] OK: no candidate files found")
+        return violations
+
+    for py in candidates:
+        if py.name in _RENDERER_CODEC_EXEMPT_BASENAMES:
+            continue
+        # Skip test files.
+        rel_str = str(py.relative_to(root)) if py.is_absolute() else str(py)
+        if "/tests/" in rel_str:
+            continue
+        n_scanned += 1
+        try:
+            text = py.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        # Waiver covers the whole file.
+        if _RENDERER_CODEC_WAIVER_MARKER in text:
+            continue
+
+        # Must touch state_dict / weights to be subject to the rule.
+        if not _renderer_codec_touches_state_dict(text):
+            continue
+
+        # PoseNet-protection signal must appear inline (case-insensitive on tags).
+        text_lower = text.lower()
+        has_tag = any(tag.lower() in text_lower for tag in _RENDERER_CODEC_POSENET_TAGS)
+        if has_tag:
+            continue
+
+        rel = py.relative_to(root) if py.is_absolute() else py
+        violations.append(
+            f"{rel}: mutates renderer state_dict / weights without a "
+            f"PoseNet-protection tag. Add ONE of "
+            f"{', '.join(_RENDERER_CODEC_POSENET_TAGS)} to the module "
+            f"docstring (and ensure the implementation actually does what "
+            f"the tag claims). Lane Ω-W-V2 lost $0.05 + 50s GPU (score 1.07 "
+            f"regression vs 1.05) by shipping a codec that optimized bytes "
+            f"without PoseNet sensitivity weighting. Override with "
+            f"`# {_RENDERER_CODEC_WAIVER_MARKER}<reason>` ONLY when the "
+            f"codec is provably score-neutral (e.g., bit-identical "
+            f"transcoding) — in which case empirical evidence MUST be cited."
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [renderer-codec-posenet] {len(violations)} violation(s) "
+                f"across {n_scanned} renderer-codec file(s):"
+            )
+            for v in violations[:10]:
+                print(f"    • {v}")
+            if len(violations) > 10:
+                print(f"    … and {len(violations) - 10} more")
+        else:
+            print(
+                f"  [renderer-codec-posenet] OK: {n_scanned} "
+                f"renderer-codec file(s) all PoseNet-protected"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "RENDERER-CODEC POSENET PROTECTION VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane Ω-W-V2 (2026-04-30) shipped a codec that optimized "
+            "bytes-saved without PoseNet-sensitivity weighting — burnt $0.05 + "
+            "50s GPU producing score 1.07 (regression vs Lane G v3 1.05). "
+            "Add a PoseNet-protection tag (or explicit waiver) to every codec "
+            "module that mutates renderer state_dict. Reference: "
+            "feedback_owv2_savings_correction_conv_vs_full_renderer_20260430.md."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 98 (2026-04-30): pose-fit module empirical white-noise verification.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: Lane GP v4 (B-spline + DCT + natural cubic spline candidates) all
+# plateaued at avg RMSE ≈ 1.15-1.59 (near signal std 1.5-2.3) because pose
+# dims 1-5 of the actual Lane G v3 baseline `optimized_poses.pt` are
+# white-noise (`diff_std/signal_std ≈ 1.35` ≈ √2). Memory:
+# project_lane_gp_v4_killed_basis_fit_infeasible_20260430.md.
+#
+# Check 91 (`check_pose_basis_fit_kill_acknowledged`) covers KILL-marker
+# acknowledgement at the import level. This complementary check enforces
+# discipline at the EMPIRICAL level: any pose-fit module subject to the kill
+# marker must ALSO have a paired regression test that runs the white-noise
+# check on actual Lane G v3 baseline poses (so a future hopeful agent cannot
+# skip the empirical step and produce yet another optimistic memo).
+#
+# A test counts as the white-noise check iff:
+#   - Its filename matches `test_<module-stem>*white_noise*.py` OR
+#   - It contains the literal `WHITE_NOISE_CHECK:<module-name>` tag in a
+#     docstring/comment (operator escape hatch).
+#
+# Lands STRICT @ 0 violations: Lane GP v4's KILL markers cover all current
+# candidates (the kill-marker is the strongest possible deferral signal — it
+# states "no fit is possible, here is the empirical proof"). New pose-fit
+# modules added without either a kill marker (Check 91) OR a white-noise
+# regression test will fail this check.
+#
+# Reference: .omx/research/council_lane_gp_v4_design_20260430.md
+# Memory: project_lane_gp_v4_killed_basis_fit_infeasible_20260430.md
+# Sister check: Check 91 `check_pose_basis_fit_kill_acknowledged`.
+
+_POSE_FIT_KILL_MARKER = "LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:"
+_WHITE_NOISE_TEST_TAG = "WHITE_NOISE_CHECK:"
+
+
+def _pose_fit_module_candidates(repo_root: Path) -> list[Path]:
+    """Same scope as Check 91 — pose-fit modules subject to the kill rule."""
+    out: list[Path] = []
+    exp = repo_root / "experiments"
+    if exp.is_dir():
+        out.extend(sorted(exp.glob("fit_pose_*.py")))
+    tac = repo_root / "src" / "tac"
+    if tac.is_dir():
+        out.extend(sorted(tac.glob("pose_*_fit.py")))
+        out.extend(sorted(tac.glob("pose_*_basis.py")))
+        out.extend(sorted(tac.glob("pose_*_polynomial.py")))
+        out.extend(sorted(tac.glob("pose_*_spline.py")))
+        out.extend(sorted(tac.glob("pose_*_dct.py")))
+        out.extend(sorted(tac.glob("pose_*_wavelet.py")))
+        out.extend(sorted(tac.glob("pose_gaussian_process.py")))
+    # Dedup.
+    return sorted(set(out))
+
+
+def _pose_fit_has_white_noise_test(
+    module_path: Path, repo_root: Path,
+) -> bool:
+    """Return True iff a paired white-noise regression test exists.
+
+    Two valid forms:
+      (a) `src/tac/tests/test_<stem>*white_noise*.py` exists (filename pattern).
+      (b) Any test file under src/tac/tests/ contains the inline tag
+          `WHITE_NOISE_CHECK:<module_stem>`.
+    """
+    stem = module_path.stem
+    tests_dir = repo_root / "src" / "tac" / "tests"
+    if not tests_dir.is_dir():
+        return False
+    # (a) filename pattern.
+    for pattern in (
+        f"test_{stem}_white_noise*.py",
+        f"test_{stem}*white_noise*.py",
+        f"test_white_noise_{stem}*.py",
+    ):
+        for hit in tests_dir.glob(pattern):
+            if hit.is_file():
+                return True
+    # (b) inline tag.
+    needle = f"{_WHITE_NOISE_TEST_TAG}{stem}"
+    for test_file in tests_dir.glob("test_*.py"):
+        try:
+            text = test_file.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if needle in text:
+            return True
+    return False
+
+
+def check_pose_fit_module_has_white_noise_test(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Pose-fit modules MUST have either a kill marker OR a white-noise test.
+
+    Sister to Check 91. Check 91 catches the import-level "I forgot the kill
+    verdict exists" pattern. This check catches the empirical-discipline
+    pattern: a future agent CANNOT drop a new fit_pose_*.py without first
+    proving (via test) that the empirical white-noise check was actually run
+    on the current Lane G v3 baseline poses.
+
+    The kill marker counts as the strongest possible "white-noise check
+    deferred to council verdict" signal: the council ran the empirical check
+    in `.omx/research/council_lane_gp_v4_design_20260430.md` and concluded
+    NO BASIS WORKS. Acknowledging the kill marker is acknowledging that
+    empirical evidence.
+
+    Returns list of violations. Lands STRICT @ 0 violations.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+
+    candidates = _pose_fit_module_candidates(root)
+    if not candidates:
+        if verbose:
+            print(f"  [pose-fit-white-noise] OK: no candidate modules found")
+        return violations
+
+    for py in candidates:
+        n_scanned += 1
+        try:
+            text = py.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel_str = str(py.relative_to(root)) if py.is_absolute() else str(py)
+        if "/tests/" in rel_str:
+            continue
+
+        # Either a kill marker (Check 91 territory) OR a paired white-noise
+        # regression test must exist.
+        if _POSE_FIT_KILL_MARKER in text:
+            continue
+        if _pose_fit_has_white_noise_test(py, root):
+            continue
+
+        rel = py.relative_to(root) if py.is_absolute() else py
+        violations.append(
+            f"{rel}: pose-fit module without `{_POSE_FIT_KILL_MARKER}` marker "
+            f"AND without a paired white-noise regression test "
+            f"(`src/tac/tests/test_{py.stem}_white_noise*.py` OR an inline "
+            f"`{_WHITE_NOISE_TEST_TAG}{py.stem}` tag in any test file). "
+            f"The Lane G v3 baseline pose stream is white-noise in dims 1-5; "
+            f"any new smooth-basis fit MUST run the empirical check first. "
+            f"Reference: .omx/research/council_lane_gp_v4_design_20260430.md."
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pose-fit-white-noise] {len(violations)} violation(s) "
+                f"across {n_scanned} pose-fit module(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [pose-fit-white-noise] OK: {n_scanned} pose-fit "
+                f"module(s) all carry kill marker or paired test"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "POSE-FIT WHITE-NOISE TEST VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nLane GP v4 KILL VERDICT (2026-04-30) proved the Lane G v3 "
+            "pose trajectory is white-noise in dims 1-5; no smooth basis can "
+            "fit it below RMSE ≈ 1.2. Either acknowledge this with the "
+            "`LANE_GP_BASIS_FIT_KILL_ACKNOWLEDGED:` marker (sister Check 91) "
+            "OR ship a paired white-noise regression test that runs your "
+            "module on the actual baseline poses and asserts the basis cannot "
+            "fit dims 1-5 below RMSE 0.5. Reference: "
+            ".omx/research/council_lane_gp_v4_design_20260430.md."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check 99 (2026-04-30): preflight-hook changed-files-mode wiring discipline.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: tools/preflight_hook.py runs the full ~60s tac.preflight scan
+# on every commit. When N subagents commit in parallel via the serializer,
+# each waits for the exclusive lock + 60s hook. Observed in
+# `.omx/state/commit-serializer.log`: max wait 361.594s, max commit 160.144s.
+# Multiple `commit_failed` outcomes from full-repo violations the subagent
+# never touched (e.g., MDL Bayesian quantizer-roundtrip-tests blocking
+# unrelated subagent commits). Memory:
+# project_swarm_recovery_state_20260430.md ("Class C — preflight thundering
+# herd").
+#
+# This check enforces the architectural pattern: any future change to
+# `tools/preflight_hook.py` MUST keep the changed-files-only mode wired in,
+# i.e., MUST honor `PREFLIGHT_FULL` env override, MUST honor
+# `PREFLIGHT_HOOK_ENABLED=0` skip path, AND MUST default to a fast mode for
+# pre-commit operation (not whole-repo scan).
+#
+# Detection: scan tools/preflight_hook.py for required tokens:
+#   - `PREFLIGHT_FULL` (env switch for whole-repo scan)
+#   - `--changed-files-only` OR `_changed_files_mode` OR `staged_files`
+#     (some indicator that the hook supports a fast mode)
+#   - `PREFLIGHT_HOOK_ENABLED` (existing skip switch)
+#
+# Lands STRICT @ 0 violations after the changed-files refactor lands in the
+# same commit.
+
+_PREFLIGHT_HOOK_REQUIRED_TOKENS = (
+    "PREFLIGHT_FULL",
+    "PREFLIGHT_HOOK_ENABLED",
+)
+# At least one of these must be present (changed-files mode indicator).
+_PREFLIGHT_HOOK_FAST_MODE_TOKENS = (
+    "_changed_files_mode",
+    "PREFLIGHT_FULL",
+    "preflight_cache",
+)
+
+
+def check_preflight_hook_supports_changed_files_mode(
+    repo_root: Path | None = None,
+    strict: bool = True,
+    verbose: bool = True,
+) -> list[str]:
+    """Enforce that tools/preflight_hook.py keeps changed-files-mode wired.
+
+    Bug class motivation: pre-commit hook running whole-repo preflight on
+    every commit produced a thundering-herd lock-contention pattern (max
+    wait 361s, max commit 160s — Class C in the bug-class audit). Refactor
+    landed alongside this check uses changed-files mode by default + cache.
+    This check guards against an accidental revert.
+
+    Returns list of violations. Lands STRICT @ 0 violations.
+    """
+    root = repo_root or REPO_ROOT
+    hook_path = root / "tools" / "preflight_hook.py"
+    violations: list[str] = []
+
+    if not hook_path.is_file():
+        if verbose:
+            print(
+                f"  [preflight-hook-changed-files] OK: hook not present, "
+                f"skipped (likely fresh checkout)"
+            )
+        return violations
+
+    try:
+        text = hook_path.read_text()
+    except (OSError, UnicodeDecodeError):
+        if verbose:
+            print(
+                f"  [preflight-hook-changed-files] OK: hook unreadable, "
+                f"skipped"
+            )
+        return violations
+
+    rel = hook_path.relative_to(root) if hook_path.is_absolute() else hook_path
+
+    missing_required = [t for t in _PREFLIGHT_HOOK_REQUIRED_TOKENS if t not in text]
+    if missing_required:
+        violations.append(
+            f"{rel}: missing required tokens {missing_required}. "
+            f"The hook must honor PREFLIGHT_HOOK_ENABLED=0 (skip) and "
+            f"PREFLIGHT_FULL=1 (whole-repo override) for the changed-files-"
+            f"only fast path."
+        )
+
+    has_fast_mode = any(t in text for t in _PREFLIGHT_HOOK_FAST_MODE_TOKENS)
+    if not has_fast_mode:
+        violations.append(
+            f"{rel}: missing fast-mode indicator (one of "
+            f"{list(_PREFLIGHT_HOOK_FAST_MODE_TOKENS)}). The pre-commit "
+            f"hook must support a changed-files-only mode to avoid the "
+            f"thundering-herd lock contention bug class (max wait 361s "
+            f"observed 2026-04-30 — see project_swarm_recovery_state_20260430.md)."
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [preflight-hook-changed-files] {len(violations)} "
+                f"violation(s):"
+            )
+            for v in violations:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [preflight-hook-changed-files] OK: hook supports "
+                f"changed-files mode + skip + full-override switches"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "PREFLIGHT-HOOK CHANGED-FILES-MODE VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations)
+            + "\n\nThe pre-commit preflight hook MUST support changed-files-"
+            "only mode (default) + PREFLIGHT_FULL=1 override + "
+            "PREFLIGHT_HOOK_ENABLED=0 skip switch. Without changed-files "
+            "mode, parallel subagent commits queue serially behind a 60s "
+            "whole-repo scan (Class C bug class). Reference: "
+            "project_swarm_recovery_state_20260430.md, "
+            ".omx/research/bug_class_audit_20260430.md."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check PCC4 (2026-04-30): KILL/FALSIFIED memory files MUST cite a Grand
+#   Council adversarial review.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: 2026-04-30 ~22:50 UTC the agent recorded a KILL verdict on
+# Lane 17 IMP based on a measurement bug — the dispatch script's "in-script
+# lightweight loop" ran for 3.47 seconds claiming 200 epochs of fine-tune.
+# The user's adversarial challenge ("was the IMP results reliable and is
+# that verdict actually hold up acording to etreme adversarail grand
+# councill") caught the premature kill before it became durable folklore.
+#
+# CLAUDE.md non-negotiable now mandates that every KILL / FALSIFIED memory
+# file contain a Grand Council adversarial review section before it can
+# be committed. This check enforces that mandate at preflight time.
+#
+# Detection: scan ~/.claude/projects/-Users-adpena-Projects-pact/memory/
+# for .md files matching:
+#   - filename glob `project_*killed*.md` OR `project_*falsified*.md`
+#     (case-insensitive)
+#   - body contains literal `VERDICT: KILL` (case-sensitive)
+#   - body contains a kill-class verdict literal: `FALSIFIED`, `DEAD`,
+#     `RETIRED` (case-sensitive — these are explicit verdict markers, not
+#     incidental usage like "dead-flag bug" which is filtered by context)
+#
+# Required for every matched file (3 sections):
+#   1. Grand Council adversarial review:
+#      - header `## Grand Council` OR `Council vote` literal anywhere
+#      - 5+ named members from the inner-10 list
+#        (Shannon, Dykstra, Yousfi, Fridrich, Contrarian, Quantizr,
+#         Hotz, Selfcomp, MacKay, Ballé)
+#   2. Internal-consistency check subsection:
+#      - literal `internal-consistency` OR `## Internal consistency`
+#      - 1+ enumerated check (a bullet point or numbered item)
+#   3. "What would change my mind" / reactivation criteria subsection:
+#      - literal `what would change` OR `## Reactivation criteria`
+#        OR `## Conditions for retracting`
+#      - 1+ enumerated condition
+#
+# Auto-pass conditions (the file is exempt):
+#   - body contains `COUNCIL_REVIEW_SKIPPED_USER_OVERRIDE: <reason>` on
+#     a line of its own (the user-explicit override)
+#   - title contains `WITHDRAWN` (a kill-verdict that was reversed under
+#     adversarial scrutiny is the GOAL of this check, not a target — the
+#     reversal IS the adversarial outcome)
+#   - file timestamp suffix < 20260430 (legacy grandfather: this rule
+#     only binds for kill verdicts recorded on or after 2026-04-30, the
+#     date the protocol was established)
+#
+# Council deliberation captured in
+#   feedback_grand_council_pcc4_kill_memory_review_enforcement_20260430.md.
+# Bug-class lineage:
+#   - feedback_grand_council_imp_permanent_fix_review_20260430.md (DD3)
+#   - project_lane_17_imp_killed_cycle_0_198_regression_20260430.md
+#     (the test fixture — has WITHDRAWN in title, auto-passes)
+
+# Inner-10 council member names (CLAUDE.md "## Council conduct").
+_PCC4_INNER_COUNCIL_NAMES = (
+    "Shannon", "Dykstra", "Yousfi", "Fridrich", "Contrarian",
+    "Quantizr", "Hotz", "Selfcomp", "MacKay", "Ballé",
+)
+
+# Header / anchor literals for each required section. Searched
+# case-sensitively for the canonical literal but additional aliases
+# (lowercase / variant header text) are accepted via the OR groups.
+_PCC4_GRAND_COUNCIL_HEADERS = (
+    "## Grand Council",
+    "Council vote",
+    "## Council vote",
+    "## Grand Council adversarial review",
+    "## Inner council",
+    "## Adversarial council",
+)
+_PCC4_INTERNAL_CONSISTENCY_HEADERS = (
+    "internal-consistency",
+    "## Internal consistency",
+    "## Internal-consistency",
+    "## Internal-Consistency",
+    "internal consistency check",
+)
+_PCC4_REACTIVATION_HEADERS = (
+    "what would change",
+    "What would change",
+    "WHAT WOULD CHANGE",
+    "## Reactivation criteria",
+    "## Conditions for retracting",
+    "## Conditions for retraction",
+    "## What would change my mind",
+)
+
+# Override marker (user-explicit skip). Must be on its own line; we
+# verify with a regex that anchors to a line boundary.
+_PCC4_OVERRIDE_RE = re.compile(
+    r"^COUNCIL_REVIEW_SKIPPED_USER_OVERRIDE:[ \t]*\S",
+    re.MULTILINE,
+)
+
+# Filename globs for files that MUST be scanned regardless of body.
+_PCC4_KILL_FILENAME_GLOBS = (
+    "project_*killed*.md",
+    "project_*falsified*.md",
+    "project_*FALSIFIED*.md",
+    "project_*RETIRED*.md",
+    "project_*retired*.md",
+)
+
+# Body literals (case-sensitive) that ALSO trigger the check.
+_PCC4_KILL_BODY_LITERALS = (
+    "VERDICT: KILL",
+    "FALSIFIED",
+    "RETIRED",
+    # "DEAD" is intentionally NOT in this set: too ambiguous (matches
+    # "dead-flag bug", "dead resolver", "dead code", etc.). DEAD-only
+    # files are caught via the filename glob if they follow the
+    # naming convention, otherwise authors should use one of the
+    # explicit verdict literals above.
+)
+
+# Timestamp threshold: kill verdicts recorded BEFORE this date are
+# grandfathered (the protocol was established 2026-04-30).
+_PCC4_PROTOCOL_START_DATE = "20260430"
+
+# Default memory directory (per the user's machine layout). Tests
+# override via the `memory_dir` parameter.
+_PCC4_DEFAULT_MEMORY_DIR = (
+    Path.home() / ".claude" / "projects"
+    / "-Users-adpena-Projects-pact" / "memory"
+)
+
+
+def _pcc4_extract_filename_date_suffix(filename: str) -> str | None:
+    """Extract a YYYYMMDD suffix from a filename like
+    `project_lane_17_imp_killed_cycle_0_198_regression_20260430.md`.
+
+    Returns the 8-digit string or None if no recognizable suffix exists.
+    """
+    # Match _YYYYMMDD before the .md extension.
+    m = re.search(r"_(\d{8})(?:_v\d+)?\.md$", filename)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _pcc4_file_is_grandfathered(filename: str) -> bool:
+    """True if the filename's timestamp suffix is BEFORE the protocol
+    start date (2026-04-30). Files without a timestamp suffix are
+    NOT grandfathered (treated as new)."""
+    date_suffix = _pcc4_extract_filename_date_suffix(filename)
+    if date_suffix is None:
+        return False
+    return date_suffix < _PCC4_PROTOCOL_START_DATE
+
+
+def _pcc4_title_contains_withdrawn(text: str) -> bool:
+    """True if the file's frontmatter title (line beginning with
+    `name:`) contains the literal `WITHDRAWN`. A kill that was
+    REVERSED under adversarial review is the success outcome, not
+    a target."""
+    for line in text.splitlines()[:20]:  # Frontmatter lives in first ~20.
+        if line.startswith("name:") and "WITHDRAWN" in line:
+            return True
+    return False
+
+
+def _pcc4_count_named_members(text: str) -> int:
+    """Return the number of inner-10 council members named in the
+    file body. Each member must appear on a non-empty line."""
+    found: set[str] = set()
+    for member in _PCC4_INNER_COUNCIL_NAMES:
+        # Must appear at least once; line must have non-whitespace
+        # content beyond the name (i.e. a position rationale or vote).
+        for line in text.splitlines():
+            if member in line and line.strip() != member:
+                found.add(member)
+                break
+    return len(found)
+
+
+def _pcc4_has_enumerated_item_after(text: str, header_literals: tuple[str, ...]) -> bool:
+    """True if AT LEAST ONE bullet (`- `, `* `) or numbered list item
+    (`1.`, `2.`, etc.) appears within 50 lines after any of the
+    given header literals. Conservative — false negatives are OK
+    (operator just adds a bullet)."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        for header in header_literals:
+            if header in line:
+                # Scan up to 50 lines after for an enumerated item.
+                for j in range(i + 1, min(i + 50, len(lines))):
+                    nxt = lines[j].lstrip()
+                    if (nxt.startswith("- ")
+                            or nxt.startswith("* ")
+                            or re.match(r"^\d+[.)]\s", nxt)):
+                        return True
+    return False
+
+
+def _pcc4_file_has_kill_semantics(path: Path, text: str) -> bool:
+    """True if the file MUST be scanned by this check (filename glob
+    OR body literal match).
+
+    Body-literal match excludes occurrences inside markdown table rows
+    (lines whose lstripped form starts with `|`). Status checkpoints and
+    forensic audits frequently CITE retired/falsified lanes in summary
+    tables; that is not the same as a kill verdict ABOUT the file itself.
+    Round 1 of the recursive greenup council pass caught this false
+    positive (memory: feedback_grand_council_recursive_greenup_shannon_
+    floor_20260501.md, CRITICAL #5).
+    """
+    name = path.name
+    name_lower = name.lower()
+    # Filename glob match.
+    for pat in _PCC4_KILL_FILENAME_GLOBS:
+        # Convert glob to regex-friendly: `project_*killed*.md` →
+        # check substring `killed` in lowercased name with `project_`
+        # prefix.
+        pat_lower = pat.lower()
+        if pat_lower.startswith("project_") and pat_lower.endswith(".md"):
+            kw = pat_lower.replace("project_*", "").replace("*.md", "")
+            if name_lower.startswith("project_") and kw in name_lower:
+                return True
+    # Body literal match (case-sensitive). Per Round 1 council greenup,
+    # exclude markdown table rows + lines inside fenced code blocks
+    # (`” ”` / `” ”python` etc.) — those are SELF-CITATIONS of other
+    # files' kill verdicts, not a verdict about the current file.
+    in_code_fence = False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        # Track fenced-code-block state.
+        if stripped.startswith("```"):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
+        # Skip markdown table rows (lines that begin with `|`).
+        if stripped.startswith("|"):
+            continue
+        for lit in _PCC4_KILL_BODY_LITERALS:
+            if lit in line:
+                return True
+    return False
+
+
+def _pcc4_audit_one_file(path: Path) -> list[str]:
+    """Audit a single memory file. Returns a list of missing-section
+    messages (empty if the file passes or is exempt)."""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return []
+
+    # Auto-pass: explicit user override (own-line marker).
+    if _PCC4_OVERRIDE_RE.search(text):
+        return []
+
+    # Auto-pass: WITHDRAWN kill (the reversal IS the adversarial outcome).
+    if _pcc4_title_contains_withdrawn(text):
+        return []
+
+    # Auto-pass: legacy grandfather (filename date < 20260430).
+    if _pcc4_file_is_grandfathered(path.name):
+        return []
+
+    # Trigger condition: filename or body indicates kill semantics.
+    if not _pcc4_file_has_kill_semantics(path, text):
+        return []
+
+    missing: list[str] = []
+
+    # Required section 1: Grand Council adversarial review.
+    has_council_header = any(h in text for h in _PCC4_GRAND_COUNCIL_HEADERS)
+    named = _pcc4_count_named_members(text)
+    if not has_council_header:
+        missing.append(
+            f"missing Grand Council header — add one of "
+            f"{list(_PCC4_GRAND_COUNCIL_HEADERS[:3])}"
+        )
+    if named < 5:
+        missing.append(
+            f"only {named}/5 inner-council members named with rationale "
+            f"(need 5+ from "
+            f"{list(_PCC4_INNER_COUNCIL_NAMES)})"
+        )
+
+    # Required section 2: Internal-consistency check.
+    has_consistency_header = any(
+        h in text for h in _PCC4_INTERNAL_CONSISTENCY_HEADERS
+    )
+    if not has_consistency_header:
+        missing.append(
+            f"missing internal-consistency check section — add one of "
+            f"{list(_PCC4_INTERNAL_CONSISTENCY_HEADERS[:2])}"
+        )
+    elif not _pcc4_has_enumerated_item_after(
+        text, _PCC4_INTERNAL_CONSISTENCY_HEADERS,
+    ):
+        missing.append(
+            "internal-consistency section present but has no enumerated "
+            "checks (need 1+ bullet or numbered item, e.g. "
+            "`elapsed_sec >= epochs * MIN_SEC`)"
+        )
+
+    # Required section 3: Reactivation / "what would change my mind".
+    has_reactivation_header = any(
+        h in text for h in _PCC4_REACTIVATION_HEADERS
+    )
+    if not has_reactivation_header:
+        missing.append(
+            f"missing reactivation criteria — add one of "
+            f"{list(_PCC4_REACTIVATION_HEADERS[:3])}"
+        )
+    elif not _pcc4_has_enumerated_item_after(
+        text, _PCC4_REACTIVATION_HEADERS,
+    ):
+        missing.append(
+            "reactivation section present but has no enumerated "
+            "conditions (need 1+ bullet or numbered item)"
+        )
+
+    if not missing:
+        return []
+    return [f"{path.name}: " + "; ".join(missing)]
+
+
+def check_kill_memory_files_have_council_review(
+    *, strict: bool = False, verbose: bool = False,
+    memory_dir: Path | None = None,
+) -> list[str]:
+    """PCC4: every KILL / FALSIFIED / RETIRED memory file must contain
+    a Grand Council adversarial review with internal-consistency checks
+    and reactivation criteria.
+
+    Args:
+        strict: If True, raise PreflightError on any violation.
+        verbose: If True, print the audit summary.
+        memory_dir: Override the memory directory. Defaults to the user's
+            ~/.claude/projects/-Users-adpena-Projects-pact/memory/ tree.
+            Tests override via this parameter.
+
+    Returns:
+        A list of violation strings (one per non-compliant file).
+
+    Auto-pass conditions:
+        - File body contains `COUNCIL_REVIEW_SKIPPED_USER_OVERRIDE:`
+          on its own line.
+        - File title (frontmatter `name:` line) contains `WITHDRAWN`.
+        - File timestamp suffix `_YYYYMMDD.md` < 2026-04-30.
+    """
+    target_dir = memory_dir or _PCC4_DEFAULT_MEMORY_DIR
+    if not target_dir.is_dir():
+        if verbose:
+            print(
+                f"  [pcc4-kill-memory-review] SKIP: memory dir not found "
+                f"({target_dir})"
+            )
+        return []
+
+    violations: list[str] = []
+    candidates: list[Path] = []
+    for f in sorted(target_dir.iterdir()):
+        if not f.is_file() or f.suffix != ".md":
+            continue
+        if f.name == "MEMORY.md":
+            # Index file — never a kill record itself.
+            continue
+        candidates.append(f)
+
+    for f in candidates:
+        violations.extend(_pcc4_audit_one_file(f))
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pcc4-kill-memory-review] {len(violations)} "
+                f"violation(s) (scanned {len(candidates)} memory files):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … and {len(violations) - 20} more")
+        else:
+            print(
+                f"  [pcc4-kill-memory-review] OK: 0 violations "
+                f"({len(candidates)} memory files scanned)"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "KILL/FALSIFIED MEMORY FILES MISSING GRAND COUNCIL REVIEW:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + (f"\n  … and {len(violations) - 20} more"
+               if len(violations) > 20 else "")
+            + "\n\nFix: add the 3 required sections to each kill memory "
+            "file:\n"
+            "  1. `## Grand Council` header + 5+ named members "
+            "(Shannon, Dykstra, Yousfi, Fridrich, Contrarian, Quantizr, "
+            "Hotz, Selfcomp, MacKay, Ballé)\n"
+            "  2. `## Internal-consistency` subsection with 1+ enumerated "
+            "check (e.g. `elapsed_sec >= epochs * MIN_SEC`)\n"
+            "  3. `## Reactivation criteria` (or `## What would change "
+            "my mind`) subsection with 1+ enumerated condition\n"
+            "Override (use sparingly): add a line\n"
+            "  COUNCIL_REVIEW_SKIPPED_USER_OVERRIDE: <reason>\n"
+            "Reference CLAUDE.md non-negotiable + "
+            "feedback_grand_council_pcc4_kill_memory_review_enforcement_"
+            "20260430.md for the protocol."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Check PCC3 (2026-04-30): stats.json internal-consistency assertion.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Background: 2026-04-30 ~22:50 UTC the IMP cycle 0 = 1.98 KILL was based on
+# stats.json claiming `{"epochs": 200, "elapsed_sec": 3.47}` — physically
+# impossible (200 epochs of fine-tune in 3.5s on any device). The producer-side
+# assertion landed in `experiments/train_imp_cycle.py` (~line 366):
+#
+#     if not args.smoke and args.epochs > 0:
+#         expected_min = args.epochs * MIN_WALL_PER_EPOCH_SEC
+#         if elapsed < expected_min:
+#             raise RuntimeError("PCC3 STUB-LOOP DETECTED: ...")
+#
+# PCC3 enforces this pattern system-wide: every Python script that writes a
+# stats-shape JSON file (dict containing both an EPOCH-like and an ELAPSED-like
+# key) MUST carry a backing assertion within the same function comparing
+# elapsed-like to epochs-like with a Mult/Div op.
+#
+# Council vote (10/10 inner council, see
+# feedback_grand_council_pcc3_stats_consistency_20260430.md):
+#   - DD1: per-script MIN_WALL_PER_EPOCH_SEC constant (NOT a global)
+#   - DD2: producer-side assertion AND preflight enforcement (defense in depth)
+#   - DD3: assertion gated on `not args.smoke and args.epochs > 0`
+#
+# Live audit (2026-04-30): 2 violations fixed in this landing wave —
+# `experiments/train_segmap.py` (line 456) and
+# `experiments/train_segmap_film_canvas.py` (line 337). With those fixed,
+# PCC3 lands at 0 live violations and goes straight to STRICT.
+#
+# Bug-class lineage:
+#   - feedback_grand_council_imp_permanent_fix_review_20260430.md (DD3)
+#   - project_lane_17_imp_killed_cycle_0_198_regression_20260430.md (the
+#     fixture; auto-passes via WITHDRAWN-in-title in PCC4)
+#   - feedback_grand_council_pcc3_stats_consistency_20260430.md (this check)
+
+# Keys that suggest the dict is reporting a training/run iteration count.
+_PCC3_EPOCH_KEYS: frozenset[str] = frozenset({
+    "epochs", "steps", "iterations",
+    "n_epochs", "n_steps",
+    "num_epochs", "num_steps",
+    "epoch_count", "step_count", "iteration_count",
+})
+
+# Keys that suggest the dict is reporting a wall-clock duration.
+_PCC3_ELAPSED_KEYS: frozenset[str] = frozenset({
+    "elapsed_sec", "elapsed", "elapsed_s",
+    "elapsed_seconds", "elapsed_secs",
+    "wall_time", "wall_seconds", "wall_clock_sec",
+    "total_seconds", "duration_sec", "duration_s", "duration",
+})
+
+# Same-line waiver markers. Authors who legitimately need to skip the check
+# (e.g. a smoke-only script that always reports elapsed=0) add one of these
+# adjacent to the json.dump call. Like the mature waiver patterns elsewhere
+# in this file, we require an EXPLICIT REASON after the colon — not a bare
+# tag — to prevent drive-by waiver inflation.
+_PCC3_WAIVER_RE = re.compile(
+    r"#\s*PCC3-WAIVED(-INTERFUNCTION)?\s*:\s*\S",
+)
+
+# Directories scanned for stats.json producers.
+_PCC3_SCAN_DIRS: tuple[str, ...] = (
+    "scripts", "experiments", "src/tac", "submissions/robust_current",
+)
+
+# Files exempt from this check (the check definition + its tests + the
+# matching scanner tool, which itself constructs synthetic dict literals).
+_PCC3_EXEMPT_PATH_PARTS: tuple[str, ...] = (
+    "/tests/",
+    "/__pycache__/",
+    "src/tac/preflight.py",  # this file (defines the keyword sets)
+    "tools/scan_stats_json_consistency.py",  # operator-side scanner (if added)
+)
+
+
+def _pcc3_dict_keys_in_call(call_node: ast.Call) -> set[str]:
+    """If the first positional argument is a Dict literal, return its
+    string keys. Otherwise return the empty set (Name lookups are
+    handled separately in _pcc3_scan_function)."""
+    if not call_node.args:
+        return set()
+    first = call_node.args[0]
+    if isinstance(first, ast.Dict):
+        keys: set[str] = set()
+        for k in first.keys:
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                keys.add(k.value)
+        return keys
+    return set()
+
+
+def _pcc3_find_dict_assigned_to(name: str, body: list[ast.stmt]) -> set[str] | None:
+    """Walk function body for a top-level `<name> = { ... }` assignment.
+    Returns the literal string keys if found, else None.
+
+    Conservative: only matches simple top-level assignments; doesn't trace
+    `<name>['x'] = ...` mutations or returns-from-helpers (those use the
+    `# PCC3-WAIVED-INTERFUNCTION:` waiver)."""
+    for node in body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    if isinstance(node.value, ast.Dict):
+                        keys: set[str] = set()
+                        for k in node.value.keys:
+                            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                                keys.add(k.value)
+                        return keys
+    return None
+
+
+def _pcc3_function_has_assertion(
+    fn: ast.AST, before_line: int,
+) -> bool:
+    """True if `fn` contains at least one `assert` / `if … raise` /
+    bare `Raise` whose subtree mentions BOTH an elapsed-like name AND
+    an epochs-like name AND uses a Mult or Div op, occurring strictly
+    BEFORE `before_line`.
+
+    The Mult/Div requirement is what distinguishes a real
+    `elapsed >= epochs * MIN_SEC` assertion from a generic
+    `assert epochs > 0` check that happens to mention both names."""
+    elapsed_aliases = _PCC3_ELAPSED_KEYS | {
+        # accept common short variable names too
+        "elapsed", "elapsed_sec", "duration", "wall",
+    }
+    for node in ast.walk(fn):
+        if not hasattr(node, "lineno") or node.lineno is None:
+            continue
+        if node.lineno >= before_line:
+            continue
+        if not isinstance(node, (ast.Assert, ast.If, ast.Raise)):
+            continue
+        dump = ast.dump(node)
+        has_elapsed = any(t in dump for t in elapsed_aliases)
+        has_epoch = any(t in dump for t in _PCC3_EPOCH_KEYS)
+        if not (has_elapsed and has_epoch):
+            continue
+        # Must contain a Mult or Div op anywhere in the subtree.
+        if "Mult()" in dump or "Div()" in dump:
+            return True
+    return False
+
+
+def _pcc3_scan_function(
+    fn: ast.AST, src_lines: list[str],
+) -> list[tuple[int, set[str], set[str]]]:
+    """Find every `json.dump(...)` / `json.dumps(...)` inside `fn` whose
+    first arg is (or refers to) a dict literal containing both an
+    EPOCH-like and an ELAPSED-like key. Returns
+    `[(lineno, epoch_keys, elapsed_keys), ...]`.
+
+    Skips calls with a same-line `# PCC3-WAIVED:` waiver."""
+    matches: list[tuple[int, set[str], set[str]]] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("dump", "dumps")):
+            continue
+        base = node.func.value
+        if not (isinstance(base, ast.Name) and base.id == "json"):
+            continue
+        # Same-line waiver?
+        line_idx = node.lineno - 1
+        if 0 <= line_idx < len(src_lines):
+            if _PCC3_WAIVER_RE.search(src_lines[line_idx]):
+                continue
+        keys = _pcc3_dict_keys_in_call(node)
+        if not keys and node.args and isinstance(node.args[0], ast.Name):
+            assigned = _pcc3_find_dict_assigned_to(
+                node.args[0].id, list(getattr(fn, "body", []))
+            )
+            if assigned is not None:
+                keys = assigned
+        ep = keys & _PCC3_EPOCH_KEYS
+        el = keys & _PCC3_ELAPSED_KEYS
+        if ep and el:
+            matches.append((node.lineno, ep, el))
+    return matches
+
+
+def check_stats_json_internal_consistency(
+    *, strict: bool = False, verbose: bool = False,
+    repo_root: Path | None = None,
+) -> list[str]:
+    """PCC3: every stats.json producer must carry an internal-consistency
+    assertion comparing elapsed-like wall-clock to epochs-like iteration
+    count BEFORE the json.dump call. Catches the IMP-cycle-0=1.98 stub-
+    loop bug class (200 epochs claimed in 3.5s).
+
+    Args:
+        strict: If True, raise MetaBugViolation on any violation.
+        verbose: If True, print the audit summary.
+        repo_root: Override the repo root. Defaults to REPO_ROOT.
+
+    Returns:
+        A list of violation strings, one per offending json.dump call.
+
+    Waivers:
+        - `# PCC3-WAIVED: <reason>` same-line marker on the json.dump call
+          for legitimate cases (smoke-only producer, etc.)
+        - `# PCC3-WAIVED-INTERFUNCTION: <reason>` same-line marker for
+          producers whose backing assertion lives in the caller (e.g.
+          `train_imp_cycle.py:_save_state` is dispatched by `main()`
+          which holds the floor check at line 366 BEFORE the helper
+          call at line 394)
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    for sd in _PCC3_SCAN_DIRS:
+        d = root / sd
+        if not d.is_dir():
+            continue
+        for py in d.rglob("*.py"):
+            rel = py.relative_to(root)
+            rel_s = str(rel)
+            if any(part in rel_s for part in _PCC3_EXEMPT_PATH_PARTS):
+                continue
+            try:
+                src = py.read_text()
+                tree = ast.parse(src, filename=str(py))
+            except (OSError, SyntaxError):
+                continue
+            src_lines = src.splitlines()
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                matches = _pcc3_scan_function(fn, src_lines)
+                for lineno, ep, el in matches:
+                    if _pcc3_function_has_assertion(fn, lineno):
+                        continue
+                    # Inter-function waiver: check the function-call site for
+                    # the next-line waiver marker.
+                    waiver_line_idx = lineno - 1
+                    if 0 <= waiver_line_idx < len(src_lines):
+                        if "PCC3-WAIVED-INTERFUNCTION" in src_lines[waiver_line_idx]:
+                            continue
+                    snippet = src_lines[lineno - 1].strip()[:80] if 0 <= lineno - 1 < len(src_lines) else ""
+                    violations.append(
+                        f"{rel_s}:{lineno}: stats.json producer with epoch_keys="
+                        f"{sorted(ep)} + elapsed_keys={sorted(el)} but no "
+                        f"backing `elapsed >= epochs * MIN_SEC` assertion in "
+                        f"function `{fn.name}` — {snippet!r}"
+                    )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pcc3-stats-internal-consistency] {len(violations)} "
+                f"violation(s):"
+            )
+            for v in violations[:20]:
+                print(f"    • {v}")
+            if len(violations) > 20:
+                print(f"    … and {len(violations) - 20} more")
+        else:
+            print(
+                f"  [pcc3-stats-internal-consistency] OK: 0 violations "
+                f"across {len(_PCC3_SCAN_DIRS)} scan dirs"
+            )
+
+    if violations and strict:
+        raise MetaBugViolation(
+            "STATS.JSON INTERNAL-CONSISTENCY VIOLATIONS:\n"
+            + "\n".join(f"  • {v}" for v in violations[:20])
+            + (f"\n  … and {len(violations) - 20} more"
+               if len(violations) > 20 else "")
+            + "\n\nFix: each producer must include, BEFORE the json.dump call,\n"
+            "  a runtime assertion of the form:\n"
+            "    MIN_WALL_PER_EPOCH_SEC = <per-script-justified-constant>\n"
+            "    if not args.smoke and args.epochs > 0:\n"
+            "        expected_min = args.epochs * MIN_WALL_PER_EPOCH_SEC\n"
+            "        if elapsed < expected_min:\n"
+            "            raise RuntimeError('PCC3 STUB-LOOP DETECTED: ...')\n"
+            "  See experiments/train_imp_cycle.py:366 for the reference impl.\n"
+            "  Waivers (use sparingly):\n"
+            "    # PCC3-WAIVED: <reason>                  (same-line on json.dump)\n"
+            "    # PCC3-WAIVED-INTERFUNCTION: <reason>   (assertion in caller)\n"
+            "  Memory: feedback_grand_council_pcc3_stats_consistency_20260430.md."
+        )
+    return violations
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2026-05-01 PCC5-PCC8 — loop-session permanent extinction checks.
+#
+# Each of the 4 checks below extincts a bug class that BURNED a Vast.ai
+# instance dispatch (~$0.30 + 5-10 min wall) on 2026-05-01. Reference:
+# feedback_loop_session_permanent_bug_class_extinction_20260501.md.
+#
+# Promotion plan:
+#   - All 4 ship strict=False (warn-only) on first commit.
+#   - Live-codebase violation count is recorded in the wire-in comment.
+#   - Once violations are fixed across the tree, flip strict=True.
+#
+# Companion code fixes shipped in the SAME commit:
+#   PCC5: scripts/remote_archive_only_eval.sh + scripts/remote_lane_*.sh
+#         already self-bootstrap uv + ffmpeg via bootstrap_runtime_deps.
+#   PCC6: scripts/ensure_remote_pip.sh helper + probe_nvdec.sh self-heal
+#         + remote_lane_nwc.sh ensures pip after `uv venv`.
+#   PCC7: launch_lane_on_vastai.py phase1 floors --min-disk-gb at 60.
+#   PCC8: experiments/results/.../wave3_chain_driver.sh adds per-candidate
+#         eval_work cleanup.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def check_remote_archive_eval_self_bootstraps_uv_and_ffmpeg(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC5: scripts/remote_archive_only_eval.sh + every scripts/remote_lane_*.sh
+    that runs contest_auth_eval MUST self-bootstrap uv (and ffmpeg if it
+    enforces the color-contract).
+
+    Bug class extincted: a fresh pytorch:cuda image has no `uv` on PATH;
+    a system-default ffmpeg 4.4.2 lacks `in_primaries` scale option that
+    `submissions/robust_current/inflate.sh require_ffmpeg_parity` requires.
+    Without an in-script self-bootstrap, the lane crashes immediately at
+    Stage 1 and a $0.30 dispatch is wasted.
+
+    Reference: feedback_uv_not_on_path_vast_instance_20260501.md +
+    feedback_loop_session_permanent_bug_class_extinction_20260501.md.
+
+    Acceptable patterns (in priority order):
+      1. function definition `bootstrap_runtime_deps()` (the canonical
+         pattern from remote_archive_only_eval.sh)
+      2. invocation of `scripts/ensure_remote_uv.sh`
+      3. inline `curl -LsSf https://astral.sh/uv/install.sh` block
+    Any of (1)-(3) satisfies the check.
+
+    Exempt: scripts that don't run contest_auth_eval (build-only, training-
+    only, smoke-only) — the check is keyed on `contest_auth_eval` text.
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    candidates: list[Path] = []
+    canonical = scripts_dir / "remote_archive_only_eval.sh"
+    if canonical.exists():
+        candidates.append(canonical)
+    for p in sorted(scripts_dir.glob("remote_lane_*.sh")):
+        candidates.append(p)
+
+    n_scanned = 0
+    n_relevant = 0
+    # In-script self-bootstrap markers (the strongest pattern).
+    bootstrap_markers = (
+        "bootstrap_runtime_deps",
+        "scripts/ensure_remote_uv.sh",
+        "ensure_remote_uv.sh",
+        "https://astral.sh/uv/install.sh",
+    )
+    # Inheritance markers — script assumes setup_full.sh / canonical
+    # bootstrap (which DOES bootstrap uv) ran first. Acceptable but weaker
+    # because operator MUST run setup_full.sh in the bootstrap chain.
+    canonical_inheritance_markers = (
+        "source $WORKSPACE/env.sh",
+        'source "$WORKSPACE/env.sh"',
+        "source env.sh",
+        '. "$WORKSPACE/env.sh"',
+        "source $REPO_ROOT/env.sh",
+        # Common pattern in our remote_lane_*.sh: depends on
+        # remote_setup_full.sh having pre-bootstrapped uv.
+        "remote_setup_full.sh",
+        "setup_full.sh",
+        # Some scripts call `command -v uv` then source the install if
+        # missing — that satisfies the contract by self-healing.
+        "command -v uv >/dev/null",
+    )
+    for path in candidates:
+        n_scanned += 1
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        # Strip comments so a "# we use bootstrap_runtime_deps" doc line
+        # doesn't satisfy the check.
+        non_comment = "\n".join(
+            line if not line.lstrip().startswith("#") else ""
+            for line in text.split("\n")
+        )
+        if "contest_auth_eval" not in non_comment:
+            continue
+        n_relevant += 1
+        if any(m in non_comment for m in bootstrap_markers):
+            continue
+        if any(m in non_comment for m in canonical_inheritance_markers):
+            continue
+        rel = path.relative_to(root) if path.is_absolute() else path
+        violations.append(
+            f"{rel}: invokes contest_auth_eval but does NOT self-bootstrap "
+            f"uv (no `bootstrap_runtime_deps`, `scripts/ensure_remote_uv.sh`, "
+            f"`source env.sh`, or `setup_full.sh` reference). Add the "
+            f"canonical bootstrap from "
+            f"scripts/remote_archive_only_eval.sh:46-72 OR call "
+            f"`bash scripts/ensure_remote_uv.sh --symlink-system`. "
+            f"Reference: feedback_uv_not_on_path_vast_instance_20260501."
+        )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pcc5-self-bootstrap-uv-ffmpeg] {len(violations)}/{n_relevant} "
+                f"contest-eval script(s) violate (of {n_scanned} scanned)"
+            )
+            for v in violations[:5]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [pcc5-self-bootstrap-uv-ffmpeg] OK: {n_relevant} contest-eval "
+                f"script(s) self-bootstrap (of {n_scanned} scanned)"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "PCC5 self-bootstrap-uv-ffmpeg violations:\n  • "
+            + "\n  • ".join(violations)
+            + "\n\nReference: feedback_loop_session_permanent_bug_class_"
+            "extinction_20260501.md (Bug Class #1, #4)."
+        )
+    return violations
+
+
+# Pattern: shell-script venv-creation tokens that DON'T install pip by
+# default. `python -m venv` ships pip in the stdlib bundle; `uv venv` and
+# bare `virtualenv` do not. So we only flag the latter two.
+# (To audit `python -m venv` callers separately, use _VENV_CREATE_ANY_RE.)
+_VENV_CREATE_RE = re.compile(
+    r"(?:^|[\s;&|`(])(?:uv\s+venv|virtualenv\s)"
+)
+_VENV_CREATE_ANY_RE = re.compile(
+    r"(?:^|[\s;&|`(])(?:python\d?\s+-m\s+venv|uv\s+venv|virtualenv\s)"
+)
+
+
+def check_venv_creators_use_ensurepip(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC6: every shell script that creates a venv (python -m venv / uv venv /
+    virtualenv) MUST install pip into it (or document why pip is not needed).
+
+    Bug class extincted (2026-05-01): `uv venv` does NOT install pip. Any
+    downstream `python -m pip ...` or `python -m ensurepip` call then fails
+    with `No module named pip`. probe_nvdec.sh hit this on a fresh venv and
+    a $0.30 dispatch was wasted.
+
+    Reference: feedback_loop_session_permanent_bug_class_extinction_20260501.md
+    (Bug Class #3) + the user's "ensurepip" guidance during the loop session.
+
+    Acceptable companions within 12 lines after the venv-create line:
+      1. `scripts/ensure_remote_pip.sh` invocation (canonical)
+      2. `python -m ensurepip` call
+      3. `uv pip install` (uv handles its own pip-less install)
+      4. an inline comment `# NO_PIP_NEEDED:` justifying the omission
+
+    Exempt: docs / .md / .txt files (we only scan .sh under scripts/).
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir():
+        return violations
+    n_scanned = 0
+    n_with_venv = 0
+    for path in sorted(scripts_dir.rglob("*.sh")):
+        n_scanned += 1
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        # Strip comment-only lines so "# uv venv ..." doc doesn't trip the regex.
+        # But keep partial-line comments intact (in case operator wrote
+        # `uv venv ...  # comment`).
+        text_no_full_comments = "\n".join(
+            line if not line.lstrip().startswith("#") else ""
+            for line in text.split("\n")
+        )
+        lines = text_no_full_comments.split("\n")
+        for i, line in enumerate(lines):
+            if not _VENV_CREATE_RE.search(line):
+                continue
+            n_with_venv += 1
+            window_lines = lines[i:i + 12]
+            window = "\n".join(window_lines)
+            satisfies = (
+                "ensure_remote_pip.sh" in window
+                or "ensurepip" in window
+                or "uv pip install" in window
+                or "# NO_PIP_NEEDED" in window
+                # uv-only paths (no pip needed): if the very next non-empty
+                # action is `uv pip install` chained, that satisfies.
+                or "--system-site-packages" in line  # inherits system pip
+            )
+            if not satisfies:
+                rel = path.relative_to(root) if path.is_absolute() else path
+                violations.append(
+                    f"{rel}:{i+1}: venv-create line `{line.strip()[:80]}` "
+                    f"has no `scripts/ensure_remote_pip.sh` / `ensurepip` "
+                    f"/ `uv pip install` within next 12 lines. Either add "
+                    f"a pip-bootstrap or annotate `# NO_PIP_NEEDED: <why>` "
+                    f"on the same line. Reference: "
+                    f"feedback_loop_session_permanent_bug_class_extinction_"
+                    f"20260501.md (Bug Class #3)."
+                )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pcc6-ensurepip-after-venv] {len(violations)} violation(s) "
+                f"across {n_with_venv} venv-create site(s) in {n_scanned} script(s)"
+            )
+            for v in violations[:5]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [pcc6-ensurepip-after-venv] OK: {n_with_venv} venv-create "
+                f"site(s) clean across {n_scanned} script(s)"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "PCC6 ensurepip-after-venv-create violations:\n  • "
+            + "\n  • ".join(violations)
+            + "\n\nReference: feedback_loop_session_permanent_bug_class_"
+            "extinction_20260501.md (Bug Class #3)."
+        )
+    return violations
+
+
+# Pattern: any `vastai create instance` invocation in shell or python.
+# Tolerant of leading `str(VASTAI),` / `"vastai",` / `${VASTAI}` etc.
+_VASTAI_CREATE_RE = re.compile(
+    r"""(?ix)
+    \b vastai \b [^\n]{0,40}? \b create \s+ instance \b
+    |
+    " create " \s* , \s* " instance "
+    |
+    ' create ' \s* , \s* ' instance '
+    """
+)
+_DISK_FLAG_LITERAL_RE = re.compile(
+    r"""(?x)
+    (?: --disk \s* | "--disk" \s* , \s* )
+    ['"]? \s*
+    (?P<value> \d+ )
+    """
+)
+# Catches python source where --disk value is a variable / expression
+# rather than a literal: `"--disk", str(int(disk_gb))` or
+# `"--disk", str(int(spec.disk_gb))`. The presence of --disk + non-literal
+# value means we trust the upstream `disk_gb`/`spec.disk_gb` parameter
+# default — which we ALSO check via the dataclass-default scanner below.
+_DISK_FLAG_VAR_RE = re.compile(
+    r"""(?x)
+    (?: --disk \s* | "--disk" \s* , \s* | '--disk' \s* , \s* )
+    ['"]? \s*
+    (?P<expr> str\s*\([^)]+\) | \$\{?[A-Z_][A-Z0-9_]*\}? | [A-Za-z_][A-Za-z_0-9]* )
+    """
+)
+
+
+def check_vastai_create_uses_min_disk_60(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC7: every `vastai create instance` invocation MUST allocate at least
+    60 GB of disk (or annotate `# SINGLE_CANDIDATE_DISK_OK: <why>` on the
+    same line for justified small-disk allocs).
+
+    Bug class extincted (2026-05-01): a 30-GB disk crashed a 6-candidate
+    chain eval at the 4th candidate (uv torch wheels 5GB + 4×3.6GB inflated
+    frames = 19.4GB working set, then 5th eval push tipped over the 30GB
+    ceiling and the rest of the chain failed at "no space left on device").
+    A 60-GB floor gives safe headroom up to ~12 candidates.
+
+    Reference: feedback_loop_session_permanent_bug_class_extinction_20260501.md
+    (Bug Class #6).
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    n_creates = 0
+    # Scan both shell (.sh) and python (.py) files in scripts/ + src/tac/deploy/.
+    candidate_paths: list[Path] = []
+    for d in ("scripts", "src/tac/deploy", "tools"):
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for ext in ("*.sh", "*.py"):
+            candidate_paths.extend(sorted(d_path.rglob(ext)))
+
+    for path in candidate_paths:
+        n_scanned += 1
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        # Strip whole-line comments so docstrings/banners don't trigger.
+        # We keep inline comments so the SINGLE_CANDIDATE_DISK_OK marker
+        # parses on the same line as the create.
+        non_comment = "\n".join(
+            line if not (
+                line.lstrip().startswith("#") or line.lstrip().startswith('"""')
+            ) else ""
+            for line in text.split("\n")
+        )
+        for m in _VASTAI_CREATE_RE.finditer(non_comment):
+            n_creates += 1
+            # Find the line containing this match.
+            start = m.start()
+            line_start = non_comment.rfind("\n", 0, start) + 1
+            # Get a window around the create call (often the --disk flag is
+            # within ~25 lines; argparse calls in py are dataclass-like).
+            window_end = min(len(non_comment), m.end() + 1500)
+            window = non_comment[line_start:window_end]
+            # Same-line waiver for justified small-disk paths.
+            same_line_end = non_comment.find("\n", line_start)
+            if same_line_end < 0:
+                same_line_end = len(non_comment)
+            same_line = non_comment[line_start:same_line_end]
+            if "SINGLE_CANDIDATE_DISK_OK" in same_line:
+                continue
+            # Find first --disk arg in the window. Try literal value first;
+            # if not found, look for a variable / expression form (e.g.
+            # `"--disk", str(int(disk_gb))`) and trust the dataclass default
+            # which is checked separately below.
+            disk_match = _DISK_FLAG_LITERAL_RE.search(window)
+            lineno = non_comment[:start].count("\n") + 1
+            rel = path.relative_to(root) if path.is_absolute() else path
+            if not disk_match:
+                # Variable form acceptable for python (we can't statically
+                # eval at preflight time without overreach). Whitelist
+                # only when the variable name itself contains 'disk' or is
+                # a likely capitalized constant.
+                var_match = _DISK_FLAG_VAR_RE.search(window)
+                if var_match:
+                    expr = var_match.group("expr")
+                    if "disk" in expr.lower() or expr.isupper():
+                        # Pass — the disk value is parameterized; the
+                        # parameter default is checked elsewhere (e.g.,
+                        # InstanceSpec.disk_gb default in src/tac/deploy/base.py
+                        # was bumped to 60 in this commit).
+                        continue
+                violations.append(
+                    f"{rel}:{lineno}: `vastai create instance` has no `--disk` "
+                    f"arg (literal or `disk`-named variable) in next ~1500 "
+                    f"chars. Default Vast.ai disk is 16GB, too small for "
+                    f"chain evals (Bug Class #6). Add `--disk 60` OR "
+                    f"annotate `# SINGLE_CANDIDATE_DISK_OK: <why>`."
+                )
+                continue
+            try:
+                disk_gb = int(disk_match.group("value"))
+            except (TypeError, ValueError):
+                continue
+            if disk_gb < 60:
+                violations.append(
+                    f"{rel}:{lineno}: `vastai create instance` uses "
+                    f"--disk {disk_gb} < 60GB. Multi-candidate chains need "
+                    f"~30GB working set + uv-torch ~5GB. Use --disk 60 OR "
+                    f"annotate `# SINGLE_CANDIDATE_DISK_OK: <why>` on the "
+                    f"same line. Reference: feedback_loop_session_permanent_"
+                    f"bug_class_extinction_20260501.md (Bug Class #6)."
+                )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pcc7-vastai-disk-60] {len(violations)}/{n_creates} create "
+                f"call(s) violate (of {n_scanned} scanned files)"
+            )
+            for v in violations[:5]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [pcc7-vastai-disk-60] OK: {n_creates} create call(s) "
+                f"clean (of {n_scanned} scanned files)"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "PCC7 vastai-create-disk-60 violations:\n  • "
+            + "\n  • ".join(violations)
+            + "\n\nReference: feedback_loop_session_permanent_bug_class_"
+            "extinction_20260501.md (Bug Class #6)."
+        )
+    return violations
+
+
+def check_remote_chain_drivers_clean_inflated_per_candidate(
+    repo_root: Path | None = None,
+    strict: bool = False,
+    verbose: bool = True,
+) -> list[str]:
+    """PCC8: every multi-candidate chain driver script MUST clean up
+    `eval_work/inflated` (and ideally `eval_work/extracted` + `archive.zip`)
+    BETWEEN candidates so a 6+ candidate chain doesn't fill the disk.
+
+    Bug class extincted (2026-05-01): a chain driver that leaves
+    `LOG_DIR/eval_work/inflated/` from candidate N around when starting
+    candidate N+1 piles 3.6 GB per candidate. After 6 candidates that's
+    21.6 GB in /workspace alone — combined with uv torch wheels (5 GB) the
+    30/35 GB Vast.ai disk fills up mid-chain.
+
+    Reference: feedback_loop_session_permanent_bug_class_extinction_20260501.md
+    (Bug Class #7).
+
+    Heuristic: any script under scripts/ or experiments/results/ matching
+    `*chain*.sh` (case-insensitive) that loops with `for cid in ...` or
+    `for entry in ...` MUST contain `rm -rf` of `eval_work/inflated` (or
+    explicit `--no-keep-work-dir` flag, or `# NO_INFLATE_CLEANUP_NEEDED:`
+    waiver).
+    """
+    root = repo_root or REPO_ROOT
+    violations: list[str] = []
+    n_scanned = 0
+    n_chains = 0
+    chain_paths: list[Path] = []
+    for d in ("scripts", "experiments/results"):
+        d_path = root / d
+        if not d_path.exists():
+            continue
+        for p in d_path.rglob("*chain*.sh"):
+            chain_paths.append(p)
+        for p in d_path.rglob("*chain*driver*.sh"):
+            if p not in chain_paths:
+                chain_paths.append(p)
+
+    for path in sorted(set(chain_paths)):
+        n_scanned += 1
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        # Strip whole-line comments for the chain-detection logic only —
+        # the waiver marker IS in a comment so it must remain visible.
+        non_comment = "\n".join(
+            line if not line.lstrip().startswith("#") else ""
+            for line in text.split("\n")
+        )
+        # A "multi-candidate chain" has a for-loop over an array.
+        if not re.search(
+            r"for\s+\w+\s+in\s+(?:\$\{?\w+\[@\]\}?|\$\(.*\)|`.*`|\$\w+|\w+_\w+)",
+            non_comment,
+        ):
+            continue
+        # Also require contest_auth_eval or remote_archive_only_eval reference.
+        if "contest_auth_eval" not in non_comment and \
+                "remote_archive_only_eval.sh" not in non_comment:
+            continue
+        n_chains += 1
+        # Specifically: rm -rf must reference inflated / eval_work / extracted.
+        rm_eval_work_re = re.compile(
+            r"rm\s+-rf[^\n]*(?:eval_work|inflated|extracted|archive\.zip)"
+        )
+        has_cleanup = (
+            bool(rm_eval_work_re.search(non_comment))
+            or "--no-keep-work-dir" in non_comment
+            # Waiver marker stays in the ORIGINAL text (often a comment).
+            or "NO_INFLATE_CLEANUP_NEEDED" in text
+        )
+        if not has_cleanup:
+            rel = path.relative_to(root) if path.is_absolute() else path
+            violations.append(
+                f"{rel}: multi-candidate chain driver has no per-candidate "
+                f"`rm -rf eval_work/inflated` cleanup. After 6 candidates "
+                f"that's ~21GB of inflated frames stacked on a 30/60GB disk. "
+                f"Add `rm -rf $LOG_DIR/eval_work/inflated` (and ideally "
+                f"`extracted` + `archive.zip`) at end of each iteration, OR "
+                f"annotate `# NO_INFLATE_CLEANUP_NEEDED: <why>`. Reference: "
+                f"feedback_loop_session_permanent_bug_class_extinction_"
+                f"20260501.md (Bug Class #7)."
+            )
+
+    if verbose:
+        if violations:
+            print(
+                f"  [pcc8-chain-cleanup] {len(violations)}/{n_chains} chain "
+                f"driver(s) violate (of {n_scanned} scanned)"
+            )
+            for v in violations[:5]:
+                print(f"    • {v}")
+        else:
+            print(
+                f"  [pcc8-chain-cleanup] OK: {n_chains} chain driver(s) "
+                f"clean (of {n_scanned} scanned)"
+            )
+
+    if violations and strict:
+        raise PreflightError(
+            "PCC8 chain-driver-per-candidate-cleanup violations:\n  • "
+            + "\n  • ".join(violations)
+            + "\n\nReference: feedback_loop_session_permanent_bug_class_"
+            "extinction_20260501.md (Bug Class #7)."
+        )
+    return violations
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Preflight pipeline validator — runs ALL layers by default"
+    )
+    parser.add_argument("--renderer", type=str, default=None,
+                        help="Optional renderer .bin/.pt for artifact check")
+    parser.add_argument("--masks", type=str, default=None)
+    parser.add_argument("--poses", type=str, default=None)
+    parser.add_argument("--archive", type=str, default=None)
+    parser.add_argument("--no-codebase", action="store_true",
+                        help="Skip codebase / arity / profiles / filenames / arch_consistency")
+    parser.add_argument("--profile", type=str, default=None,
+                        help="Profile name for training-input validation")
+    parser.add_argument("--tto-frames", type=str, default=None)
+    parser.add_argument("--gt-poses", type=str, default=None)
+    args = parser.parse_args()
+
+    try:
+        # R38 fix: was preflight_check (artifact-only) — now preflight_all
+        # so the CLI runs the full 5-layer validation. Operators running
+        # `python -m tac.preflight` expected comprehensive validation.
+        profile_arch = None
+        if args.profile:
+            from tac.profiles import PROFILES
+            if args.profile not in PROFILES:
+                print(f"Unknown profile: {args.profile}", file=sys.stderr)
+                sys.exit(2)
+            profile_arch = PROFILES[args.profile]
+        preflight_all(
+            profile_name=args.profile,
+            profile_arch=profile_arch,
+            tto_frames_path=args.tto_frames,
+            gt_poses_path=args.gt_poses,
+            masks_path=args.masks,
+            renderer_path=args.renderer,
+            archive_path=args.archive,
+            check_codebase=not args.no_codebase,
+            verbose=True,
+        )
+        print("\nPREFLIGHT PASSED")
+    except (PreflightError, ArityViolation, FilenameContractError,
+            CodebaseDriftError, LoaderFormatSafetyError) as e:
+        print(f"\nPREFLIGHT FAILED: {e}", file=sys.stderr)
+        sys.exit(1)

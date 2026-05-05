@@ -1,0 +1,322 @@
+"""Tests for credential-safe Lightning exact-eval orchestration."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+
+REPO = Path(__file__).resolve().parents[3]
+SCRIPT = REPO / "scripts" / "lightning_exact_eval_repro.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location(
+        "lightning_exact_eval_repro_under_test",
+        str(SCRIPT),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fixture_repo(tmp_path: Path) -> tuple[Path, Path]:
+    archive = tmp_path / "experiments/results/candidate/archive.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"candidate archive bytes")
+    baseline = tmp_path / "experiments/results/frontier/contest_auth_eval.json"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_text(
+        json.dumps(
+            {
+                "score_recomputed_from_components": 1.043987524793892,
+                "archive_size_bytes": 686635,
+                "avg_posenet_dist": 0.00346442,
+                "avg_segnet_dist": 0.00400656,
+                "n_samples": 600,
+                "provenance": {
+                    "device": "cuda",
+                    "archive_sha256": "0af839abb30e0dfdcfbcbf75247b136db8731196ef26e58374c76a1b562ded7f",
+                    "gpu_t4_match": True,
+                },
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return archive, baseline
+
+
+def _base_args(archive: Path, baseline: Path) -> list[str]:
+    return [
+        "--job-name",
+        "owv3_exact_eval_test",
+        "--archive",
+        str(archive),
+        "--baseline-json",
+        str(baseline),
+        "--predicted-band",
+        "1.0",
+        "1.1",
+        "--regression-threshold",
+        "1.2",
+        "--max-posenet-relative",
+        "1.05",
+        "--max-segnet-relative",
+        "1.002",
+        "--studio",
+        "pact",
+    ]
+
+
+def _flag_value(cmd: list[str], flag: str) -> str:
+    idx = cmd.index(flag)
+    return cmd[idx + 1]
+
+
+def test_stage_command_uses_operator_supplied_ssh_alias_without_key_material(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--stage-workspace",
+            "--remote",
+            "lightning-pact",
+            "--extra-artifact",
+            str(tmp_path / "experiments/results/candidate/archive.zip"),
+        ]
+    )
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    stage_cmd = plan["commands"]["stage_workspace"]
+    stage_string = plan["command_strings"]["stage_workspace"]
+
+    assert stage_cmd is not None
+    assert _flag_value(stage_cmd, "--remote") == "lightning-pact"
+    assert "StrictHostKeyChecking" not in stage_string
+    assert " -i " not in f" {stage_string} "
+    assert "experiments/results/candidate/archive.zip" in plan["artifacts"]
+    assert "experiments/results/frontier/contest_auth_eval.json" in plan["artifacts"]
+
+
+def test_queue_command_is_dry_run_and_uses_writable_remote_workspace_path(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(_base_args(archive, baseline))
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    queue_cmd = plan["commands"]["queue_exact_eval"]
+    queue_string = plan["command_strings"]["queue_exact_eval"]
+
+    assert queue_cmd is not None
+    assert "--dry-run" in queue_cmd
+    assert _flag_value(queue_cmd, "--archive") == (
+        "/teamspace/studios/this_studio/pact/experiments/results/candidate/archive.zip"
+    )
+    assert _flag_value(queue_cmd, "--expected-archive-sha256") == hashlib.sha256(
+        b"candidate archive bytes"
+    ).hexdigest()
+    assert _flag_value(queue_cmd, "--expected-archive-size-bytes") == str(len(b"candidate archive bytes"))
+    assert "/teamspace/jobs/" not in queue_string
+    assert "--adjudicate" in queue_cmd
+    assert "--device cuda" not in queue_cmd
+
+
+def test_baseline_json_populates_adjudication_flags(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(_base_args(archive, baseline))
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    queue_cmd = plan["commands"]["queue_exact_eval"]
+    assert queue_cmd is not None
+
+    assert _flag_value(queue_cmd, "--baseline-score") == "1.0439875247938919"
+    assert _flag_value(queue_cmd, "--baseline-archive-bytes") == "686635"
+    assert _flag_value(queue_cmd, "--baseline-posenet-dist") == "0.00346442"
+    assert _flag_value(queue_cmd, "--baseline-segnet-dist") == "0.00400656"
+    assert _flag_value(queue_cmd, "--component-reference-label") == (
+        "experiments/results/frontier/contest_auth_eval.json"
+    )
+    assert plan["queue_metadata"]["baseline_json"] == "experiments/results/frontier/contest_auth_eval.json"
+
+
+def test_submit_requires_staging_or_explicit_remote_custody_and_target_backend(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+
+    no_stage = mod.build_parser().parse_args(_base_args(archive, baseline) + ["--submit"])
+    with pytest.raises(ValueError, match="--stage-workspace or --allow-unstaged-submit"):
+        mod.build_plan(no_stage, repo_root=tmp_path)
+
+    no_backend_args = _base_args(archive, baseline)
+    studio_idx = no_backend_args.index("--studio")
+    del no_backend_args[studio_idx : studio_idx + 2]
+    no_backend = mod.build_parser().parse_args(
+        no_backend_args + ["--submit", "--allow-unstaged-submit"]
+    )
+    with pytest.raises(ValueError, match="--studio or --image"):
+        mod.build_plan(no_backend, repo_root=tmp_path)
+
+
+def test_submit_requires_remote_alias_before_forwarding_submit_preflight(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--submit",
+            "--allow-unstaged-submit",
+        ]
+    )
+    args.remote = None
+
+    with pytest.raises(ValueError, match="--remote"):
+        mod.build_plan(args, repo_root=tmp_path)
+
+
+def test_stage_workspace_rejects_bare_lightning_ssh_host(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--stage-workspace",
+            "--remote",
+            "ssh.lightning.ai",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="bare ssh\\.lightning\\.ai"):
+        mod.build_plan(args, repo_root=tmp_path)
+
+
+def test_wrapper_argparse_rejects_misspelled_remote_flag_with_real_surface(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod = _load_module()
+
+    with pytest.raises(SystemExit):
+        mod.build_parser().parse_args(["--job-name", "x", "--archive", "a.zip", "--rmote", "lightning-pact"])
+
+    captured = capsys.readouterr()
+    assert "--rmote: --remote" in captured.err
+    assert "Known options include:" in captured.err
+
+
+def test_submit_forwards_dispatch_claim_guard_flags(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--submit",
+            "--stage-workspace",
+            "--remote",
+            "lightning-pact",
+            "--dispatch-lane-id",
+            "lane_renderer_eval",
+            "--dispatch-claims-path",
+            ".omx/state/active_lane_dispatch_claims.md",
+        ]
+    )
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    queue_cmd = plan["commands"]["queue_exact_eval"]
+    assert queue_cmd is not None
+    assert "--dry-run" not in queue_cmd
+    assert _flag_value(queue_cmd, "--dispatch-lane-id") == "lane_renderer_eval"
+    assert _flag_value(queue_cmd, "--dispatch-claims-path") == ".omx/state/active_lane_dispatch_claims.md"
+
+
+def test_queue_command_forwards_exact_eval_env_overrides(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--env",
+            "INFLATE_TORCH_SPEC=torch==2.5.1+cu124",
+            "--env",
+            "UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124",
+        ]
+    )
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    queue_cmd = plan["commands"]["queue_exact_eval"]
+    assert queue_cmd is not None
+
+    env_values = [
+        queue_cmd[index + 1]
+        for index, value in enumerate(queue_cmd)
+        if value == "--env"
+    ]
+    assert env_values == [
+        "INFLATE_TORCH_SPEC=torch==2.5.1+cu124",
+        "UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124",
+    ]
+    assert plan["env"] == env_values
+
+
+def test_queue_command_can_request_component_trace(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--component-trace",
+            "--component-trace-top-k",
+            "96",
+        ]
+    )
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    queue_cmd = plan["commands"]["queue_exact_eval"]
+    assert queue_cmd is not None
+
+    assert "--component-trace" in queue_cmd
+    assert _flag_value(queue_cmd, "--component-trace-top-k") == "96"
+    assert plan["component_trace"] is True
+    assert plan["component_trace_top_k"] == 96
+
+
+def test_submit_forwards_dispatch_claim_break_glass_reason(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--submit",
+            "--stage-workspace",
+            "--remote",
+            "lightning-pact",
+            "--allow-missing-dispatch-claim-reason",
+            "operator reviewed emergency rerun",
+        ]
+    )
+
+    plan = mod.build_plan(args, repo_root=tmp_path)
+    queue_cmd = plan["commands"]["queue_exact_eval"]
+    assert queue_cmd is not None
+    assert _flag_value(queue_cmd, "--allow-missing-dispatch-claim-reason") == (
+        "operator reviewed emergency rerun"
+    )
+
+
+def test_read_only_sdk_artifact_view_is_rejected_as_output_dir(tmp_path: Path) -> None:
+    mod = _load_module()
+    archive, baseline = _fixture_repo(tmp_path)
+    args = mod.build_parser().parse_args(
+        _base_args(archive, baseline)
+        + [
+            "--output-dir",
+            "/teamspace/jobs/owv3/artifacts",
+        ]
+    )
+    with pytest.raises(ValueError, match="read-only artifact view"):
+        mod.build_plan(args, repo_root=tmp_path)

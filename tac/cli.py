@@ -1,0 +1,1162 @@
+"""Canonical tac CLI.
+
+Provides the top-level command router for the lossy and lossless namespaces.
+The lossy path is the standard training route; the lossless path is a minimal
+profile-based skeleton that keeps the namespace canonical without duplicating
+training logic.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from .lossless.arithmetic import (
+    GPTArithmeticEstimate,
+    build_gpt_arithmetic_plan,
+    estimate_gpt_arithmetic_workload,
+    materialize_gpt_arithmetic_stream,
+    write_symbol_frequency_report,
+)
+from .lossless.codecs import (
+    benchmark_zstd_dict_file,
+    benchmark_zstd_dict_directory,
+    benchmark_zstd_dict_chunked_file,
+    compress_lossless_file,
+    decompress_lossless_file,
+    evaluate_lossless_baseline_submission,
+)
+from .lossless.evaluate import evaluate_lossless_archive
+from .lossless.frequency_coder import (
+    benchmark_prev_pair_frequency_file,
+    benchmark_prev_symbol_frequency_file,
+    decode_uint16_prev_symbol_file,
+    encode_uint16_frequency_file,
+    encode_uint16_prev_symbol_file,
+)
+from .lossless.gpt_arithmetic_coder import encode_commavq_gpt_global_sample, encode_commavq_gpt_sample
+from .lossless.global_prev_symbol import benchmark_global_prev_symbol_record_order_sample
+from .lossless.hybrid_selector import SelectionMetric, rank_exact_candidates
+from .lossless.next_frame_coder import encode_commavq_next_frame_sample
+from .lossless.gpt_score import probe_commavq_gpt_devices, score_commavq_gpt_sample
+from .lossless.tiny_frame_predictor import summarize_tiny_frame_predictor
+from .lossless.tiny_frame_train import probe_tiny_frame_training
+from .lossless.token_rgb_bridge import (
+    OFFICIAL_DECODER_URL,
+    decode_commavq_token_file_to_rgb,
+    load_official_commavq_bridge,
+)
+from .lossless.semantic_labels import build_pose_label_map_sample
+from .lossless.rgb_semantic_labels import build_rgb_label_map_sample
+from .lossless.profiles import PROFILES as LOSSLESS_PROFILES
+from .lossless.state import promote_lossless_result
+from .lossless.submission import build_submission_zip
+from .profiles import PROFILES as LOSSY_PROFILES
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# All paths are configurable via environment variables — no hardcoded assumptions
+# about directory structure. Fallbacks use PROJECT_ROOT-relative paths.
+_UPSTREAM = os.environ.get(
+    "TAC_UPSTREAM_DIR",
+    str(PROJECT_ROOT / "workspace" / "upstream" / "comma_video_compression_challenge"),
+)
+UPSTREAM_ROOT = Path(_UPSTREAM)
+
+DEFAULTS = {
+    "archive": os.environ.get("TAC_ARCHIVE", str(PROJECT_ROOT / "submissions" / "robust_current" / "archive.zip")),
+    "gt_video": os.environ.get("TAC_GT_VIDEO", str(UPSTREAM_ROOT / "videos" / "0.mkv")),
+    "saliency": os.environ.get("TAC_SALIENCY", ""),  # empty = skip saliency
+    "models_dir": os.environ.get("TAC_MODELS_DIR", str(UPSTREAM_ROOT / "models")),
+    "upstream_dir": str(UPSTREAM_ROOT),
+}
+
+TINY_FRAME_PREDICTOR_PROFILES = sorted(
+    profile for profile, config in LOSSLESS_PROFILES.items() if config.get("method") == "tiny_frame_predictor"
+)
+
+
+def _add_lossy_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Named profile from tac.profiles (e.g., council_v1, segnet_attack, smoke). "
+        "CLI args override profile values.",
+    )
+    parser.add_argument("--archive", default=os.environ.get("TAC_ARCHIVE", DEFAULTS["archive"]))
+    parser.add_argument("--gt-video", default=os.environ.get("TAC_GT_VIDEO", DEFAULTS["gt_video"]))
+    parser.add_argument("--precomputed", default=os.environ.get("TAC_PRECOMPUTED", None))
+    parser.add_argument("--saliency", default=os.environ.get("TAC_SALIENCY", DEFAULTS["saliency"]))
+    parser.add_argument("--models-dir", default=os.environ.get("TAC_MODELS_DIR", DEFAULTS["models_dir"]))
+    parser.add_argument("--upstream-dir", default=os.environ.get("TAC_UPSTREAM_DIR", DEFAULTS["upstream_dir"]))
+    parser.add_argument("--variant", default="standard")
+    parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--kernel", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2500)
+    parser.add_argument("--alpha", type=float, default=20.0)
+    parser.add_argument("--sal-lambda", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--ema-decay", type=float, default=0.997)
+    parser.add_argument("--accum-steps", type=int, default=4)
+    parser.add_argument("--subsample", type=int, default=8)
+    parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--hard-frame-ratio", type=float, default=0.0)
+    parser.add_argument("--error-replay-every", type=int, default=0)
+    parser.add_argument(
+        "--loss-mode",
+        default="standard",
+        choices=["standard", "temperature", "focal_ste", "kl_distill", "pcgrad",
+                 "feature_match", "segnet_kl", "posenet_embedding"],
+    )
+    parser.add_argument("--temperature-start", type=float, default=1.0)
+    parser.add_argument("--temperature-end", type=float, default=0.05)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--segnet-loss-weight", type=float, default=100.0)
+    parser.add_argument("--use-dual-saliency", action="store_true")
+    parser.add_argument("--alpha-seg", type=float, default=200.0)
+    parser.add_argument("--use-ste", action="store_true")
+    parser.add_argument("--boundary-weight", type=float, default=1.0)
+    parser.add_argument("--learn-loss-weights", action="store_true",
+                        help="Learn segnet/posenet loss weights via log-space nn.Parameters")
+    parser.add_argument("--adaptive-boundary", action="store_true",
+                        help="Adjust boundary_weight per-epoch based on SegNet feedback")
+    parser.add_argument("--weight-decay", type=float, default=1e-4,
+                        help="AdamW weight decay (default: 1e-4)")
+    parser.add_argument("--eta-min", type=float, default=1e-4,
+                        help="CosineAnnealingLR minimum learning rate (default: 1e-4)")
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--output-dir", default="experiments/postfilter_weights")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="tac", description="Canonical tac CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    lossy = subparsers.add_parser("lossy", help="Run the learned post-filter training lane.")
+    _add_lossy_arguments(lossy)
+
+    lossless = subparsers.add_parser("lossless", help="Run canonical lossless workflows.")
+    lossless_sub = lossless.add_subparsers(dest="lossless_command", required=True)
+
+    sp = lossless_sub.add_parser("profiles", help="List available lossless profiles")
+    sp.set_defaults(lossless_handler="profiles")
+
+    sp = lossless_sub.add_parser(
+        "tiny-frame-predictor-summary",
+        help="Summarize a compact whole-frame predictor architecture for exact entropy coding experiments",
+    )
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.set_defaults(lossless_handler="tiny_frame_predictor_summary")
+
+    sp = lossless_sub.add_parser(
+        "tiny-frame-train-probe",
+        help="Run a bounded local tiny-frame training probe and write a JSON artifact",
+    )
+    sp.add_argument("--profile", required=True, choices=TINY_FRAME_PREDICTOR_PROFILES)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--shard-path", action="append", default=None)
+    sp.add_argument("--data-file", action="append", default=None)
+    sp.add_argument("--batch-size", type=int, default=2)
+    sp.add_argument("--context-frames", type=int, default=None)
+    sp.add_argument("--max-records", type=int, default=1)
+    sp.add_argument("--sample-offset", type=int, default=0)
+    sp.add_argument("--max-batches", type=int, default=1)
+    sp.add_argument("--learning-rate", type=float, default=0.05)
+    sp.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
+    sp.set_defaults(lossless_handler="tiny_frame_train_probe")
+
+    sp = lossless_sub.add_parser("plan", help="Build a non-measured lossless experiment plan")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--work-dir", default=None)
+    sp.add_argument("--split", nargs="*", default=None)
+    sp.add_argument("--layout", default="frame_major", choices=["frame_major", "position_major"])
+    sp.set_defaults(lossless_handler="plan")
+
+    sp = lossless_sub.add_parser("estimate", help="Estimate a non-measured lossless arithmetic workload")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--work-dir", default=None)
+    sp.add_argument("--split", nargs="*", default=None)
+    sp.add_argument("--layout", default="frame_major", choices=["frame_major", "position_major"])
+    sp.set_defaults(lossless_handler="estimate")
+
+    sp = lossless_sub.add_parser("prepare", help="Materialize a GPT/arithmetic token stream")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--split", nargs="*", default=None)
+    sp.add_argument("--layout", default="frame_major", choices=["frame_major", "position_major"])
+    sp.set_defaults(lossless_handler="prepare")
+
+    sp = lossless_sub.add_parser("gpt-score", help="Score a prepared frame-major token stream with the official commavq GPT")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--max-scored-tokens", type=int, default=None)
+    sp.add_argument("--context-tokens", type=int, default=None)
+    sp.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--cache-dir", default=None)
+    sp.add_argument("--model-url", default=None)
+    sp.add_argument("--gpt-module-path", default=None)
+    sp.set_defaults(lossless_handler="gpt_score")
+
+    sp = lossless_sub.add_parser("gpt-score-probe", help="Benchmark local GPT scoring backends on a prepared frame-major stream")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--max-scored-tokens", type=int, default=64)
+    sp.add_argument("--context-tokens", type=int, default=None)
+    sp.add_argument("--device", dest="devices", action="append", required=True, choices=["cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--cache-dir", default=None)
+    sp.add_argument("--model-url", default=None)
+    sp.add_argument("--gpt-module-path", default=None)
+    sp.set_defaults(lossless_handler="gpt_score_probe")
+
+    sp = lossless_sub.add_parser("gpt-arithmetic-sample", help="Encode a local-only GPT arithmetic sample from a prepared frame-major stream")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--max-tokens", type=int, default=256)
+    sp.add_argument("--context-tokens", type=int, default=None)
+    sp.add_argument("--device", default="mps", choices=["cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--verify-decode", action="store_true")
+    sp.add_argument("--cache-dir", default=None)
+    sp.add_argument("--model-url", default=None)
+    sp.add_argument("--gpt-module-path", default=None)
+    sp.set_defaults(lossless_handler="gpt_arithmetic_sample")
+
+    sp = lossless_sub.add_parser(
+        "gpt-arithmetic-global-sample",
+        help="Encode a local-only GPT arithmetic sample from a raw uint16 global token stream",
+    )
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--max-tokens", type=int, default=256)
+    sp.add_argument("--context-tokens", type=int, default=None)
+    sp.add_argument("--device", default="mps", choices=["cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--verify-decode", action="store_true")
+    sp.add_argument("--cache-dir", default=None)
+    sp.add_argument("--model-url", default=None)
+    sp.add_argument("--gpt-module-path", default=None)
+    sp.set_defaults(lossless_handler="gpt_arithmetic_global_sample")
+
+    sp = lossless_sub.add_parser("next-frame-sample", help="Encode a local-only grouped next-frame sample from a prepared frame-major stream")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--max-frames", type=int, default=32)
+    sp.add_argument("--context-frames", type=int, default=None)
+    sp.add_argument("--device", default="mps", choices=["cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--verify-decode", action="store_true")
+    sp.add_argument("--cache-dir", default=None)
+    sp.add_argument("--model-url", default=None)
+    sp.add_argument("--gpt-module-path", default=None)
+    sp.set_defaults(lossless_handler="next_frame_sample")
+
+    sp = lossless_sub.add_parser(
+        "token-rgb-sample",
+        help="Decode a commavq token cube to RGB frames using the canonical off-the-shelf decoder",
+    )
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--max-frames", type=int, default=None)
+    sp.add_argument("--batch-size", type=int, default=64)
+    sp.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--commavq-root", default=None)
+    sp.add_argument("--decoder-url", default=OFFICIAL_DECODER_URL)
+    sp.set_defaults(lossless_handler="token_rgb_sample")
+
+    sp = lossless_sub.add_parser(
+        "pose-labels-sample",
+        help="Build a NaN-robust pose-derived label map keyed by canonical commavq file_name",
+    )
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--split", nargs="*", default=None)
+    sp.add_argument("--max-records", type=int, default=64)
+    sp.set_defaults(lossless_handler="pose_labels_sample")
+
+    sp = lossless_sub.add_parser(
+        "rgb-labels-sample",
+        help="Build a local-only RGB semantic label map keyed by canonical commavq file_name",
+    )
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--split", nargs="*", default=None)
+    sp.add_argument("--max-records", type=int, default=64)
+    sp.add_argument("--max-keyframes", type=int, default=6)
+    sp.add_argument("--batch-size", type=int, default=64)
+    sp.add_argument("--device", default="cpu", choices=["auto", "cpu", "cuda", "mps"])
+    sp.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    sp.add_argument("--commavq-root", default=None)
+    sp.add_argument("--decoder-url", default=OFFICIAL_DECODER_URL)
+    sp.set_defaults(lossless_handler="rgb_labels_sample")
+
+    sp = lossless_sub.add_parser(
+        "global-prev-symbol-order-sample",
+        help="Benchmark exact global prev-symbol record-order strategies on a bounded commavq slice",
+    )
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--split", nargs="*", default=None)
+    sp.add_argument("--max-records", type=int, default=64)
+    sp.add_argument(
+        "--strategy",
+        default="canonical",
+        choices=[
+            "canonical",
+            "explicit",
+            "clip_greedy_nn",
+            "clip_recursive_pca",
+            "transition_recursive_pca",
+            "label_grouped_clip_greedy_nn",
+            "label_lexicographic_clip_rank",
+            "hybrid_thresh8_parent046_label_greedy",
+        ],
+    )
+    sp.add_argument("--labels", default=None)
+    sp.add_argument("--order-file", default=None)
+    sp.add_argument("--frame-order", default="canonical", choices=["canonical", "recursive_bisect"])
+    sp.set_defaults(lossless_handler="global_prev_symbol_order_sample")
+
+    sp = lossless_sub.add_parser(
+        "hybrid-select",
+        help="Rank exact lossless candidate JSON summaries by ordered metrics and persist the deterministic winner",
+    )
+    sp.add_argument("--input", action="append", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument(
+        "--metric",
+        action="append",
+        required=True,
+        help="Metric ordering in the form key:min or key:max",
+    )
+    sp.add_argument("--exact-key", default="exact_match")
+    sp.set_defaults(lossless_handler="hybrid_select")
+
+    sp = lossless_sub.add_parser("frequency-report", help="Analyze a prepared token stream")
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.set_defaults(lossless_handler="frequency_report")
+
+    sp = lossless_sub.add_parser(
+        "frequency-encode", help="Encode a prepared token stream with the static frequency coder"
+    )
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.set_defaults(lossless_handler="frequency_encode")
+
+    sp = lossless_sub.add_parser(
+        "prev-symbol-encode", help="Encode a prepared token stream with the previous-symbol conditional coder"
+    )
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--output", required=True)
+    sp.set_defaults(lossless_handler="prev_symbol_encode")
+
+    sp = lossless_sub.add_parser("prev-symbol-decode", help="Restore a previous-symbol encoded token stream")
+    sp.add_argument("--encoded", required=True)
+    sp.add_argument("--output", required=True)
+    sp.set_defaults(lossless_handler="prev_symbol_decode")
+
+    sp = lossless_sub.add_parser(
+        "prev-symbol-benchmark", help="Benchmark a previous-symbol conditional static coder over a prepared stream"
+    )
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--max-tokens", type=int, default=None)
+    sp.set_defaults(lossless_handler="prev_symbol_benchmark")
+
+    sp = lossless_sub.add_parser(
+        "prev-pair-benchmark", help="Benchmark a previous-pair conditional static coder over a prepared stream"
+    )
+    sp.add_argument("--tokens", required=True)
+    sp.add_argument("--max-tokens", type=int, default=None)
+    sp.set_defaults(lossless_handler="prev_pair_benchmark")
+
+    sp = lossless_sub.add_parser("zstd-dict-benchmark", help="Benchmark a local-only zstd dictionary experiment")
+    sp.add_argument("--source", required=True)
+    sp.add_argument("--compressed", required=True)
+    sp.add_argument("--restored", required=True)
+    sp.add_argument("--sample", action="append", default=[])
+    sp.add_argument("--dict-size", type=int, default=8192)
+    sp.add_argument("--sample-block-bytes", type=int, default=None)
+    sp.add_argument("--max-training-samples", type=int, default=None)
+    sp.set_defaults(lossless_handler="zstd_dict_benchmark")
+
+    sp = lossless_sub.add_parser("zstd-dict-dir-benchmark", help="Benchmark a local-only zstd dictionary experiment over a directory")
+    sp.add_argument("--source-root", required=True)
+    sp.add_argument("--compressed-root", required=True)
+    sp.add_argument("--restored-root", required=True)
+    sp.add_argument("--sample", action="append", default=[])
+    sp.add_argument("--dict-size", type=int, default=8192)
+    sp.add_argument("--sample-block-bytes", type=int, default=None)
+    sp.add_argument("--max-training-samples", type=int, default=None)
+    sp.set_defaults(lossless_handler="zstd_dict_dir_benchmark")
+
+    sp = lossless_sub.add_parser("zstd-dict-chunk-benchmark", help="Benchmark a local-only zstd dictionary experiment over chunks of one file")
+    sp.add_argument("--source", required=True)
+    sp.add_argument("--compressed-root", required=True)
+    sp.add_argument("--restored-root", required=True)
+    sp.add_argument("--block-bytes", type=int, required=True)
+    sp.add_argument("--sample", action="append", default=[])
+    sp.add_argument("--dict-size", type=int, default=8192)
+    sp.add_argument("--sample-block-bytes", type=int, default=None)
+    sp.add_argument("--max-training-samples", type=int, default=None)
+    sp.set_defaults(lossless_handler="zstd_dict_chunk_benchmark")
+
+    sp = lossless_sub.add_parser("baseline", help="Build a real dataset-backed lossless baseline submission")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--work-dir", required=True)
+    sp.add_argument("--split", nargs="*", default=["0", "1"])
+    sp.set_defaults(lossless_handler="baseline")
+
+    sp = lossless_sub.add_parser("compress", help="Run a real lossless baseline compressor and exact round-trip check")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--input", required=True)
+    sp.add_argument("--output", required=True)
+    sp.add_argument("--decompressed-output", required=True)
+    sp.set_defaults(lossless_handler="compress")
+
+    sp = lossless_sub.add_parser("package", help="Build a commavq-style submission zip")
+    sp.add_argument("--payload-dir", required=True)
+    sp.add_argument("--decompress", required=True)
+    sp.add_argument("--output", required=True)
+    sp.set_defaults(lossless_handler="package")
+
+    sp = lossless_sub.add_parser("evaluate", help="Evaluate an exact lossless archive result")
+    sp.add_argument("--profile", required=True, choices=sorted(LOSSLESS_PROFILES))
+    sp.add_argument("--method", required=True)
+    sp.add_argument("--original", required=True)
+    sp.add_argument("--decompressed", required=True)
+    sp.add_argument("--archive", required=True)
+    sp.set_defaults(lossless_handler="evaluate")
+
+    sp = lossless_sub.add_parser(
+        "promote", help="Promote a measured lossless result into separate lossless state surfaces"
+    )
+    sp.add_argument("--result-json", required=True)
+    sp.add_argument("--repo-root", required=True)
+    sp.set_defaults(lossless_handler="promote")
+
+    # ── Experiment utility subcommands ──────────────────────────────────────
+
+    # tac crf-search
+    sp = subparsers.add_parser("crf-search", help="Per-video CRF optimization sweep.")
+    sp.add_argument("--crf-min", type=float, default=32, help="Minimum CRF to test")
+    sp.add_argument("--crf-max", type=float, default=36, help="Maximum CRF to test")
+    sp.add_argument("--crf-step", type=float, default=1, help="CRF step size")
+    sp.add_argument("--full-eval-top", type=int, default=0, help="Run full scorer on top N proxy results")
+    sp.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
+
+    # tac ensemble
+    sp = subparsers.add_parser("ensemble", help="Checkpoint ensemble via weight-space averaging.")
+    sp.add_argument("--checkpoints", nargs="+", help="Explicit checkpoint paths")
+    sp.add_argument("--checkpoint-dir", help="Directory to discover checkpoints from")
+    sp.add_argument("--top-k", type=int, default=5, help="Number of top checkpoints to average")
+    sp.add_argument("--output", required=True, help="Output int8 checkpoint path")
+    sp.add_argument("--variant", default="dilated", help="Architecture variant")
+    sp.add_argument("--hidden", type=int, default=64, help="Hidden channel width")
+    sp.add_argument("--kernel", type=int, default=3, help="Kernel size")
+    sp.add_argument("--no-per-channel", dest="per_channel", action="store_false",
+                    help="Disable per-channel quantization (use per-tensor instead)")
+
+    # tac rd-floor
+    sp = subparsers.add_parser("rd-floor", help="Empirical rate/distortion Pareto frontier analysis.")
+    sp.add_argument("--root", type=Path, default=None, help="Root directory for summary JSONs")
+    sp.add_argument("--target", action="append", type=float, default=None,
+                    help="Target scores for counterfactual analysis (repeatable)")
+    sp.add_argument("--json", action="store_true", help="Print machine-readable JSON only.")
+
+    # tac benchmark-codecs
+    sp = subparsers.add_parser("benchmark-codecs", help="Benchmark mask encoding strategies.")
+
+    # ── Visualization subcommands ──────────────────────────────────────────
+
+    # tac viz-comma-video
+    sp = subparsers.add_parser("viz-comma-video", help="Generate 6-panel comma-format comparison video + GIF.")
+
+    # tac viz-comma-gif
+    sp = subparsers.add_parser("viz-comma-gif", help="Generate 512x384 comma-style animated GIF (baseline/ours/comparison).")
+
+    # tac viz-comparison
+    sp = subparsers.add_parser("viz-comparison", help="Generate side-by-side SegNet overlay comparison video + GIF.")
+
+    # tac viz-segnet
+    sp = subparsers.add_parser("viz-segnet", help="Generate SegNet visualization JSON data for the web page.")
+
+    # tac viz-yuv-gif
+    sp = subparsers.add_parser("viz-yuv-gif", help="Generate 3-panel YUV Y00 channel comparison GIF.")
+
+    # tac viz-analysis-panels
+    sp = subparsers.add_parser("viz-analysis-panels", help="Generate 6-panel TTO analysis visualization (GT/recon/error + SegNet).")
+    sp.add_argument("--frames", type=str, required=True, help="Path to TTO frames .pt file (N, H, W, 3) uint8 tensor.")
+    sp.add_argument("--upstream", type=str, required=True, help="Path to upstream directory with scorer models and GT videos.")
+    sp.add_argument("--output", type=str, required=True, help="Output directory for GIF/MP4 visualization files.")
+    sp.add_argument("--auth-matched", action="store_true", default=False, help="Upscale frames to camera resolution to match authoritative scorer.")
+    sp.add_argument("--device", type=str, default="cpu", help="Torch device (cpu, cuda, mps).")
+
+    return parser
+
+
+def _select(profile_defaults: dict[str, Any], args: argparse.Namespace, name: str, default: Any) -> Any:
+    value = getattr(args, name.replace("-", "_"))
+    if value != default:
+        return value
+    return profile_defaults.get(name.replace("-", "_"), value)
+
+
+def _parse_selection_metrics(raw_metrics: list[str]) -> tuple[SelectionMetric, ...]:
+    metrics: list[SelectionMetric] = []
+    for raw_metric in raw_metrics:
+        key, separator, direction = raw_metric.partition(":")
+        if separator != ":":
+            raise SystemExit(f"ERROR: invalid metric specification {raw_metric!r}; expected key:min or key:max")
+        metrics.append(SelectionMetric(key.strip(), direction.strip()))
+    return tuple(metrics)
+
+
+def _run_lossy(args: argparse.Namespace) -> dict[str, Any]:
+    from tac.architectures import build_postfilter
+    from tac.data import load_frames, load_raw_saliency
+    from tac.scorer import detect_device, load_scorers
+    from tac.training import TrainConfig, Trainer
+
+    device = detect_device()
+    print(f"[tac] device: {device}")
+
+    profile_defaults: dict[str, Any] = {}
+    if args.profile:
+        if args.profile not in LOSSY_PROFILES:
+            raise SystemExit(f"ERROR: unknown profile '{args.profile}'")
+        profile_defaults = LOSSY_PROFILES[args.profile]
+        print(f"[tac] Using profile: {args.profile}")
+
+    effective_variant = _select(profile_defaults, args, "variant", "standard")
+    effective_hidden = int(_select(profile_defaults, args, "hidden", 64))
+    effective_kernel = int(_select(profile_defaults, args, "kernel", 3))
+
+    config = TrainConfig(
+        hidden=effective_hidden,
+        kernel=effective_kernel,
+        variant=effective_variant,
+        epochs=int(_select(profile_defaults, args, "epochs", 2500)),
+        alpha=float(_select(profile_defaults, args, "alpha", 20.0)),
+        sal_lambda=float(_select(profile_defaults, args, "sal-lambda", 1.0)),
+        lr=float(_select(profile_defaults, args, "lr", 5e-4)),
+        ema_decay=float(_select(profile_defaults, args, "ema-decay", 0.997)),
+        accum_steps=int(_select(profile_defaults, args, "accum-steps", 4)),
+        eval_every=int(_select(profile_defaults, args, "eval-every", 5)),
+        hard_frame_ratio=float(_select(profile_defaults, args, "hard-frame-ratio", 0.0)),
+        error_replay_every=int(_select(profile_defaults, args, "error-replay-every", 0)),
+        loss_mode=str(_select(profile_defaults, args, "loss-mode", "standard")),
+        temperature_start=float(_select(profile_defaults, args, "temperature-start", 1.0)),
+        temperature_end=float(_select(profile_defaults, args, "temperature-end", 0.05)),
+        focal_gamma=float(_select(profile_defaults, args, "focal-gamma", 2.0)),
+        segnet_loss_weight=float(_select(profile_defaults, args, "segnet-loss-weight", 100.0)),
+        use_dual_saliency=bool(args.use_dual_saliency or profile_defaults.get("use_dual_saliency", False)),
+        alpha_seg=float(_select(profile_defaults, args, "alpha-seg", 200.0)),
+        use_ste_segnet=bool(args.use_ste or profile_defaults.get("use_ste_segnet", False)),
+        boundary_weight=float(_select(profile_defaults, args, "boundary-weight", 1.0)),
+        boundary_anneal=bool(profile_defaults.get("boundary_anneal", False)),
+        learn_loss_weights=bool(args.learn_loss_weights or profile_defaults.get("learn_loss_weights", False)),
+        adaptive_boundary=bool(args.adaptive_boundary or profile_defaults.get("adaptive_boundary", False)),
+        weight_decay=float(_select(profile_defaults, args, "weight-decay", 1e-4)),
+        eta_min=float(_select(profile_defaults, args, "eta-min", 1e-4)),
+        resume_from=args.resume_from,
+        output_dir=args.output_dir,
+        tag=args.tag,
+    )
+
+    print(
+        f"[tac] config: h={config.hidden} {config.variant} epochs={config.epochs} "
+        f"alpha={config.alpha} sal_lambda={config.sal_lambda} loss={config.loss_mode}"
+    )
+
+    comp_frames, gt_frames = load_frames(
+        archive_path=args.archive,
+        gt_video_path=args.gt_video,
+        precomputed_dir=args.precomputed,
+    )
+    print(f"[tac] {len(comp_frames)} compressed + {len(gt_frames)} GT frames")
+
+    # Saliency is optional — gracefully handle missing/empty path
+    if args.saliency and Path(args.saliency).exists():
+        raw_saliency = load_raw_saliency(args.saliency)
+        print(f"[tac] Saliency shape: {tuple(raw_saliency.shape)}")
+    else:
+        # Generate uniform saliency (equal weight everywhere)
+        import torch
+        # comp_frames is a list of tensors (B, H, W, C) — get dims from first frame
+        h, w = comp_frames[0].shape[0], comp_frames[0].shape[1]
+        raw_saliency = torch.ones(len(comp_frames), h, w)
+        if args.saliency:
+            print(f"[tac] WARNING: Saliency file not found: {args.saliency}")
+        print(f"[tac] Using uniform saliency (no weighting)")
+
+    models_dir = Path(args.models_dir)
+    posenet, segnet = load_scorers(
+        models_dir / "posenet.safetensors",
+        models_dir / "segnet.safetensors",
+        device=device,
+        upstream_dir=args.upstream_dir,
+    )
+
+    model = build_postfilter(effective_variant, hidden=effective_hidden, kernel=effective_kernel)
+    print(
+        f"[tac] Model: {effective_variant} h={effective_hidden} ({sum(p.numel() for p in model.parameters())} params)"
+    )
+
+    trainer = Trainer(model, config, device=device)
+    best = trainer.fit_lazy(comp_frames, gt_frames, posenet, segnet, raw_saliency, subsample=args.subsample)
+    print(f"[tac] Done. Best scorer: {best:.4f}")
+    return {
+        "command": "lossy",
+        "best_scorer": best,
+        "tag": args.tag,
+        "variant": effective_variant,
+        "hidden": effective_hidden,
+        "kernel": effective_kernel,
+    }
+
+
+def _run_lossless(args: argparse.Namespace) -> dict[str, Any]:
+    if args.lossless_handler == "profiles":
+        payload = {
+            "command": "lossless_profiles",
+            "profiles": sorted(LOSSLESS_PROFILES),
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "tiny_frame_predictor_summary":
+        payload = summarize_tiny_frame_predictor(args.profile)
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "tiny_frame_train_probe":
+        payload = probe_tiny_frame_training(
+            profile=args.profile,
+            output_path=Path(args.output),
+            shard_paths=[Path(path) for path in args.shard_path] if args.shard_path else None,
+            data_files=args.data_file,
+            batch_size=args.batch_size,
+            context_frames=args.context_frames,
+            max_records=args.max_records,
+            sample_offset=args.sample_offset,
+            max_batches=args.max_batches,
+            learning_rate=args.learning_rate,
+            device=args.device,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "plan":
+        plan = build_gpt_arithmetic_plan(
+            args.profile,
+            split=args.split,
+            work_dir=Path(args.work_dir) if args.work_dir else None,
+            layout=args.layout,
+        )
+        plan_payload = asdict(plan)
+        plan_payload["split"] = list(plan_payload["split"])
+        payload = {
+            "command": "lossless_plan",
+            "plan": plan_payload,
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "estimate":
+        estimate = estimate_gpt_arithmetic_workload(
+            args.profile,
+            split=args.split,
+            work_dir=Path(args.work_dir) if args.work_dir else None,
+            layout=args.layout,
+        )
+        estimate_payload = asdict(estimate)
+        estimate_payload["split"] = list(estimate_payload["split"])
+        payload = {
+            "command": "lossless_estimate",
+            "estimate": estimate_payload,
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "prepare":
+        payload = materialize_gpt_arithmetic_stream(
+            args.profile,
+            split=args.split,
+            output_path=Path(args.output),
+            layout=args.layout,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "gpt_score":
+        payload = score_commavq_gpt_sample(
+            token_path=Path(args.tokens),
+            output_path=Path(args.output),
+            profile=args.profile,
+            max_scored_tokens=args.max_scored_tokens,
+            context_tokens=args.context_tokens,
+            device=args.device,
+            dtype=args.dtype,
+            cache_dir=args.cache_dir,
+            model_url=args.model_url,
+            gpt_module_path=args.gpt_module_path,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "gpt_score_probe":
+        payload = probe_commavq_gpt_devices(
+            token_path=Path(args.tokens),
+            output_path=Path(args.output),
+            profile=args.profile,
+            max_scored_tokens=args.max_scored_tokens,
+            context_tokens=args.context_tokens,
+            devices=tuple(args.devices),
+            dtype=args.dtype,
+            cache_dir=args.cache_dir,
+            model_url=args.model_url,
+            gpt_module_path=args.gpt_module_path,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "gpt_arithmetic_sample":
+        payload = encode_commavq_gpt_sample(
+            token_path=Path(args.tokens),
+            encoded_path=Path(args.output),
+            profile=args.profile,
+            max_tokens=args.max_tokens,
+            context_tokens=args.context_tokens,
+            device=args.device,
+            dtype=args.dtype,
+            verify_decode=args.verify_decode,
+            cache_dir=args.cache_dir,
+            model_url=args.model_url,
+            gpt_module_path=args.gpt_module_path,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "gpt_arithmetic_global_sample":
+        payload = encode_commavq_gpt_global_sample(
+            token_path=Path(args.tokens),
+            encoded_path=Path(args.output),
+            profile=args.profile,
+            max_tokens=args.max_tokens,
+            context_tokens=args.context_tokens,
+            device=args.device,
+            dtype=args.dtype,
+            verify_decode=args.verify_decode,
+            cache_dir=args.cache_dir,
+            model_url=args.model_url,
+            gpt_module_path=args.gpt_module_path,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "next_frame_sample":
+        payload = encode_commavq_next_frame_sample(
+            token_path=Path(args.tokens),
+            encoded_path=Path(args.output),
+            profile=args.profile,
+            max_frames=args.max_frames,
+            context_frames=args.context_frames,
+            device=args.device,
+            dtype=args.dtype,
+            verify_decode=args.verify_decode,
+            cache_dir=args.cache_dir,
+            model_url=args.model_url,
+            gpt_module_path=args.gpt_module_path,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "token_rgb_sample":
+        payload = decode_commavq_token_file_to_rgb(
+            token_path=Path(args.tokens),
+            output_path=Path(args.output),
+            max_frames=args.max_frames,
+            batch_size=args.batch_size,
+            device=args.device,
+            dtype=args.dtype,
+            commavq_root=Path(args.commavq_root) if args.commavq_root else None,
+            decoder_url=args.decoder_url,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "pose_labels_sample":
+        payload = build_pose_label_map_sample(
+            output_path=Path(args.output),
+            split=args.split,
+            max_records=args.max_records,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "rgb_labels_sample":
+        payload = build_rgb_label_map_sample(
+            output_path=Path(args.output),
+            split=args.split,
+            max_records=args.max_records,
+            bridge_loader=load_official_commavq_bridge,
+            batch_size=args.batch_size,
+            max_keyframes=args.max_keyframes,
+            device=args.device,
+            dtype=args.dtype,
+            commavq_root=Path(args.commavq_root) if args.commavq_root else None,
+            decoder_url=args.decoder_url,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "global_prev_symbol_order_sample":
+        payload = benchmark_global_prev_symbol_record_order_sample(
+            output_path=Path(args.output),
+            split=args.split,
+            max_records=args.max_records,
+            strategy=args.strategy,
+            frame_order=args.frame_order,
+            labels_path=Path(args.labels) if args.labels else None,
+            order_path=Path(args.order_file) if args.order_file else None,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "hybrid_select":
+        input_paths = tuple(Path(item) for item in args.input)
+        metrics = _parse_selection_metrics(args.metric)
+        candidates: list[dict[str, Any]] = []
+        candidates_by_path: dict[Path, dict[str, Any]] = {}
+        path_by_summary_id: dict[int, str] = {}
+        for input_path in input_paths:
+            summary = json.loads(input_path.read_text(encoding="utf-8"))
+            if not isinstance(summary, dict):
+                raise SystemExit(f"ERROR: {input_path} must contain a top-level JSON object")
+            candidates.append(summary)
+            candidates_by_path[input_path] = summary
+            path_by_summary_id[id(summary)] = str(input_path)
+
+        ranked = rank_exact_candidates(candidates, metrics=metrics, exact_key=args.exact_key)
+        ranked_inputs = [path_by_summary_id[id(summary)] for summary in ranked]
+        selected_summary = ranked[0]
+        payload = {
+            "command": "lossless_hybrid_select",
+            "inputs": [str(path) for path in input_paths],
+            "metrics": [{"key": metric.key, "direction": metric.direction} for metric in metrics],
+            "exact_key": args.exact_key,
+            "selected_input": ranked_inputs[0],
+            "ranked_inputs": ranked_inputs,
+            "selected_summary": selected_summary,
+        }
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "frequency_report":
+        payload = write_symbol_frequency_report(
+            token_path=Path(args.tokens),
+            output_path=Path(args.output),
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "frequency_encode":
+        payload = encode_uint16_frequency_file(
+            Path(args.tokens),
+            Path(args.output),
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "prev_symbol_encode":
+        payload = encode_uint16_prev_symbol_file(
+            Path(args.tokens),
+            Path(args.output),
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "prev_symbol_decode":
+        restored_path = decode_uint16_prev_symbol_file(
+            Path(args.encoded),
+            Path(args.output),
+        )
+        payload = {
+            "command": "lossless_prev_symbol_decode",
+            "encoded_path": str(Path(args.encoded)),
+            "restored_path": restored_path,
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "prev_symbol_benchmark":
+        payload = benchmark_prev_symbol_frequency_file(
+            Path(args.tokens),
+            max_tokens=args.max_tokens,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "prev_pair_benchmark":
+        payload = benchmark_prev_pair_frequency_file(
+            Path(args.tokens),
+            max_tokens=args.max_tokens,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "zstd_dict_benchmark":
+        payload = benchmark_zstd_dict_file(
+            source_path=Path(args.source),
+            compressed_path=Path(args.compressed),
+            restored_path=Path(args.restored),
+            sample_paths=[Path(path) for path in args.sample],
+            dict_size=args.dict_size,
+            sample_block_bytes=args.sample_block_bytes,
+            max_training_samples=args.max_training_samples,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "zstd_dict_dir_benchmark":
+        payload = benchmark_zstd_dict_directory(
+            source_root=Path(args.source_root),
+            compressed_root=Path(args.compressed_root),
+            restored_root=Path(args.restored_root),
+            sample_paths=[Path(path) for path in args.sample],
+            dict_size=args.dict_size,
+            sample_block_bytes=args.sample_block_bytes,
+            max_training_samples=args.max_training_samples,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "zstd_dict_chunk_benchmark":
+        payload = benchmark_zstd_dict_chunked_file(
+            source_path=Path(args.source),
+            compressed_root=Path(args.compressed_root),
+            restored_root=Path(args.restored_root),
+            block_bytes=args.block_bytes,
+            sample_paths=[Path(path) for path in args.sample],
+            dict_size=args.dict_size,
+            sample_block_bytes=args.sample_block_bytes,
+            max_training_samples=args.max_training_samples,
+        )
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "package":
+        output = build_submission_zip(
+            payload_dir=Path(args.payload_dir),
+            decompress_path=Path(args.decompress),
+            output_path=Path(args.output),
+        )
+        payload = {
+            "command": "lossless_package",
+            "output": str(output),
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "baseline":
+        baseline = evaluate_lossless_baseline_submission(
+            profile=args.profile,
+            split=args.split,
+            work_dir=Path(args.work_dir),
+        )
+        payload = {
+            "command": "lossless_baseline",
+            **baseline,
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "compress":
+        archive_path = Path(args.output)
+        decompressed_path = Path(args.decompressed_output)
+        compression = compress_lossless_file(
+            profile=args.profile,
+            input_path=Path(args.input),
+            output_path=archive_path,
+        )
+        decompressed = decompress_lossless_file(
+            profile=args.profile,
+            archive_path=archive_path,
+            output_path=decompressed_path,
+        )
+        verification_compression, verification = evaluate_lossless_archive(
+            profile=args.profile,
+            original_tokens=Path(args.input).read_bytes(),
+            decompressed_tokens=decompressed.read_bytes(),
+            archive_path=archive_path,
+            archive_bytes=archive_path.stat().st_size,
+            method=compression.method,
+        )
+        payload = {
+            "command": "lossless_compress",
+            "compression": asdict(verification_compression),
+            "verification": asdict(verification),
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "evaluate":
+        original = Path(args.original).read_bytes()
+        decompressed = Path(args.decompressed).read_bytes()
+        archive = Path(args.archive)
+        compression, verification = evaluate_lossless_archive(
+            profile=args.profile,
+            original_tokens=original,
+            decompressed_tokens=decompressed,
+            archive_path=archive,
+            archive_bytes=archive.stat().st_size,
+            method=args.method,
+        )
+        payload = {
+            "command": "lossless_evaluate",
+            "compression": asdict(compression),
+            "verification": asdict(verification),
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    if args.lossless_handler == "promote":
+        payload = promote_lossless_result(repo_root=args.repo_root, result_path=args.result_json)
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    raise SystemExit(f"Unknown lossless subcommand: {args.lossless_handler}")
+
+
+def _run_crf_search(args: argparse.Namespace) -> Any:
+    from .experiments.crf_search import sweep
+
+    return sweep(
+        crf_min=args.crf_min,
+        crf_max=args.crf_max,
+        crf_step=args.crf_step,
+        full_eval_top=args.full_eval_top,
+        device=args.device,
+    )
+
+
+def _run_ensemble(args: argparse.Namespace) -> Any:
+    from .experiments.ensemble import discover_checkpoints, ensemble_and_save
+
+    if args.checkpoints:
+        paths = args.checkpoints
+    elif args.checkpoint_dir:
+        paths = discover_checkpoints(args.checkpoint_dir, top_k=args.top_k)
+    else:
+        raise SystemExit("Must specify --checkpoints or --checkpoint-dir")
+
+    if not paths:
+        raise SystemExit("No checkpoints found!")
+
+    result = ensemble_and_save(
+        checkpoint_paths=paths,
+        output_path=args.output,
+        variant=args.variant,
+        hidden=args.hidden,
+        kernel=args.kernel,
+        per_channel=args.per_channel,
+    )
+    print(f"\nEnsemble complete: {result['num_checkpoints']} checkpoints -> {result['output_path']}")
+    return result
+
+
+def _run_rd_floor(args: argparse.Namespace) -> Any:
+    from .experiments.rd_floor import build_report, load_summary_points, print_human_report, RAW_ROOT
+
+    root = args.root if args.root else RAW_ROOT
+    targets = sorted(set(args.target or [1.80, 1.75]), reverse=True)
+    report = build_report(load_summary_points(root), targets)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_human_report(report)
+        print("\nJSON:")
+        print(json.dumps(report, indent=2))
+    return report
+
+
+def _run_benchmark_codecs(args: argparse.Namespace) -> Any:
+    from .experiments.benchmark_codecs import main as _codecs_main
+
+    return _codecs_main()
+
+
+def main(argv: list[str] | None = None) -> Any:
+    args = build_parser().parse_args(argv)
+    if args.command == "lossy":
+        return _run_lossy(args)
+    if args.command == "lossless":
+        return _run_lossless(args)
+    if args.command == "crf-search":
+        return _run_crf_search(args)
+    if args.command == "ensemble":
+        return _run_ensemble(args)
+    if args.command == "rd-floor":
+        return _run_rd_floor(args)
+    if args.command == "benchmark-codecs":
+        return _run_benchmark_codecs(args)
+    if args.command == "viz-comma-video":
+        from tac.visualization.comma_format_video import main as _viz_main
+        return _viz_main()
+    if args.command == "viz-comma-gif":
+        from tac.visualization.comma_gif import main as _viz_main
+        return _viz_main()
+    if args.command == "viz-comparison":
+        from tac.visualization.comparison_video import main as _viz_main
+        return _viz_main()
+    if args.command == "viz-segnet":
+        from tac.visualization.segnet_viz import main as _viz_main
+        return _viz_main()
+    if args.command == "viz-yuv-gif":
+        from tac.visualization.yuv_gif import main as _viz_main
+        return _viz_main()
+    if args.command == "viz-analysis-panels":
+        from pathlib import Path
+
+        import torch
+
+        from tac.scorer import load_differentiable_scorers
+        from tac.viz.analysis_panels import generate_analysis_panels
+
+        device = torch.device(args.device)
+        tto_frames = torch.load(args.frames, map_location="cpu", weights_only=True)
+        _, segnet = load_differentiable_scorers(args.upstream, device=str(device))
+        gt_video_path = Path(args.upstream) / "videos" / "0.mkv"
+        result = generate_analysis_panels(
+            tto_frames=tto_frames,
+            gt_video_path=gt_video_path,
+            segnet=segnet,
+            output_dir=Path(args.output),
+            auth_matched=args.auth_matched,
+        )
+        print(f"Visualization complete: {result['n_frames_rendered']} frames")
+        print(f"  GIF: {result['gif_path']}")
+        if result.get("mp4_path"):
+            print(f"  MP4: {result['mp4_path']}")
+        print(f"  SegNet disagreement: {result['seg_disagree_mean']:.4f}")
+        print(f"  Pixel error: {result['pixel_error_mean']:.2f}")
+        return 0
+    raise SystemExit(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    result = main()
+    raise SystemExit(result if isinstance(result, int) else 0)

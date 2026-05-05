@@ -1,0 +1,208 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tac"
+version = "1.0.5"
+description = "Task-Aware Codec: Neural video compression optimized for downstream perception models"
+readme = "src/tac/README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Alejandro Pena", email = "adpena@users.noreply.github.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# R38 fix: pin major versions to prevent silent runtime divergence across
+# fresh checkouts and remote deploys. Was unbounded `>=` ranges, which
+# meant `uv pip install --upgrade` could change behavior. Major-version
+# upper bounds preserve compatibility within a major (semver) while
+# preventing torch 2 → 3 jumps that could break CUDA kernels.
+dependencies = [
+    "torch>=2.0,<3.0",
+    "pydantic>=2.0,<3.0",
+    "numpy>=1.24,<3.0",
+    "click>=8.0,<9.0",
+    # Codex R5-2 #3 fix (2026-04-27, Lane B-alt deployment blocker):
+    # `brotli` MUST be a guaranteed dependency, not an optional extra.
+    # `submissions/robust_current/inflate.sh` invokes `uv run python
+    # inflate_renderer.py` without a `--with brotli` or runtime extra; in a
+    # clean contest-style env (T4 instance, no `tac[runtime]` pre-install),
+    # `_decompress_brotli_in_archive` would fatal-exit on `import brotli`
+    # the moment a `renderer.bin.br` is present in the archive (which is
+    # the entire point of the Lane B-alt brotli stack). Moving it here
+    # means every install of the `tac` package — including the implicit
+    # one `uv run python <script.py>` does via the project pyproject —
+    # gets brotli automatically. The library is small (~300KB wheel) and
+    # has no native build dependencies on T4 / 4090 wheels.
+    "brotli>=1.0",
+    # Public PR86 / HPAC-family archives use constriction queue arithmetic
+    # coding plus PPMd-compressed entropy-model weights in their inflate path.
+    # Keep these as hard runtime dependencies so exact-eval and replay
+    # environments fail at lock/install time instead of inside a paid CUDA job.
+    "constriction>=0.4,<0.5",
+    "pyppmd>=1.3,<2.0",
+    # Codex R5-3 #1 fix (2026-04-27): the Lane C compliance gate uses
+    # Ed25519 detached signatures over a canonical-JSON serialization of
+    # the attestation's trust-bearing fields. `cryptography` ships
+    # Ed25519PrivateKey / Ed25519PublicKey via the stdlib-style
+    # `cryptography.hazmat.primitives.asymmetric.ed25519` module; we
+    # depend on it both for signing (tools/sign_lane_c_compliance.py,
+    # tools/lane_c_keygen.py) and verifying
+    # (experiments/build_baseline_archive.py, src/tac/lane_c_compliance.py).
+    # Including here as a hard dep means EVERY install of `tac` can run
+    # the compliance gate. The wheel is ~3MB on standard wheels and has
+    # binary builds for T4 / 4090 / macOS — no native compile required.
+    "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.5"]
+viz = [
+    "plotly>=5.0",
+    "matplotlib>=3.8",
+    "pillow>=10.0",
+    "imageio>=2.34",
+]
+analysis = [
+    # Optional acceleration and table tooling for planning-only profilers,
+    # not contest runtime dependencies.
+    "dask[array]>=2024.1",
+    "polars>=0.20",
+]
+notebooks = ["marimo>=0.3"]
+# 2026-04-26 — canonical runtime extras for GPU training/eval deploys.
+# scripts/remote_*_bootstrap.sh installs `tac[runtime]` so adding a new
+# runtime dep means editing ONE file (this one), not every bootstrap.
+# `brotli` was missed when --brotli was added to pipeline.py compress;
+# `av` is required for video decode in optimize_poses + auth_eval;
+# `timm`/`einops`/`segmentation_models_pytorch` are upstream scorer
+# direct deps via tac.scorers; `opencv-python` for frame-level utils.
+runtime = [
+    "av>=10.0",
+    "opencv-python>=4.5",
+    "timm>=0.9",
+    "einops>=0.7",
+    "segmentation-models-pytorch>=0.3",
+    # Codex R5-2 #3: `brotli` was promoted to the always-installed
+    # `[project].dependencies` list (above). It is intentionally still
+    # NOT listed here so the runtime extra stays a pure GPU/training
+    # superset; pulling `tac` alone gives you brotli for inflate.
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.0",
+    "hypothesis>=6.0",
+    "ruff>=0.4",
+    # Round 14 finding 1 (R15): src/tac/tests/test_se3.py uses
+    # scipy.spatial.transform.Rotation as the golden Rodrigues reference.
+    # Without it test collection hard-crashes on every remote (Vast.ai,
+    # Kaggle, Modal, CI). Pinning scipy>=1.10 because earlier versions
+    # have a Rotation API that differs subtly from what the test asserts.
+    "scipy>=1.10",
+]
+cloud = [
+    # Lightning AI Batch Jobs/Studio automation. Do not install the PyPI
+    # package named `lightning` for cloud orchestration; keep using the
+    # separate SDK package guarded by scripts/scan_lightning_supply_chain.py.
+    "lightning-sdk>=2026.4.10,<2026.5",
+    # Active contest compute backends. These must not be ambient developer
+    # packages; a locked cloud sync must preserve Modal dispatch/harvest and
+    # Vast reconciliation/cleanup tooling.
+    "modal>=1.4,<2",
+    "vastai>=1.0,<2",
+]
+
+[project.scripts]
+tac = "tac.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/adpena/pact"
+Documentation = "https://github.com/adpena/pact#readme"
+Repository = "https://github.com/adpena/pact"
+Issues = "https://github.com/adpena/pact/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tac = ["py.typed"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["experiments/archive"]  # archived experiments — dead code
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "TCH",  # type-checking imports
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line length handled by formatter
+    "RUF002",  # unicode in docstrings is intentional (×, →)
+    "RUF059",  # unused unpacking is fine for shape destructuring
+    "SIM105",  # try/except/pass is clearer than contextlib.suppress for signals
+    "TC003",   # type-checking import optimization not worth the complexity
+]
+
+[tool.ruff.lint.per-file-ignores]
+"experiments/*.py" = ["E402"]  # sys.path manipulation before imports is necessary
+
+[tool.ruff.lint.isort]
+known-first-party = ["tac", "comma_lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src/tac/tests"]
+timeout = 60
+markers = [
+    "slow: marks tests that load scorer models (deselect with '-m \"not slow\"')",
+    "compliance: marks tests that verify upstream scorer compliance",
+    "cuda: marks tests that require a CUDA device (skipped on CPU/MPS hosts)",
+]
+
+[tool.ty]
+# Astral ty — Rust-native type checker (sibling to ruff, ~50x faster than mypy).
+# Pragmatic gradual config: scan src/tac, allow unresolved 3rd-party imports
+# (upstream/torch/numpy stubs are inconsistent), surface real bugs without
+# chasing a perfectly-clean baseline.
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+# Project sources to type-check. experiments/ + contrib/ are intentionally
+# excluded — high churn, low long-term value to gate on.
+include = ["src/tac"]
+exclude = [
+  "src/tac/tests/**",        # tests — many use ad-hoc fixtures with dynamic types
+  "src/tac/contrib/**",      # contrib — research code, often duck-typed
+  "src/tac/deploy/**",       # deploy code — string-heavy CLI assembly
+]
+
+[tool.ty.rules]
+# Promote NameError / undefined symbols to errors (the auth_eval bug class).
+# Other rules can be tightened once the baseline is clean.
+unresolved-reference = "error"
+unresolved-import = "ignore"           # 3rd-party stubs flaky
+possibly-unbound = "warn"
+invalid-argument-type = "warn"
+invalid-return-type = "warn"
