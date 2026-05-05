@@ -1,0 +1,47 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: pip install uv
+      - name: Install package + test deps
+        run: |
+          uv venv
+          uv pip install -e . pytest pytest-timeout hypothesis
+      - name: Run meta-Lagrangian + predictor + distortion-proxy tests (deterministic, CPU-only)
+        run: |
+          .venv/bin/python -m pytest tac/tests/test_meta_lagrangian.py tac/tests/test_predictor_score_band.py tac/tests/test_distortion_proxy_local.py -v --timeout=60
+      - name: Verify contest_score formula matches upstream constants
+        run: |
+          .venv/bin/python -c "
+          from tac.optimizer import contest_score
+          from tac.predictor.score_band import (
+              SEG_COEFFICIENT, RATE_COEFFICIENT, POSE_COEFFICIENT_SQRT_INNER, PR106_TOTAL_RATE_DENOM
+          )
+          assert SEG_COEFFICIENT == 100.0, f'SEG={SEG_COEFFICIENT}'
+          assert RATE_COEFFICIENT == 25.0, f'RATE={RATE_COEFFICIENT}'
+          assert POSE_COEFFICIENT_SQRT_INNER == 10.0, f'POSE_SQRT_INNER={POSE_COEFFICIENT_SQRT_INNER}'
+          assert PR106_TOTAL_RATE_DENOM == 37545489, f'RATE_DENOM={PR106_TOTAL_RATE_DENOM}'
+          # PR106 baseline reproduction
+          score = contest_score(3.4e-5, 0.00067819, 186239)
+          assert abs(score - 0.20945673) < 5e-3, f'PR106 score={score}'
+          # apogee_int4 falsification reproduction
+          score = contest_score(0.02370903, 0.00868503, 109996)
+          assert abs(score - 1.42866394) < 1e-3, f'int4 score={score}'
+          print('All formula constants + reproductions verified.')
+          "
