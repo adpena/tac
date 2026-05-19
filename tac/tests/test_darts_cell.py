@@ -21,17 +21,16 @@ import torch
 import torch.nn as nn
 
 from tac.darts import (
-    DARTSAnnealSchedule,
     DARTSAlphaTrajectory,
+    DARTSAnnealSchedule,
     DARTSCell,
     DARTSOptimizer,
     alpha_kl_to_uniform,
     alpha_softmax,
+    darts_search_step,
     discrete_arch_index,
     split_arch_weight_params,
-    darts_search_step,
 )
-
 
 # ── Tiny ops for the tests ──────────────────────────────────────────────
 

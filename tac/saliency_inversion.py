@@ -40,7 +40,7 @@ from __future__ import annotations
 import io
 import struct
 import zlib
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -384,7 +384,8 @@ def apply_saliency_weighted_compression(
             return len(payload)
 
         from tac.learnable_saliency_threshold import (
-            fit_linear_rate_model, optimise_threshold_for_target_bytes,
+            fit_linear_rate_model,
+            optimise_threshold_for_target_bytes,
         )
         slope, intercept = fit_linear_rate_model(
             _bytes_at_threshold, sample_thresholds=(0.3, 0.7),

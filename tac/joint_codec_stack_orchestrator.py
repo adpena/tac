@@ -91,7 +91,6 @@ from __future__ import annotations
 import io
 import struct
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -103,17 +102,13 @@ from tac.balle_hyperprior_codec import (
     BalleHyperpriorCodec,
     decode_qints_balle,
     encode_qints_balle_auto,
-    encode_qints_full_balle,
-    encode_qints_hotz_lite,
 )
 from tac.joint_admm_coordinator import (
     AdmmResult,
     JointADMMConfig,
     ProximalStepResult,
-    StreamProximalCodec,
     run_admm,
 )
-
 
 _JCSP_MAGIC: bytes = b"JCSP"
 _JCSP_VERSION: int = 1

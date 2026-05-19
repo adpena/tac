@@ -20,7 +20,6 @@ import torch
 
 from tac.losses_logit_margin import fragility_weights, logit_margin_loss
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 1: fragility_weights — high margin → 0; zero margin → 1
 # ─────────────────────────────────────────────────────────────────────────────

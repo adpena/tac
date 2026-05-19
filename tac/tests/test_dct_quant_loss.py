@@ -14,18 +14,14 @@ These tests verify:
 """
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
-import torch.nn.functional as F
 
 from tac.fridrich_losses import (
     JPEG_LUMA_Q_TABLE,
     _build_dct8_matrix,
     dct_quant_loss,
 )
-
 
 # ---- Helpers ---- #
 

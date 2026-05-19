@@ -74,7 +74,9 @@ def _worker_fn(
     """
     try:
         import io
+
         import torch
+
         from tac.architectures import build_postfilter
 
         # Reconstruct model

@@ -95,7 +95,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import pytest
 
 from tac.joint_admm_coordinator import (
     AdmmResult,
@@ -104,7 +103,6 @@ from tac.joint_admm_coordinator import (
     StreamProximalCodec,
     run_admm,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Synthetic 4-stream INTERIOR-OPTIMUM problem (math derivation in module

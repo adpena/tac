@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 DEFAULT_HIDDEN_DIMS = (16, 16, 32, 32, 96, 96, 256)
 
 

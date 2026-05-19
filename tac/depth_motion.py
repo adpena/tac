@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tac.camera import COMMA_INTRINSICS, COMMA_EXTRINSICS, DEPTH_PRIORS_METERS
+from tac.camera import COMMA_EXTRINSICS, COMMA_INTRINSICS, DEPTH_PRIORS_METERS
 
 
 class DepthAwareMotionPredictor(nn.Module):

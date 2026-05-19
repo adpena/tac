@@ -35,10 +35,7 @@ These tests pin every claim:
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
-
-import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 PROFILE_KEY = "dilated_h64_half_frame_v3_annealed_kldistill"
@@ -50,8 +47,8 @@ PROFILE_KEY = "dilated_h64_half_frame_v3_annealed_kldistill"
 def test_v3_profile_registered() -> None:
     """The V3 profile MUST be in PROFILES under its canonical key."""
     from tac.profiles import (
-        PROFILES,
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL,
+        PROFILES,
     )
 
     assert PROFILE_KEY in PROFILES, (
@@ -147,6 +144,8 @@ def test_v3_kl_distill_weight_matches_lane_v() -> None:
     convention. If they ever drift, an explicit acknowledgement is required."""
     from tac.profiles import (
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL as v3,
+    )
+    from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME as lane_v,
     )
 
@@ -175,6 +174,8 @@ def test_v3_lrs_strictly_above_v1() -> None:
     """V3 LRs must be >= V1 LRs (the V2 fix raises the floor; V3 inherits)."""
     from tac.profiles import (
         DILATED_H64_HALF_FRAME as v1,
+    )
+    from tac.profiles import (
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL as v3,
     )
     for i in range(1, 6):
@@ -193,6 +194,8 @@ def test_v3_inherits_v1_arch_knobs() -> None:
     schedule + KL weight + LR floor only, not the architecture."""
     from tac.profiles import (
         DILATED_H64_HALF_FRAME as v1,
+    )
+    from tac.profiles import (
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL as v3,
     )
     arch_keys = (
@@ -210,6 +213,8 @@ def test_v3_inherits_v1_fridrich_aux_loss_knobs() -> None:
     """Fridrich aux losses unchanged from V1 — direct A/B with V1/V2."""
     from tac.profiles import (
         DILATED_H64_HALF_FRAME as v1,
+    )
+    from tac.profiles import (
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL as v3,
     )
     fridrich_keys = (
@@ -233,6 +238,8 @@ def test_v3_inherits_v1_phase_epochs() -> None:
     shape is unchanged for direct A/B)."""
     from tac.profiles import (
         DILATED_H64_HALF_FRAME as v1,
+    )
+    from tac.profiles import (
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL as v3,
     )
     for i in range(1, 6):
@@ -248,6 +255,8 @@ def test_v3_seed_differs_from_v1() -> None:
     RNG basins (matches Lane V-V1 vs Lane V-V2 convention)."""
     from tac.profiles import (
         DILATED_H64_HALF_FRAME as v1,
+    )
+    from tac.profiles import (
         DILATED_H64_HALF_FRAME_V3_ANNEALED_KLDISTILL as v3,
     )
     assert v3["seed"] != v1["seed"], (

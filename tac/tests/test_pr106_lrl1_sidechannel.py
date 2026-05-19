@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import struct
 import sys
-import zipfile
 from pathlib import Path
 
 import numpy as np

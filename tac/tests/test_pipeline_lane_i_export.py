@@ -20,10 +20,9 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict, fields
+from dataclasses import fields
 from pathlib import Path
 
-import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -214,6 +213,7 @@ class TestStepExportLegacyPathStillWorks:
 
     def test_empty_variant_routes_to_FP4A_legacy(self, tmp_path: Path):
         from experiments.pipeline import step_export
+
         from tac.renderer import build_renderer
 
         torch.manual_seed(31)

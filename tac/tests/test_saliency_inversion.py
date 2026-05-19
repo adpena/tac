@@ -8,18 +8,15 @@ remote bootstrap on CUDA.
 """
 from __future__ import annotations
 
-import io
-import struct
-
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from tac.saliency_inversion import (
+    _MAGIC,
     CAMERA_H,
     CAMERA_W,
-    _MAGIC,
     _rle_decode_bool,
     _rle_encode_bool,
     apply_saliency_weighted_compression,
@@ -27,7 +24,6 @@ from tac.saliency_inversion import (
     compute_pixel_saliency,
     unpack_saliency_payload,
 )
-
 
 # ─── Mock scorers (PoseNet-shaped + SegNet-shaped) ──────────────────────
 

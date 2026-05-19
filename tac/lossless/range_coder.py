@@ -4,7 +4,6 @@ from bisect import bisect_right
 
 import numpy as np
 
-
 STATE_BITS = 32
 FULL_RANGE = 1 << STATE_BITS
 HALF = FULL_RANGE >> 1

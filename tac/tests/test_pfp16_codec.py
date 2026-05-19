@@ -27,7 +27,6 @@ from tac.pfp16_codec import (
     encode_pose_file_pfp16,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LANE_G_V3_POSES = (
     REPO_ROOT / "experiments" / "results" / "lane_g_v3_landed"

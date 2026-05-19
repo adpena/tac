@@ -17,14 +17,10 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
-from pathlib import Path
-from unittest import mock
 
 import pytest
 
 from tac.deploy.azure import azure_dispatch as azd
-
 
 # ── 1. Pricing table sanity ──────────────────────────────────────────────────
 

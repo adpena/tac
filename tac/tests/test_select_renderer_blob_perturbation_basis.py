@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "experiments" / "select_renderer_blob_perturbation_basis.py"
 

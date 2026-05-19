@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "remote_lane_k_darts_channels.sh"
 

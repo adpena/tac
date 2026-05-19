@@ -12,7 +12,6 @@ import torch
 
 from tac.sensitivity_map import save_sensitivity_map
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "experiments" / "build_component_response_perturbation_plan.py"
 

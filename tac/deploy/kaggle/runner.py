@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -25,7 +24,8 @@ from pathlib import Path
 # Import at module level so the bound references survive test mocks on __import__.
 from tac.deploy.cloud_bootstrap import (  # noqa: E402,F401
     WHEEL_GLOBS as WHEEL_GLOBS,
-    find_wheel as find_tac_wheel,
+)
+from tac.deploy.cloud_bootstrap import (
     bootstrap as _cb_bootstrap,
 )
 
@@ -118,7 +118,7 @@ def ensure_upstream(working_dir: Path | None = None) -> Path:
 
 def ensure_deps() -> None:
     """Install missing Python dependencies — uv preferred, pip fallback."""
-    from tac.deploy.cloud_paths import try_ensure_uv, ensure_packages
+    from tac.deploy.cloud_paths import ensure_packages, try_ensure_uv
     ensure_packages(try_ensure_uv(), *PIP_DEPS)
 
 

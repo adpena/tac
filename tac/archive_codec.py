@@ -170,7 +170,7 @@ class TextureAtomCodebook(nn.Module):
         return header + packed
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "TextureAtomCodebook":
+    def deserialize(cls, data: bytes) -> TextureAtomCodebook:
         """Deserialize a codebook from packed bytes.
 
         Args:

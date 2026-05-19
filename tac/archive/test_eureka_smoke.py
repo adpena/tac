@@ -23,7 +23,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ---- Mock scorer models ----
 
 class MockPoseNet(nn.Module):
@@ -175,7 +174,7 @@ def test_newton_step():
 
 def test_batchnorm_statistics():
     """GPU Eureka #6: BatchNorm statistics extraction and style loss."""
-    from tac.scorer_exploits import extract_batchnorm_statistics, batchnorm_style_loss
+    from tac.scorer_exploits import batchnorm_style_loss, extract_batchnorm_statistics
 
     posenet = MockPoseNet().eval()
 
@@ -216,8 +215,8 @@ def test_batchnorm_statistics():
 def test_quantization_directions():
     """CPU Eureka #9: Jacobian-directed quantization."""
     from tac.precompute_corrections import (
-        compute_quantization_directions,
         apply_quantization_directions,
+        compute_quantization_directions,
     )
 
     posenet = MockPoseNet().eval()

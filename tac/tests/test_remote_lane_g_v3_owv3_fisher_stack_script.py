@@ -6,7 +6,6 @@ import os
 import re
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "remote_lane_g_v3_owv3_fisher_stack.sh"
 PROFILER = REPO / "experiments" / "profile_hessian_per_weight.py"

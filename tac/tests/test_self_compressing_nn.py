@@ -10,8 +10,6 @@ References
 """
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -25,7 +23,6 @@ from tac.self_compressing_nn import (
     hard_threshold_gates,
     joint_compress_loss,
 )
-
 
 # ── LearnableChannelGate ───────────────────────────────────────────────
 

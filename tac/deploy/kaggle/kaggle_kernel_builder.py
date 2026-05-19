@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-import ast
 
 
 @dataclass(frozen=True)

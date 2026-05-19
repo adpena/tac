@@ -73,8 +73,9 @@ def train():
         os.makedirs(precomputed_dir, exist_ok=True)
         sys.path.insert(0, "/app/src")
         sys.path.insert(0, "/upstream")
-        from tac.data import decode_archive, decode_video
         import torch
+
+        from tac.data import decode_archive, decode_video
         print("Precomputing frames...")
         comp = decode_archive(archive_path)
         gt = decode_video("/upstream/videos/0.mkv")

@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
@@ -299,8 +298,8 @@ def falcon_segment_frame(  # noqa: PLR0913 -- mirrors Falcon Perception's infere
     pil_image = Image.fromarray(frame_rgb)
 
     # Lazy import of the MLX batch inference engine
-    from falcon_perception.mlx.batch_inference import process_batch_and_generate
     from falcon_perception import build_prompt_for_task
+    from falcon_perception.mlx.batch_inference import process_batch_and_generate
 
     combined_mask = np.zeros((h, w), dtype=np.float32)
 
@@ -355,8 +354,8 @@ def run_falcon_on_frames(
         raise RuntimeError("Falcon Perception not available")
 
     from falcon_perception import (
-        load_and_prepare_model,
         PERCEPTION_MODEL_ID,
+        load_and_prepare_model,
     )
     from falcon_perception.mlx.batch_inference import BatchInferenceEngine
 
@@ -660,7 +659,7 @@ def generate_masks(
 
     Returns the path to the saved .npy file.
     """
-    print(f"=== ML Mask Generator ===", file=sys.stderr)
+    print("=== ML Mask Generator ===", file=sys.stderr)
     print(f"  Input:    {video_path}", file=sys.stderr)
     print(f"  Output:   {output_path}", file=sys.stderr)
     print(f"  Strategy: {strategy}", file=sys.stderr)

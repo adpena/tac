@@ -37,9 +37,8 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Platform constants
@@ -74,7 +73,7 @@ class CloudPaths:
     working_dir: Path
 
     @classmethod
-    def detect(cls) -> "CloudPaths":
+    def detect(cls) -> CloudPaths:
         """Auto-detect platform and return appropriate path defaults.
 
         Respects CLOUD_PLATFORM, CLOUD_INPUT_ROOT, CLOUD_WORKING_DIR overrides.

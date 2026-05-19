@@ -17,6 +17,8 @@ SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+# find_tac_wheel and WHEEL_GLOBS are re-exported from tac.deploy.cloud_bootstrap
+import tac.deploy.cloud_bootstrap as _cloud_bootstrap_mod
 from tac.deploy.kaggle.runner import (  # noqa: E402
     WHEEL_GLOBS,
     _strip_flags,
@@ -26,9 +28,6 @@ from tac.deploy.kaggle.runner import (  # noqa: E402
     resolve_training_script,
     save_manifest,
 )
-# find_tac_wheel and WHEEL_GLOBS are re-exported from tac.deploy.cloud_bootstrap
-import tac.deploy.cloud_bootstrap as _cloud_bootstrap_mod
-
 
 # ---------------------------------------------------------------------------
 # find_tac_wheel

@@ -12,8 +12,8 @@ guarantee:
 """
 from __future__ import annotations
 
-import struct
 import json
+import struct
 import tarfile
 
 import pytest
@@ -27,7 +27,6 @@ from tac.block_fp_codec import (
     pack_block_fp,
     unpack_block_fp,
 )
-
 
 # ── Header ─────────────────────────────────────────────────────────────────
 
@@ -174,7 +173,6 @@ from tac.block_fp_codec import (  # noqa: E402
     encode_tensor_linear_q_per_tensor_v1,
     pack_payload_tar_xz,
     segmap_lossy_contract_metadata,
-    unpack_payload_tar_xz,
     verify_roundtrip,
 )
 

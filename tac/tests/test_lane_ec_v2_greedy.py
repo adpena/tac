@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-
 from experiments.precompute_gradient_corrections import (
     enforce_packed_byte_cap,
     estimated_sparse_bytes,

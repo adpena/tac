@@ -40,9 +40,10 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -244,11 +245,11 @@ class BayesianSweep:
     n_trials: int = 30
     objective: str = "auth_score"
     direction: str = "minimize"
-    output_dir: Optional[Path] = None
-    result_parser: Optional[Callable[[Path], float]] = None
+    output_dir: Path | None = None
+    result_parser: Callable[[Path], float] | None = None
     # Predicted auth-score band — operator-supplied range from prior runs;
     # used only for provenance + sanity-band warnings, never for control flow.
-    predicted_band: Optional[tuple[float, float]] = None
+    predicted_band: tuple[float, float] | None = None
     trials: list[TrialResult] = field(default_factory=list)
 
     def __post_init__(self) -> None:

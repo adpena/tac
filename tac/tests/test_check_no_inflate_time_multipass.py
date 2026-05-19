@@ -17,7 +17,6 @@ from tac.preflight import (
     check_no_inflate_time_multipass,
 )
 
-
 # ── current-codebase invariant: 0 violations ─────────────────────────────────
 
 

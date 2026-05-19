@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -374,6 +373,7 @@ class TacLosslessStateTests(unittest.TestCase):
 
     def test_promote_lossless_result_matches_comma_lab_lossless_doctor_expectations(self) -> None:
         from src.comma_lab import lossless_state_sync
+
         from tac.lossless.state import promote_lossless_result
 
         with tempfile.TemporaryDirectory() as tmpdir:

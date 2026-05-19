@@ -6,11 +6,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-
 from experiments.build_mask_class_prior import (
     build_mask_class_prior,
     write_prior_npz,
 )
+
 from tac.mask_prior import (
     apply_prior_weighting,
     load_prior,

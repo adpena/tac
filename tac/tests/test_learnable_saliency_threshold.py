@@ -27,7 +27,6 @@ from tac.learnable_saliency_threshold import (
     optimise_threshold_for_target_bytes,
 )
 
-
 # ── Module basics ────────────────────────────────────────────────────────
 
 

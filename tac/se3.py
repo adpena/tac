@@ -40,7 +40,6 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 
@@ -68,8 +67,8 @@ _LIE_ALGEBRA_SENTINEL: str = "_se3_tangent_is_lie_algebra"
 
 
 def mark_tangent_as_lie_algebra(
-    tangent: "Tuple[torch.Tensor, torch.Tensor] | torch.Tensor",
-) -> "Tuple[torch.Tensor, torch.Tensor] | torch.Tensor":
+    tangent: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     """Stamp the Lie-algebra sentinel on a tangent tensor / tuple.
 
     Round 13 (I-2): callers that construct an se(3) tangent directly
@@ -457,7 +456,7 @@ def inverse_left_jacobian_so3(omega: torch.Tensor) -> torch.Tensor:
     return eye - 0.5 * omega_hat + a * omega_hat_sq
 
 
-def exp_map_se3(omega: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def exp_map_se3(omega: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Closed-form SE(3) exponential map (Sola Eq. 172)::
 
         exp([ω̂  v;  0  0]) = [exp(ω̂)   J_l(ω) v ;
@@ -490,7 +489,7 @@ def exp_map_se3(omega: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, tor
     return R, t
 
 
-def log_map_se3(R: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def log_map_se3(R: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Closed-form SE(3) logarithm map.
 
     Given ``T = [R t; 0 1]``, recover ``(ω, v)`` such that
@@ -518,9 +517,9 @@ def log_map_se3(R: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.T
 
 
 def riemannian_gradient_se3(
-    euclidean_grad: Tuple[torch.Tensor, torch.Tensor],
+    euclidean_grad: tuple[torch.Tensor, torch.Tensor],
     current: SE3Element,  # noqa: ARG001 — reserved for non-trivial metrics
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Project a Euclidean gradient onto the tangent space of SE(3).
 
     The rotation component stays in the axis-angle chart. The translation
@@ -562,7 +561,7 @@ def riemannian_gradient_se3(
 
 def geodesic_step(
     current: SE3Element,
-    tangent: Tuple[torch.Tensor, torch.Tensor],
+    tangent: tuple[torch.Tensor, torch.Tensor],
     step_size: float,
 ) -> SE3Element:
     """Take a geodesic step on SE(3): retraction via the exponential map.
@@ -723,7 +722,7 @@ def batched_geodesic_step_axis_angle(
     step_size: float,
     *,
     _lie_algebra_assumed: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Vectorised geodesic step for a batch of SE(3) elements.
 
     All inputs are batched along leading dimensions; the last dim is 3

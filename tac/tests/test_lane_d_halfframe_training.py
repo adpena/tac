@@ -40,7 +40,7 @@ REPO = Path(__file__).resolve().parents[3]
 def test_dilated_h64_half_frame_profile_registered() -> None:
     """The profile MUST be in PROFILES dict so --profile dilated_h64_half_frame
     works. If this fails, the bootstrap script will SystemExit before launch."""
-    from tac.profiles import PROFILES, DILATED_H64_HALF_FRAME
+    from tac.profiles import DILATED_H64_HALF_FRAME, PROFILES
 
     assert "dilated_h64_half_frame" in PROFILES, (
         "DILATED_H64_HALF_FRAME not registered in PROFILES dict. "
@@ -392,7 +392,8 @@ def test_reproducibility_different_seeds_differ() -> None:
 def test_bootstrap_script_exists_and_executable() -> None:
     script = REPO / "scripts" / "remote_lane_d_halfframe_retrain.sh"
     assert script.is_file(), f"missing bootstrap: {script}"
-    import os, stat
+    import os
+    import stat
     st = os.stat(script)
     assert st.st_mode & stat.S_IXUSR, f"{script} not executable"
 
@@ -499,8 +500,9 @@ def test_evaluate_fp4_signature_has_zoom_kwargs() -> None:
     """The FP4 in-training evaluator must accept sim_zoom_warp + use_zoom_flow
     so its scorer measurement matches the model's training distribution.
     Without this, eval-time scores diverge from inflate-time scores."""
-    from tac.experiments.train_renderer import evaluate_fp4
     import inspect
+
+    from tac.experiments.train_renderer import evaluate_fp4
     sig = inspect.signature(evaluate_fp4)
     assert "sim_zoom_warp" in sig.parameters, (
         "evaluate_fp4 missing sim_zoom_warp kwarg — FP4 eval will pass None "
@@ -619,8 +621,9 @@ def test_resolve_pose_dim_for_resume_force_wins(tmp_path) -> None:
     AND profile resolution. The shape mismatch that follows is intentional —
     silent shape drift is what we are protecting against, not preventing
     operator-requested overrides."""
-    from tac.experiments.train_renderer import _resolve_pose_dim_for_resume
     import argparse
+
+    from tac.experiments.train_renderer import _resolve_pose_dim_for_resume
     ckpt_path = tmp_path / "ck.pt"
     torch.save(
         {"model": {}, "ema_shadow": {}, "arch_meta": {"pose_dim": 6}},
@@ -635,8 +638,9 @@ def test_resolve_pose_dim_for_resume_checkpoint_overrides_profile(tmp_path) -> N
     """Codex R-Lane-D-Issue1: when --force-pose-dim is unset AND the
     checkpoint's arch_meta disagrees with the profile, the checkpoint wins
     (resume must use the saved arch, otherwise strict load fails)."""
-    from tac.experiments.train_renderer import _resolve_pose_dim_for_resume
     import argparse
+
+    from tac.experiments.train_renderer import _resolve_pose_dim_for_resume
     ckpt_path = tmp_path / "ck.pt"
     torch.save(
         {"model": {}, "ema_shadow": {}, "arch_meta": {"pose_dim": 0}},
@@ -651,8 +655,9 @@ def test_resolve_pose_dim_for_resume_checkpoint_overrides_profile(tmp_path) -> N
 def test_resolve_pose_dim_for_resume_no_checkpoint_uses_profile() -> None:
     """Codex R-Lane-D-Issue1: without a resume checkpoint, the profile
     pose_dim wins (the original Lane D path)."""
-    from tac.experiments.train_renderer import _resolve_pose_dim_for_resume
     import argparse
+
+    from tac.experiments.train_renderer import _resolve_pose_dim_for_resume
     args = argparse.Namespace(force_pose_dim=None, pose_dim=6)
     pd, src = _resolve_pose_dim_for_resume(args, None)
     assert pd == 6 and src == "profile"
@@ -666,8 +671,9 @@ def test_evaluate_fp4_accepts_half_frame_mode_kwarg() -> None:
     in-training evaluator can mirror the inflate-side warp_inverse_masks
     reconstruction. Without this, best checkpoint selection optimises a
     distribution the deployed model never sees."""
-    from tac.experiments.train_renderer import evaluate_fp4
     import inspect
+
+    from tac.experiments.train_renderer import evaluate_fp4
     sig = inspect.signature(evaluate_fp4)
     assert "half_frame_mode" in sig.parameters, (
         "evaluate_fp4 missing half_frame_mode kwarg — without it, half-frame "
@@ -686,8 +692,9 @@ def test_evaluate_fp4_half_frame_mode_requires_zoom_warp() -> None:
     sim_zoom_warp must FAIL LOUD instead of silently passing through —
     silent half-frame eval falls back to mask_t = mask_t (the bug we are
     fixing in the first place)."""
-    from tac.experiments.train_renderer import evaluate_fp4
     import inspect
+
+    from tac.experiments.train_renderer import evaluate_fp4
     src_lines = inspect.getsource(evaluate_fp4)
     assert "half_frame_mode=True) requires sim_zoom_warp" in src_lines, (
         "evaluate_fp4 must raise when half_frame_mode=True but sim_zoom_warp "

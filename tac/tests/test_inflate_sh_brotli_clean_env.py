@@ -35,7 +35,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO = Path(__file__).resolve().parents[3]
 INFLATE_SH = REPO / "submissions" / "robust_current" / "inflate.sh"
 INFLATE_PY = REPO / "submissions" / "robust_current" / "inflate_renderer.py"

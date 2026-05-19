@@ -20,16 +20,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
-
 import torch.nn.functional as F
 
 from tac.data import build_pairs, decode_archive, decode_video
-from tac.losses import scorer_forward_pair
-from tac.scorer import detect_device, load_scorers
-from tac.proxy_eval import _default_paths
-from tac.quantization import load_postfilter_int8, normalize_postfilter_meta, save_int8 as save_model_int8
 from tac.entrypoints import resolve_cloud_output_dir
+from tac.losses import scorer_forward_pair
+from tac.proxy_eval import _default_paths
+from tac.quantization import load_postfilter_int8, normalize_postfilter_meta
+from tac.quantization import save_int8 as save_model_int8
+from tac.scorer import detect_device, load_scorers
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent.parent.parent  # src/tac/research -> project root

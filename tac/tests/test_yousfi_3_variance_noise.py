@@ -32,7 +32,6 @@ import torch
 from tac.fridrich import variance_weighted_noise
 from tac.losses import uniward_quant_noise_loss
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 

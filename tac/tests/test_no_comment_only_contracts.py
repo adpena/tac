@@ -16,15 +16,14 @@ from pathlib import Path
 import pytest
 
 from tac.preflight import (
-    MetaBugViolation,
     _COMMENT_ONLY_CONTRACT_PATTERNS_AUDIT,
     _COMMENT_ONLY_CONTRACT_PATTERNS_STRICT,
+    MetaBugViolation,
     _find_enclosing_function_body,
     _has_backing_assertion,
     _scan_file_for_comment_only_contracts,
     check_no_comment_only_contracts,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -205,7 +204,7 @@ def test_backing_assertion_within_50_lines_satisfies(
     """Q3 verdict (b): backing assertion within ±50 lines (different
     function body, but close enough that a reviewer would see it)."""
     body_lines = "\n".join(
-        ["    pass  # filler line {}".format(i) for i in range(20)]
+        [f"    pass  # filler line {i}" for i in range(20)]
     )
     p = _write(
         tmp_path, "stub.py",
@@ -388,7 +387,7 @@ def test_real_codebase_live_count_zero() -> None:
         strict=False, verbose=False,
     )
     assert violations == [], (
-        f"NEW COMMENT-ONLY CONTRACT INTRODUCED:\n"
+        "NEW COMMENT-ONLY CONTRACT INTRODUCED:\n"
         + "\n".join(f"  • {v}" for v in violations)
         + "\n\nFix: add a backing assertion (assert/raise/check_*) within "
         "±50 lines of the comment OR inside the enclosing function body. "

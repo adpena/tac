@@ -9,10 +9,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOL_PATH = REPO_ROOT / "tools" / "diagnose_lane.py"
@@ -29,7 +27,7 @@ def test_heartbeat_age_minutes_returns_none_on_empty():
 
 def test_heartbeat_age_minutes_parses_recent_mtime():
     # mtime = now - 5 minutes
-    mtime = datetime.now(timezone.utc).timestamp() - 5 * 60
+    mtime = datetime.now(UTC).timestamp() - 5 * 60
     section = f"{mtime} ./scripts/heartbeat.log"
     age = diagnose_lane._heartbeat_age_minutes(section)
     assert age is not None

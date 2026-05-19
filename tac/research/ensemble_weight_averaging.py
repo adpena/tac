@@ -27,12 +27,10 @@ proxy. If it beats all individual members it is a free improvement.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -41,9 +39,10 @@ sys.path.insert(0, str(PROJECT / "submissions" / "robust_current"))
 
 # Legacy: these used to come from train_postfilter_saliency (removed).
 # Now sourced from the tac package.
-from tac.quantization import normalize_postfilter_meta, save_int8 as save_model_int8
-from tac.entrypoints import resolve_cloud_output_dir
 from tac.architectures import PostFilter
+from tac.entrypoints import resolve_cloud_output_dir
+from tac.quantization import normalize_postfilter_meta
+from tac.quantization import save_int8 as save_model_int8
 
 OUTPUT_DIR = resolve_cloud_output_dir(PROJECT)
 

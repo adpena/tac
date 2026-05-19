@@ -507,7 +507,7 @@ def _delta_symbols_to_frame(
 # ── Public API ───────────────────────────────────────────────────────────
 
 
-def encode_argmax_masks(masks: "torch.Tensor | np.ndarray") -> bytes:
+def encode_argmax_masks(masks: torch.Tensor | np.ndarray) -> bytes:
     """Encode a sequence of 5-class argmax masks as a self-contained blob.
 
     Args:
@@ -609,7 +609,7 @@ def decode_argmax_masks(
     expected_n: int | None = None,
     expected_h: int | None = None,
     expected_w: int | None = None,
-) -> "torch.Tensor":
+) -> torch.Tensor:
     """Decode a blob produced by :func:`encode_argmax_masks`.
 
     Args:
@@ -780,7 +780,7 @@ def _decode_one_long(
     raise ValueError("AMRC: failed to decode symbol within MAX_CODE_LENGTH")
 
 
-def pack_archive(masks: "torch.Tensor | np.ndarray", output_path: Path | str) -> int:
+def pack_archive(masks: torch.Tensor | np.ndarray, output_path: Path | str) -> int:
     """Encode masks and write to disk. Returns the file size in bytes.
 
     Convenience for the compress-time pipeline; the canonical "what goes
@@ -793,7 +793,7 @@ def pack_archive(masks: "torch.Tensor | np.ndarray", output_path: Path | str) ->
     return len(blob)
 
 
-def unpack_archive(input_path: Path | str) -> "torch.Tensor":
+def unpack_archive(input_path: Path | str) -> torch.Tensor:
     """Read a .amrc file and return the decoded mask tensor."""
     input_path = Path(input_path)
     if not input_path.exists():
@@ -855,7 +855,7 @@ def validate_amrc_file(path: Path | str) -> None:
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def _to_numpy(masks: "torch.Tensor | np.ndarray") -> np.ndarray:
+def _to_numpy(masks: torch.Tensor | np.ndarray) -> np.ndarray:
     """Coerce the input to a contiguous np.int64 ndarray.
 
     Accepts torch.Tensor (any int dtype), np.ndarray (any int dtype), or

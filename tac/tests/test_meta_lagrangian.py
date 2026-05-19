@@ -29,7 +29,6 @@ from tac.predictor.score_band import (  # noqa: E402
     load_calibration_anchors,
 )
 
-
 # ── Test fixtures ─────────────────────────────────────────────────────────
 
 
@@ -118,8 +117,8 @@ def test_contest_score_uses_canonical_upstream_formula_constants() -> None:
     formula cannot drift from upstream/evaluate.py without breaking this test.
     """
     from tac.predictor.score_band import (
-        PR106_TOTAL_RATE_DENOM,
         POSE_COEFFICIENT_SQRT_INNER,
+        PR106_TOTAL_RATE_DENOM,
         RATE_COEFFICIENT,
         SEG_COEFFICIENT,
     )

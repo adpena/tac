@@ -5,7 +5,7 @@ Dispatches subcommands to :class:`VastClient` and :class:`BudgetTracker`.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from tac.deploy.base import InstanceSpec
 from tac.deploy.vastai.budget import BudgetTracker
@@ -79,8 +79,8 @@ def cmd_launch(client: VastClient, args: argparse.Namespace) -> int:
             print(f"  {_GREEN}Experiment launched in background{_RESET}")
             print(f"  Instance ID: {inst.instance_id}")
             print(f"  SSH: ssh -p {inst.ssh_port} root@{inst.ssh_host}")
-            print(f"  Monitor: python scripts/vastai_deploy.py status")
-            print(f"  Results: python scripts/vastai_deploy.py results")
+            print("  Monitor: python scripts/vastai_deploy.py status")
+            print("  Results: python scripts/vastai_deploy.py results")
             print(f"  Timeout: {experiment.timeout_hours}h")
 
             # Record estimated cost
@@ -122,7 +122,7 @@ def cmd_status(client: VastClient, args: argparse.Namespace) -> int:
         print(f"  {_DIM}No tracked instances{_RESET}")
         return 0
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     instances_to_destroy: list[str] = []
 
     for iid, inst in instances.items():
@@ -238,7 +238,7 @@ def cmd_results(client: VastClient, args: argparse.Namespace) -> int:
                         print("    Destroying instance...")
                         client.destroy(iid)
                     continue
-                elapsed_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+                elapsed_hours = (datetime.now(UTC) - created).total_seconds() / 3600
                 final_cost = inst.dph * elapsed_hours
                 client.budget.record_spend(
                     iid, final_cost,
@@ -293,7 +293,7 @@ def cmd_destroy(client: VastClient, args: argparse.Namespace) -> int:
                 client.destroy(iid)
                 print(f"  {_GREEN}Destroyed {iid} ({experiment_name}){_RESET}")
                 continue
-            elapsed_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+            elapsed_hours = (datetime.now(UTC) - created).total_seconds() / 3600
             final_cost = inst.dph * elapsed_hours
             # Only record if not already recorded
             already_recorded = any(

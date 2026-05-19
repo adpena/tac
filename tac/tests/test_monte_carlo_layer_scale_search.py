@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "research" / "monte_carlo_layer_scale_search.py"
 

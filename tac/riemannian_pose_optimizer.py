@@ -62,7 +62,7 @@ Why a custom optimiser (instead of running plain SGD then re-projecting)
 """
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 import torch
 from torch.optim.optimizer import Optimizer
@@ -72,7 +72,6 @@ from .se3 import (
     inverse_left_jacobian_so3,
     mark_tangent_as_lie_algebra,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Public optimiser

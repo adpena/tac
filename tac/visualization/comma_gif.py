@@ -38,15 +38,14 @@ import io
 import os
 import sys
 from pathlib import Path
-
 from typing import TYPE_CHECKING
 
+import matplotlib
 import numpy as np
 import torch
 
 from tac.versioned_output import versioned_write
 
-import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -130,7 +129,7 @@ def get_posenet_mse(
 # Font helper
 # ---------------------------------------------------------------------------
 
-_MONO_FONT_CACHE: dict[int, "ImageFont.FreeTypeFont | ImageFont.ImageFont"] = {}
+_MONO_FONT_CACHE: dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
 
 def _get_mono_font(size: int = 11):

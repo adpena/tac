@@ -9,7 +9,6 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "experiments" / "fleet_snapshot.py"
 

@@ -64,7 +64,7 @@ PRIOR_DTYPE = np.float16
 _EPS = 1e-6
 
 
-def _coerce_prior_to_numpy(prior: np.ndarray | "torch.Tensor") -> np.ndarray:
+def _coerce_prior_to_numpy(prior: np.ndarray | torch.Tensor) -> np.ndarray:
     """Convert prior to numpy array (handles both numpy and torch inputs).
 
     The tests exercise both code paths: ``apply_prior_weighting(logits, prior, ...)``
@@ -142,7 +142,7 @@ def load_prior(npz_path: str | Path) -> np.ndarray:
 
 def apply_prior_weighting(
     logits: torch.Tensor,
-    prior: np.ndarray | "torch.Tensor",
+    prior: np.ndarray | torch.Tensor,
     alpha: float = 0.1,
 ) -> torch.Tensor:
     """Apply a soft class-prior bias to per-pixel mask logits.
@@ -202,7 +202,7 @@ def apply_prior_weighting(
 
 
 def save_prior_to_archive(
-    prior: np.ndarray | "torch.Tensor" | str | Path,
+    prior: np.ndarray | torch.Tensor | str | Path,
     archive_zip_path: str | Path,
     *,
     arcname: str = PRIOR_FILENAME,

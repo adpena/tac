@@ -18,9 +18,7 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
 
 # ── JPEG luminance quantization table (ITU-T T.81 Annex K, Table K.1) ──────
 #

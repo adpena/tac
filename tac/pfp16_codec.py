@@ -73,7 +73,6 @@ from pathlib import Path
 
 import torch
 
-
 # Sentinel string for documentation / build-script logging. There is NO
 # wire-format magic byte for Lane PFP16 — the archive contains a raw fp16
 # buffer, and the inflate-side loader detects it by ABSENCE of pickle magic

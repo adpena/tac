@@ -22,7 +22,6 @@ from tac.losses_jbl import (
     jaccard_metric_loss,
 )
 
-
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 

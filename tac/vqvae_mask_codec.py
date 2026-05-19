@@ -67,7 +67,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-
 # ── magic bytes / format version ─────────────────────────────────────────
 
 

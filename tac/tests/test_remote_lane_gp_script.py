@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "remote_lane_gp_gaussian_process_pose.sh"
 

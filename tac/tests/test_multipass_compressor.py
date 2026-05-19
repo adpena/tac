@@ -41,11 +41,9 @@ from tac.multipass_compressor import (
     AdjustmentPolicy,
     CoordinateDescentPolicy,
     MultiPassCompressor,
-    MultiPassResult,
     PassRecord,
     compress_with_multipass,
 )
-
 
 # ── (a) synthetic 2-pass quadratic-objective convergence ─────────────────────
 

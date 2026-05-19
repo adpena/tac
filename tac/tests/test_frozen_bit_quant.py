@@ -28,7 +28,6 @@ from tac.frozen_bit_quant import (
     wrap_layer_with_frozen_bits,
 )
 
-
 # ── 8-bit near-identity ───────────────────────────────────────────────────
 
 

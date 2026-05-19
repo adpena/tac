@@ -43,12 +43,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from tac.predictor.score_band import (
+    MIN_CALIBRATION_ANCHORS,
     CalibrationAnchor,
     DistortionProxy,
-    MIN_CALIBRATION_ANCHORS,
     load_calibration_anchors,
 )
 

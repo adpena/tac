@@ -28,7 +28,6 @@ from tac.submission_archive import (
     validate_archive,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 

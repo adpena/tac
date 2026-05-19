@@ -16,13 +16,10 @@ Constraints:
 """
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
 from tac.mask_grayscale_lut import CLASS_TO_GRAY, NUM_CLASSES
-
 
 # Default initialization mirrors the Selfcomp hard-coded targets so that a
 # zero-trained LCT model is identical to the no-LCT baseline.
@@ -74,10 +71,10 @@ class LearnableClassTargets(nn.Module):
 
     def __init__(
         self,
-        initial: Optional[torch.Tensor] = None,
+        initial: torch.Tensor | None = None,
         *,
         ema_decay: float = 0.99,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> None:
         super().__init__()
         if device is not None and torch.device(device).type == "mps":
@@ -164,7 +161,7 @@ class LearnableClassTargets(nn.Module):
         return (torch.sigmoid(self.raw_values.to(torch.float64)) * 255.0).to(torch.float32)
 
     @torch.no_grad()
-    def enforce_separation(self, min_gap: float = 32.0) -> "LearnableClassTargets":
+    def enforce_separation(self, min_gap: float = 32.0) -> LearnableClassTargets:
         """Enforce minimum gap between adjacent sorted targets.
 
         AV1 monochrome quantization noise is ~10-15 gray levels at CRF 50.
@@ -218,7 +215,7 @@ class LearnableClassTargets(nn.Module):
         self,
         assignments: torch.Tensor,
         gray_values: torch.Tensor,
-    ) -> "LearnableClassTargets":
+    ) -> LearnableClassTargets:
         """van den Oord (2017) VQ-VAE persistent-buffer EMA codebook update.
 
         Maintains per-class running stats:
@@ -300,7 +297,7 @@ class LearnableClassTargets(nn.Module):
         return targets.cpu().numpy().tobytes()
 
     @classmethod
-    def deserialize_from_bytes(cls, data: bytes) -> "LearnableClassTargets":
+    def deserialize_from_bytes(cls, data: bytes) -> LearnableClassTargets:
         """Reconstruct from 10-byte payload."""
         if len(data) != NUM_CLASSES * 2:
             raise ValueError(

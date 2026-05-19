@@ -44,12 +44,11 @@ CLAUDE.md compliance:
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 __all__ = [
     "LearnableSaliencyThreshold",

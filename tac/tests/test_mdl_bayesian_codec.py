@@ -26,7 +26,6 @@ from tac.mdl_bayesian_codec import (
     rank_codecs,
 )
 
-
 # ── primitives ─────────────────────────────────────────────────────────
 
 

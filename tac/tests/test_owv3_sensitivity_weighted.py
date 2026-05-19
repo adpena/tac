@@ -15,13 +15,12 @@ from tac.owv3_sensitivity_weighted import (
     OWV3_ARCHIVE_VERSION,
     OWV3ArchiveError,
     decode_owv3_archive,
-    enforce_owv3_byte_budget,
     encode_owv3_archive,
+    enforce_owv3_byte_budget,
     inspect_owv3_archive,
     is_owv3_archive,
 )
 from tac.sensitivity_map import conv_weight_shapes
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 

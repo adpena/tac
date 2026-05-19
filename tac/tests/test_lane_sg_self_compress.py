@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import re
 from pathlib import Path
 
@@ -8,14 +7,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tac.experiments.train_renderer import parse_args
 from tac.self_compress import (
     SC_PROTECTED_NAME_PATTERNS,
     attribute_score_sensitivity_per_layer,
     get_protected_patterns,
     patterns_from_measured_sensitivity,
 )
-from tac.experiments.train_renderer import parse_args
-
 
 REPO = Path(__file__).resolve().parents[3]
 QAT_FINETUNE = REPO / "experiments" / "qat_finetune.py"

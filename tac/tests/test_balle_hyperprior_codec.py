@@ -37,30 +37,26 @@ CLAUDE.md non-negotiables verified
 """
 from __future__ import annotations
 
-import io
 import struct
 
 import numpy as np
 import pytest
 import torch
 
+from tac.arithmetic_qint_codec import decode_qints_arithmetic, encode_qints_arithmetic
 from tac.balle_hyperprior_codec import (
+    _BHV1_MAGIC,
+    MODE_FULL_BALLE,
     BalleHyperpriorCodec,
     HyperDecoder,
     HyperEncoder,
-    MODE_FULL_BALLE,
-    MODE_HOTZ_LITE,
-    _BHV1_MAGIC,
-    _BHV1_VERSION,
+    _pmf_to_int_freq,
     decode_qints_balle,
     discretized_gaussian_pmf,
     encode_qints_balle_auto,
     encode_qints_full_balle,
     encode_qints_hotz_lite,
 )
-from tac.balle_hyperprior_codec import _pmf_to_int_freq
-from tac.arithmetic_qint_codec import encode_qints_arithmetic, decode_qints_arithmetic
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Discretized-Gaussian PMF sums to 1

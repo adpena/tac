@@ -34,7 +34,6 @@ from tac.learnable_bit_quant import (
 )
 from tac.self_compress import SC_PROTECTED_NAME_PATTERNS
 
-
 # ── Toy model that mimics the renderer's protected-layer pattern ─────────
 
 

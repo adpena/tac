@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import struct
-from typing import Mapping
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -32,7 +32,6 @@ from tac.water_filling_codec_v2 import (
     decode_omega_w_v2,
     encode_omega_w_v2,
 )
-
 
 OWV3_ARCHIVE_MAGIC: bytes = b"OWV3"
 OWV3_ARCHIVE_VERSION: int = 1

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from tac.parametrize_strip import strip_parametrize_hooks, has_parametrize_keys
+from tac.parametrize_strip import has_parametrize_keys, strip_parametrize_hooks
 
 
 def test_no_strip_needed_returns_copy() -> None:
@@ -174,6 +174,7 @@ def test_multi_original_dropped_with_warning(recwarn) -> None:
 def test_multi_original_warning_disabled() -> None:
     """warn_multi_original=False suppresses the warning."""
     import warnings as _w
+
     from tac.parametrize_strip import reset_warning_cache
     reset_warning_cache()
     state = {"linear.parametrizations.weight.original0": torch.ones(3)}

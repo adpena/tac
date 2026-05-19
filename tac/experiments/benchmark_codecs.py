@@ -12,11 +12,12 @@ import subprocess
 import tempfile
 import time
 import zlib
-from pathlib import Path
 
 import numpy as np
 
-from tac.camera import FRAME_H as H, FRAME_W as W, NUM_CLASSES
+from tac.camera import FRAME_H as H
+from tac.camera import FRAME_W as W
+from tac.camera import NUM_CLASSES
 
 # ── Constants matching our pipeline ──────────────────────────────────────────
 NUM_FRAMES = 120
@@ -317,6 +318,7 @@ def bench_delta_zlib(masks: np.ndarray) -> None:
 
 def bench_png_zip(masks: np.ndarray) -> None:
     import zipfile
+
     from PIL import Image
 
     n, h, w = masks.shape
@@ -349,6 +351,7 @@ def bench_png_zip(masks: np.ndarray) -> None:
 
 def bench_palettized_png_zip(masks: np.ndarray) -> None:
     import zipfile
+
     from PIL import Image
 
     n, h, w = masks.shape
@@ -416,7 +419,7 @@ def bench_apng(masks: np.ndarray) -> None:
 
 def bench_entropy_coder(masks: np.ndarray) -> None:
     try:
-        from tac.mask_entropy_coder import encode_masks_entropy, decode_masks_entropy
+        from tac.mask_entropy_coder import decode_masks_entropy, encode_masks_entropy
     except ImportError:
         print("  Entropy coder not available (tac.mask_entropy_coder not importable)")
         return

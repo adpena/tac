@@ -36,9 +36,10 @@ for callers that need the broader contract.
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 from math import isfinite
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
@@ -134,7 +135,7 @@ class QPV1Payload:
     def values_by_dim(self) -> dict[int, list[int]]:
         return {stream.dim: list(stream.values) for stream in self.streams}
 
-    def with_values(self, values_by_dim: dict[int, list[int]]) -> "QPV1Payload":
+    def with_values(self, values_by_dim: dict[int, list[int]]) -> QPV1Payload:
         streams: list[QPV1DimensionStream] = []
         for stream in self.streams:
             values = tuple(int(value) for value in values_by_dim[stream.dim])

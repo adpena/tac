@@ -31,7 +31,7 @@ from .batch_jobs import (
     exact_cuda_eval_command,
     make_exact_eval_spec,
 )
-from .lightning_dispatch import LightningDispatcher, DispatchResult
+from .lightning_dispatch import DispatchResult, LightningDispatcher
 
 __all__ = [
     "DispatchResult",

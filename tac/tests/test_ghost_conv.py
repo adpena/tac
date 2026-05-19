@@ -45,7 +45,6 @@ from tac.renderer import (  # noqa: E402
     build_renderer,
 )
 
-
 # ── 1. GhostConv2d primitive ───────────────────────────────────────────
 
 

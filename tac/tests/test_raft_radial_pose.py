@@ -19,9 +19,8 @@ from tac.raft_radial_pose import (
     MODE_COMPRESS_TIME_PRIOR,
     MODE_INFLATE_RECOMPUTE,
     RAFT_RADIAL_VERSION,
-    PoseCalibration,
-    RaftRadialPoseConfig,
     VALID_MODES,
+    RaftRadialPoseConfig,
     build_radial_basis,
     calibrate_to_contest_pose,
     compute_radial_basis_from_flow,
@@ -29,7 +28,6 @@ from tac.raft_radial_pose import (
     estimate_pose_compress_time_prior,
     evaluate_disagreement,
 )
-
 
 # ── basis builder ─────────────────────────────────────────────────────
 

@@ -52,10 +52,8 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
-
 
 # Encoder defaults (centralized so tests + exporter + decoder agree).
 DEFAULT_BLOCK_SIZE: int = 16
@@ -265,7 +263,7 @@ class BlockFPHeader:
         return b"".join(parts)
 
     @classmethod
-    def decode(cls, data: bytes) -> tuple["BlockFPHeader", int]:
+    def decode(cls, data: bytes) -> tuple[BlockFPHeader, int]:
         if data[:4] != _BFP_MAGIC:
             raise ValueError(
                 f"block_fp_codec: expected magic {_BFP_MAGIC!r}, got {data[:4]!r}"
@@ -343,7 +341,7 @@ def pack_block_fp(
 
 def unpack_block_fp(
     data: bytes,
-    shape: Optional[tuple[int, ...]] = None,
+    shape: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Decode a block-FP byte blob back to a float32 tensor.
 

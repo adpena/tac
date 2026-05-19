@@ -7,9 +7,9 @@ import os
 import shutil
 import time
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 import numpy as np
 

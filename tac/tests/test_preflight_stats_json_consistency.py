@@ -39,7 +39,6 @@ from tac.preflight import (  # noqa: E402
     check_stats_json_internal_consistency,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Real-codebase regression — STRICT @ 0 violations
 # ─────────────────────────────────────────────────────────────────────────────

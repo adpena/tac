@@ -13,11 +13,10 @@ import pytest
 
 from tac.preflight import (
     DeadResolverViolation,
-    _import_inside_try_handler,
     _is_resolvable_submodule,
     _module_top_level_names,
-    _scan_python_for_dead_objective_feature,
     _scan_python_for_dead_imports,
+    _scan_python_for_dead_objective_feature,
     _scan_python_for_dead_resolvers,
     check_feature_flags_have_live_objective_effect,
     preflight_dead_resolvers,

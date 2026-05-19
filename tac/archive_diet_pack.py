@@ -18,7 +18,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-
 _FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _SEGMENT_WEIGHT_NAME = "segmap_weights.tar.xz"
 _ARITH_PAYLOAD_NAME = "payload.bin"

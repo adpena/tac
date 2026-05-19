@@ -20,9 +20,9 @@ from pathlib import Path
 import pytest
 
 from tac.preflight import (
-    MetaBugViolation,
-    SMOKE_PROOFS_REL,
     SMOKE_PROOF_MAX_AGE_DAYS,
+    SMOKE_PROOFS_REL,
+    MetaBugViolation,
     check_lane_scripts_have_e2e_smoke_proof,
 )
 
@@ -60,7 +60,7 @@ def _make_repo(tmp: Path, *, lane_scripts: dict[str, str],
 
 def test_check_passes_when_proof_exists_and_recent(tmp_path: Path) -> None:
     """A lane with a fresh smoke proof passes the check."""
-    now_iso = _utc_iso(dt.datetime.now(dt.timezone.utc))
+    now_iso = _utc_iso(dt.datetime.now(dt.UTC))
     repo = _make_repo(
         tmp_path,
         lane_scripts={"remote_lane_foo.sh": "#!/bin/bash\necho hi\n"},
@@ -97,7 +97,7 @@ def test_check_fails_when_proof_missing(tmp_path: Path) -> None:
 
 def test_check_fails_when_proof_too_old(tmp_path: Path) -> None:
     """A proof older than SMOKE_PROOF_MAX_AGE_DAYS days violates."""
-    too_old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+    too_old = dt.datetime.now(dt.UTC) - dt.timedelta(
         days=SMOKE_PROOF_MAX_AGE_DAYS + 2,
     )
     repo = _make_repo(
@@ -234,6 +234,6 @@ def test_real_repo_has_no_violations() -> None:
         repo_root=REPO, strict=False, verbose=False,
     )
     assert violations == [], (
-        f"Check 64 has live violations on the real repo:\n"
+        "Check 64 has live violations on the real repo:\n"
         + "\n".join(f"  • {v}" for v in violations[:10])
     )

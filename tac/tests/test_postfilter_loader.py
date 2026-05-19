@@ -7,7 +7,6 @@ from pathlib import Path
 
 import torch
 
-
 ROOT = Path(__file__).resolve().parents[3]
 MODULE_PATH = ROOT / "submissions" / "robust_current" / "inflate_postfilter.py"
 PIXELSHUFFLE_MODULE_PATH = MODULE_PATH  # inflate_postfilter.py contains PixelShuffleDilatedPostFilter

@@ -96,7 +96,6 @@ import io
 import math
 import struct
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -108,7 +107,6 @@ from tac.arithmetic_qint_codec import (
     _cumulative_table,
     build_freq_table,
 )
-
 
 _BHV1_MAGIC: bytes = b"BHv1"
 _BHV1_VERSION: int = 1
@@ -624,7 +622,7 @@ class BHv1Header:
     block_size: int
 
 
-def _read_bhv1_header(blob: bytes) -> Tuple[BHv1Header, int]:
+def _read_bhv1_header(blob: bytes) -> tuple[BHv1Header, int]:
     """Parse the fixed BHv1 header. Returns (header, cursor_after_header)."""
     if len(blob) < 4 + 2 + 1 + 2 + 4 + 8 + 4:
         raise ValueError(
@@ -861,7 +859,7 @@ def encode_qints_balle_auto(
     num_chunks_lite: int = 4,
     full_codec: BalleHyperpriorCodec | None = None,
     static_baseline_bytes: int | None = None,
-) -> Tuple[bytes, str, dict]:
+) -> tuple[bytes, str, dict]:
     """Try all available modes and return the smallest.
 
     Args:
@@ -877,7 +875,7 @@ def encode_qints_balle_auto(
     Returns:
         ``(blob, chosen_mode_name, stats_dict)``.
     """
-    candidates: list[Tuple[str, bytes]] = []
+    candidates: list[tuple[str, bytes]] = []
     lite_blob = encode_qints_hotz_lite(
         qints=qints,
         num_symbols=num_symbols,

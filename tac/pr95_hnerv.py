@@ -14,11 +14,10 @@ import hashlib
 import io
 import struct
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import brotli
-
 
 FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 

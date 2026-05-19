@@ -68,9 +68,6 @@ Design notes
 
 from __future__ import annotations
 
-import io
-import json
-import math
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -182,7 +179,7 @@ class IMPState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "IMPState":
+    def from_dict(cls, d: dict[str, Any]) -> IMPState:
         return cls(
             cycle_count=int(d.get("cycle_count", 0)),
             sparsity_target=float(d.get("sparsity_target", 0.90)),

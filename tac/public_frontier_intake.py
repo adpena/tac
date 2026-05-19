@@ -19,12 +19,11 @@ import argparse
 import hashlib
 import json
 import math
-import struct
-import zipfile
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
 SCHEMA = "public_frontier_intake_profile_v1"
 TOOL = "experiments/profile_public_frontier_intake.py"

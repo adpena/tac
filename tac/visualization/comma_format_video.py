@@ -212,6 +212,7 @@ class _PoseNetChartRenderer:
         window: int = 120,
     ) -> np.ndarray:
         import io
+
         from PIL import Image
 
         ax = self._ax

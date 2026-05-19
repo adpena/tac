@@ -4,10 +4,9 @@ import argparse
 import json
 import shlex
 import subprocess
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
-
 
 ACTIVE_STATUSES = {"running", "queued"}
 REPUSHABLE_PHASES = {"quota_blocked", "kernel_error", "kernel_cancelled", "kernel_cancel_acknowledged"}
@@ -22,7 +21,7 @@ def _counts_as_remote_active(status: str, phase: str) -> bool:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _read_json(path: Path) -> dict[str, object]:

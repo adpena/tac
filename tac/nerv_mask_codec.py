@@ -59,7 +59,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-
 # ── magic bytes / format version ─────────────────────────────────────────
 
 
@@ -606,7 +605,7 @@ class NeRVMaskTrainer:
 
     def __init__(
         self,
-        codec: "NeRVMaskCodec | None" = None,
+        codec: NeRVMaskCodec | None = None,
         *,
         device: str = "cuda",
         learning_rate: float = 1e-3,

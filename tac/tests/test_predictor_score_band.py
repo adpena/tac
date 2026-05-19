@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import get_args, get_origin
 
 import pytest
 
@@ -41,7 +40,6 @@ from tac.predictor.score_band import (
     SEG_COEFFICIENT,
     _score_from_components,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures

@@ -51,10 +51,8 @@ from __future__ import annotations
 
 import io
 import struct
-from typing import Iterable
 
 import numpy as np
-
 
 _AQ_MAGIC: bytes = b"AQv1"
 _AQ_VERSION: int = 1
@@ -461,6 +459,7 @@ def unpack_arithmetic_payload(payload_path: str) -> dict:
     inflate_segmap_arithmetic.py).
     """
     import json
+
     import torch
 
     from tac.block_fp_codec import decode_conv_weight, decode_tensor_linear_q_per_tensor_v1

@@ -40,8 +40,7 @@ References:
 from __future__ import annotations
 
 import warnings
-from typing import Mapping
-
+from collections.abc import Mapping
 
 _DROPPED_MULTI_ORIG_WARNED: set[str] = set()
 
@@ -100,11 +99,11 @@ def _is_multi_original(suffix: str) -> bool:
 
 
 def strip_parametrize_hooks(
-    state: Mapping[str, "object"],
+    state: Mapping[str, object],
     *,
     drop_internal: bool = True,
     warn_multi_original: bool = True,
-) -> dict[str, "object"]:
+) -> dict[str, object]:
     """Return a copy of ``state`` with parametrize hook keys normalized.
 
     Mapping rules:
@@ -143,7 +142,7 @@ def strip_parametrize_hooks(
     """
     if not has_parametrize_keys(state):
         return dict(state)
-    out: dict[str, "object"] = {}
+    out: dict[str, object] = {}
     for k, v in state.items():
         path, name, suffix = _parse_param_key(k)
         if path is None:
@@ -180,7 +179,7 @@ def strip_parametrize_hooks(
     return out
 
 
-def has_parametrize_keys(state: Mapping[str, "object"]) -> bool:
+def has_parametrize_keys(state: Mapping[str, object]) -> bool:
     """True iff `state` contains any parametrize-hook keys.
 
     Detects both nested layer keys (`layer.parametrizations.…`) and ROOT-level

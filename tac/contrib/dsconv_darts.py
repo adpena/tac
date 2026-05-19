@@ -60,13 +60,12 @@ import torch
 import torch.nn as nn
 
 from tac.darts import (
-    DARTSAnnealSchedule,
     DARTSAlphaTrajectory,
+    DARTSAnnealSchedule,
     DARTSCell,
     DARTSOptimizer,
     alpha_softmax,
 )
-
 
 __all__ = [
     "DSConvVariant",

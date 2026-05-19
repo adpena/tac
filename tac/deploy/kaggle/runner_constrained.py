@@ -138,7 +138,7 @@ def _load_models(
     Returns:
         (segnet, posenet) both on device, in eval mode with weights loaded.
     """
-    from modules import SegNet, PoseNet
+    from modules import PoseNet, SegNet
     from safetensors.torch import load_file
 
     segnet = SegNet().to(device).eval()
@@ -280,6 +280,7 @@ def compute_proxy_score(
         will be ~20–70x smaller than the true rate contribution.
     """
     import math
+
     import torch
 
     N = generated_frames.shape[0]
@@ -349,7 +350,7 @@ def main(
         CONSTRAINED_LR         — Adam learning rate (default 0.1)
         CONSTRAINED_VIDEO      — relative path inside asset slug to test video
     """
-    from tac.deploy.cloud_paths import CloudPaths, try_ensure_uv, ensure_packages
+    from tac.deploy.cloud_paths import CloudPaths, ensure_packages, try_ensure_uv
 
     # Resolve platform paths
     if input_root is None or working_dir is None:
@@ -498,7 +499,7 @@ def main(
     print(f"  proxy: {kill_scores['score']:.4f}  (kill if > {KILL_THRESHOLD})")
     if kill_scores["score"] > KILL_THRESHOLD:
         print(f"  KILLED — proxy {kill_scores['score']:.4f} exceeds threshold {KILL_THRESHOLD}.")
-        print(f"  Hypothesis: constrained gen from noise does not converge fast enough.")
+        print("  Hypothesis: constrained gen from noise does not converge fast enough.")
         return 1
 
     print(f"  Passed kill check — continuing to {num_steps} steps ...")
@@ -533,8 +534,8 @@ def main(
     # tensor and a separate 3.66 GB uint8 numpy array simultaneously.
     # (14.65 + 3.66 = 18.3 GB; adding gt_frames = 33 GB → OOM on Kaggle 26 GB CPU RAM)
     # Chunk approach: peak per batch = 64×874×1164×3×4 = 784 MB. Total ≈ 16.5 GB.
-    import torch.nn.functional as F  # noqa: PLC0415 — deferred to avoid top-level torch dep
     import numpy as np
+    import torch.nn.functional as F  # noqa: PLC0415 — deferred to avoid top-level torch dep
 
     video_name = Path(video_rel).stem  # e.g. "0"
     inflated_dir = working_dir / "inflated"
@@ -592,7 +593,7 @@ def main(
         archive_size_bytes=archive_path.stat().st_size,
     )
     del gt_small_proxy
-    print(f"\n  === RESULT ===")
+    print("\n  === RESULT ===")
     print(f"  score:     {scores['score']:.4f}")
     print(f"  seg_dist:  {scores['seg_dist']:.6f}")
     print(f"  pose_dist: {scores['pose_dist']:.6f}")

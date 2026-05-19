@@ -34,7 +34,6 @@ import io
 import json
 import struct
 from pathlib import Path
-from typing import Union
 
 import torch
 import torch.nn as nn
@@ -420,7 +419,7 @@ def export_renderer_checkpoint(
 
 
 def load_renderer_checkpoint(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Deserialize renderer from .bin file.
@@ -944,7 +943,7 @@ def export_asymmetric_checkpoint(
 
 
 def load_asymmetric_checkpoint(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Deserialize AsymmetricPairGenerator from .bin file.
@@ -1195,8 +1194,8 @@ def export_asymmetric_checkpoint_fp4(
     from tac.fp4_quantize import (
         DEFAULT_CODEBOOK,
         RESIDUAL_CODEBOOK,
-        _quantize_block,
         _pack_indices_signs,
+        _quantize_block,
     )
 
     model.eval()
@@ -1365,7 +1364,7 @@ def export_asymmetric_checkpoint_fp4(
 
 
 def load_asymmetric_checkpoint_fp4(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Deserialize AsymmetricPairGenerator from FP4-packed .bin file.
@@ -1378,9 +1377,8 @@ def load_asymmetric_checkpoint_fp4(
         AsymmetricPairGenerator in eval mode with restored weights.
     """
     from tac.fp4_quantize import (
-        DEFAULT_CODEBOOK,
-        _unpack_indices_signs,
         _dequantize_block,
+        _unpack_indices_signs,
     )
     from tac.renderer import AsymmetricPairGenerator
 
@@ -1822,7 +1820,7 @@ def export_hardware_fp8_checkpoint(
 
 
 def load_hardware_fp8_checkpoint(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Restore a renderer from an FP8H ``.bin`` (Lane F-V5 hardware FP8)."""
@@ -1857,7 +1855,7 @@ def load_hardware_fp8_checkpoint(
     return model
 
 
-def detect_checkpoint_type(data_or_path: Union[bytes, Path]) -> str:
+def detect_checkpoint_type(data_or_path: bytes | Path) -> str:
     """Detect the type of a renderer checkpoint.
 
     Returns:
@@ -1905,7 +1903,7 @@ def detect_checkpoint_type(data_or_path: Union[bytes, Path]) -> str:
 
 
 def load_any_renderer_checkpoint(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Load any renderer checkpoint, auto-detecting the format.
@@ -1973,8 +1971,8 @@ def load_any_renderer_checkpoint(
         return model.eval().to(device)
     else:
         raise ValueError(
-            f"Raw PyTorch checkpoint detected — use _load_renderer() in "
-            f"inflate_renderer.py for .pt format support."
+            "Raw PyTorch checkpoint detected — use _load_renderer() in "
+            "inflate_renderer.py for .pt format support."
         )
 
 
@@ -2017,7 +2015,7 @@ _C3_RESIDUAL_FORMAT_VERSION = 1
 
 def _is_coolchic_renderer(model: nn.Module) -> bool:
     """True if `model.renderer` is a CoolChicLatentRenderer (no residual head)."""
-    from tac.contrib.coolchic_renderer import CoolChicLatentRenderer, C3ResidualRenderer
+    from tac.contrib.coolchic_renderer import C3ResidualRenderer, CoolChicLatentRenderer
     inner = getattr(model, "renderer", None)
     return isinstance(inner, CoolChicLatentRenderer) and not isinstance(inner, C3ResidualRenderer)
 
@@ -2041,7 +2039,7 @@ def _quantize_block_fp4(
     Caller is responsible for storing `numel` and `block_size` in the header
     so the inverse operation can recover the flat tensor.
     """
-    from tac.fp4_quantize import _quantize_block, _pack_indices_signs
+    from tac.fp4_quantize import _pack_indices_signs, _quantize_block
 
     numel = int(flat.numel())
     flat = flat.detach().cpu().float().reshape(-1)
@@ -2073,7 +2071,7 @@ def _dequantize_block_fp4(
     codebook: torch.Tensor,
 ) -> torch.Tensor:
     """Inverse of `_quantize_block_fp4`; returns a flat float32 tensor of `numel`."""
-    from tac.fp4_quantize import _unpack_indices_signs, _dequantize_block
+    from tac.fp4_quantize import _dequantize_block, _unpack_indices_signs
 
     padded_numel = numel + (block_size - numel % block_size) % block_size
     n_blocks = padded_numel // block_size
@@ -2536,7 +2534,7 @@ def export_c3_residual_renderer(
 
 
 def _load_coolchic_or_c3(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     *,
     is_c3: bool,
     device: str = "cpu",
@@ -2729,7 +2727,7 @@ def _load_coolchic_or_c3(
 
 
 def load_coolchic_renderer(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Deserialize a Cool-Chic PairGenerator from a `b"CCh1"` .bin."""
@@ -2737,7 +2735,7 @@ def load_coolchic_renderer(
 
 
 def load_c3_residual_renderer(
-    data_or_path: Union[bytes, Path],
+    data_or_path: bytes | Path,
     device: str = "cpu",
 ) -> nn.Module:
     """Deserialize a C3 residual PairGenerator from a `b"C3R1"` .bin."""
@@ -3599,8 +3597,8 @@ _OMEGA_VERSION = 1
 
 
 def _bitpack_values_with_bits(
-    values: "list[int] | torch.Tensor",
-    bits: "list[int] | torch.Tensor",
+    values: list[int] | torch.Tensor,
+    bits: list[int] | torch.Tensor,
 ) -> bytes:
     """LSB-first variable-width bit-packed encoding of signed integer values.
 
@@ -3651,7 +3649,7 @@ def _bitpack_values_with_bits(
 
 def _bitunpack_values_with_bits(
     blob: bytes,
-    bits: "list[int] | torch.Tensor",
+    bits: list[int] | torch.Tensor,
 ) -> list[int]:
     """Inverse of _bitpack_values_with_bits — recover signed integer codes."""
     if isinstance(bits, torch.Tensor):
@@ -3799,7 +3797,7 @@ def _maybe_unwrap_learnable_bit_model(
         parents[name] = mod
 
     # Collect (parent, child_name, full_name, wrapper) tuples first.
-    to_replace: list[tuple[nn.Module, str, str, "LearnableBitConv2d"]] = []
+    to_replace: list[tuple[nn.Module, str, str, LearnableBitConv2d]] = []
     for full_name, mod in model.named_modules():
         if isinstance(mod, LearnableBitConv2d):
             if "." in full_name:
@@ -4418,7 +4416,7 @@ def export_neural_compressed_checkpoint(
 
 
 def load_neural_compressed_checkpoint(
-    data_or_path: Union[bytes, Path, str],
+    data_or_path: bytes | Path | str,
     device: str = "cpu",
 ) -> nn.Module:
     """Restore a renderer from an NWC1 ``.bin``.
@@ -4496,7 +4494,7 @@ def load_neural_compressed_checkpoint(
 
 
 def load_nwcs_sensitivity_compressed_checkpoint(
-    data_or_path: Union[bytes, Path, str],
+    data_or_path: bytes | Path | str,
     device: str = "cpu",
 ) -> nn.Module:
     """Restore a renderer from an NWCS1 sensitivity-aware NWC container."""

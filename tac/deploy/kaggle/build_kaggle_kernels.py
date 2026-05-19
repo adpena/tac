@@ -9,7 +9,6 @@ import sys
 import time
 from pathlib import Path
 
-
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
@@ -18,10 +17,9 @@ if str(HERE) not in sys.path:
 _REPO_ROOT_PROBE = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT_PROBE / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT_PROBE / "src"))
-from tac.deploy.deploy_config import ALL_VARIANTS  # noqa: E402
-
 from kaggle_kernel_builder import KaggleKernelSpec, write_bundle
 
+from tac.deploy.deploy_config import ALL_VARIANTS  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 KAGGLE_ROOT = REPO_ROOT / "experiments" / "kaggle_kernels"
@@ -481,7 +479,7 @@ def push_kernels(bundle_dirs: list[Path]) -> None:
             slug = kernel_ref.split("/", 1)[-1] if "/" in kernel_ref else kernel_ref
             print(f"  WARNING: Kernel {kernel_ref} does not exist on Kaggle.")
             print(f"  Create it first at: https://www.kaggle.com/code/{username}/{slug}/edit")
-            print(f"  Then re-run this push command.")
+            print("  Then re-run this push command.")
             continue  # skip this kernel, push the rest
 
         print(f"  Pushing kernel: {bundle_dir.name} ...")

@@ -39,7 +39,6 @@ import math
 from typing import Any
 
 import numpy as np
-
 from experiments.precompute_gradient_corrections import (  # noqa: E402
     estimated_sparse_bytes,
     greedy_waterfill_correction_map,

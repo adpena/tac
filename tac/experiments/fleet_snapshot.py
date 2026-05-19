@@ -7,7 +7,6 @@ import re
 import sys
 from pathlib import Path
 
-
 DEFAULT_DIRECTORY = Path("/private/tmp/pact-mine/experiments/postfilter_weights")
 META_SUFFIX = "_best_meta.json"
 META_PREFIX = "postfilter_"

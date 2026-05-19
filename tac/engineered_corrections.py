@@ -46,6 +46,8 @@ import numpy as np
 # and avoids the canonical-import-drift bug class.
 from experiments.precompute_gradient_corrections import (  # noqa: E402
     apply_corrections as _apply_corrections,
+)
+from experiments.precompute_gradient_corrections import (
     estimated_sparse_bytes,
     greedy_waterfill_correction_map,
     pack_sparse_corrections,
@@ -115,7 +117,7 @@ def compute_per_frame_corrections(
 
 
 def apply_corrections_at_inflate(
-    rendered: "np.ndarray | torch.Tensor",
+    rendered: np.ndarray | torch.Tensor,
     corrections: dict[str, Any] | bytes | str | Path,
     *,
     alpha: float = 1.0,

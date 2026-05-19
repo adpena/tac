@@ -24,13 +24,11 @@ All tests use synthetic data (no GT video, no CUDA/MPS dependency). CI-fast.
 """
 from __future__ import annotations
 
-import struct
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -44,7 +42,6 @@ from tac.renderer_export import (
     export_neural_compressed_checkpoint,
     load_neural_compressed_checkpoint,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 

@@ -18,7 +18,6 @@ import importlib
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Section 1: import-resolves tests (every required symbol must be importable)
 # ---------------------------------------------------------------------------
@@ -211,11 +210,11 @@ def test_module_exposes_required_symbols(module_name: str, required_symbols: lis
 
 def test_pr85_bundle_segment_order_constants() -> None:
     from tac.pr85_bundle import (
+        FIXED_V5_LENGTHS,
         HEADER_EXPLICIT30_SEGMENTS,
         HEADER_V5_SEGMENTS,
-        SEGMENT_ORDER,
-        FIXED_V5_LENGTHS,
         QPOST_STREAM_NAMES,
+        SEGMENT_ORDER,
     )
 
     assert SEGMENT_ORDER == (
@@ -311,7 +310,7 @@ def test_validate_pr85_member_name() -> None:
 
 
 def test_u24le_helpers() -> None:
-    from tac.pr85_bundle import _pack_u24le, _u24le, Pr85BundleError
+    from tac.pr85_bundle import Pr85BundleError, _pack_u24le, _u24le
 
     for value in (0, 1, 255, 256, 65535, 65536, 16777215):
         packed = _pack_u24le(value)
@@ -371,7 +370,6 @@ def test_endgame_archive_decision_main_raises_not_implemented(tmp_path) -> None:
 def test_hpac_probability_variants_registry() -> None:
     from tac.pr86_hpac_codec import (
         DEFAULT_HPAC_PROBABILITY_VARIANT,
-        HPAC_PROBABILITY_VARIANTS,
         Pr86HpacReplayError,
         resolve_hpac_probability_variant,
         supported_hpac_probability_variant_names,

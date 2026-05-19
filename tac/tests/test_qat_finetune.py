@@ -59,7 +59,6 @@ from tac.renderer_export import (  # noqa: E402
     load_asymmetric_checkpoint_fp4,
 )
 
-
 # ── Architecture: matches the verified 0.9001 dilated-h64 baseline ─────
 # (header inspected from submissions/baseline_dilated_h64_0_90/renderer.bin)
 DILATED_H64_ARCH = dict(
@@ -446,7 +445,6 @@ def test_real_dilated_h64_baseline_fp4_roundtrip():
 # explicit --poses arg + raise. This is the test gate that prevents regression.
 
 
-import argparse
 import subprocess
 import sys
 
@@ -531,13 +529,13 @@ def test_qat_finetune_no_silent_auto_discovery_pattern():
     silent-auto-discovery pattern using the meta-bug check. Must return
     0 violations after Bug 1 fix."""
     from tac.preflight import (
-        _scan_python_for_silent_auto_discovery,
         REPO_ROOT,
+        _scan_python_for_silent_auto_discovery,
     )
     qat_path = REPO_ROOT / "experiments" / "qat_finetune.py"
     v = _scan_python_for_silent_auto_discovery(qat_path, REPO_ROOT)
     assert v == [], (
-        f"qat_finetune.py has silent-auto-discovery violation(s). "
-        f"Bug 1 fix regressed. Findings:\n"
+        "qat_finetune.py has silent-auto-discovery violation(s). "
+        "Bug 1 fix regressed. Findings:\n"
         + "\n".join(f"  • {x}" for x in v)
     )

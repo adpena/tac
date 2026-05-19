@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sys
 import tempfile
 import unittest
@@ -9,7 +8,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"

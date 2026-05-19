@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -17,7 +17,6 @@ from tac.neural_weight_corpus import (
     build_corpus_manifest,
     canonical_manifest_json,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 

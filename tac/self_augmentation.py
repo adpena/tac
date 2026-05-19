@@ -196,7 +196,7 @@ class SelfAugmenter(nn.Module):
     # ------------------------------------------------------------------
     # Proxy/auth log fitting
     # ------------------------------------------------------------------
-    def fit_from_proxy_auth_log(self, path: str | Path) -> "SelfAugmenter":
+    def fit_from_proxy_auth_log(self, path: str | Path) -> SelfAugmenter:
         """Set ``pose_sigma_per_dim`` from a proxy/auth JSONL log.
 
         Each row in the JSONL must contain ``pose_per_dim`` (an iterable

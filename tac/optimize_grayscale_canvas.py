@@ -60,9 +60,8 @@ Reuses (does not modify):
 """
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -76,7 +75,6 @@ from tac.mask_grayscale_lut import (
     encode_masks_grayscale,
 )
 from tac.preflight import PreflightError
-
 
 # ── module constants (mirror submissions/robust_current/inflate_renderer.py) ──
 SCORER_INPUT_H = 384
@@ -123,7 +121,7 @@ class OptimizeConfig:
     pose_weight: float = 10.0
     batch_size: int = 8
     log_every: int = 10
-    smoke_eval_callback: Optional[Callable[[int, torch.Tensor, dict], None]] = None
+    smoke_eval_callback: Callable[[int, torch.Tensor, dict], None] | None = None
     smoke_eval_every: int = 0
     seed: int = 0xA1A1
 

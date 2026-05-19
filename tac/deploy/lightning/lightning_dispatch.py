@@ -41,13 +41,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import shlex
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
-
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LIGHTNING_STATE = REPO_ROOT / ".omx/state/lightning_active_sessions.json"

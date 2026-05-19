@@ -17,6 +17,7 @@ from __future__ import annotations
 # making long-running scripts appear silent for hours per the optimize_poses
 # incident on the A100 today).
 import sys as _dx_sys
+
 try:
     _dx_sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
     _dx_sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
@@ -32,7 +33,7 @@ import os as _os
 import random
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import torch
@@ -54,12 +55,16 @@ if _upstream.exists() and str(_upstream) not in sys.path:
 
 # ── Imports (after path setup) ──────────────────────────────────────────
 
+from tac.contrib.wavelet_renderer import build_wavelet_renderer  # noqa: E402
 from tac.data import decode_video, pair_from_frames, pair_start_indices  # noqa: E402
+from tac.feature_masking import FeatureMasker  # noqa: E402
 from tac.fp4_quantize import (  # noqa: E402
     QATRendererFP4,
     dequantize_fp4,
     quantize_fp4,
 )
+from tac.fridrich_losses import dct_quant_loss  # noqa: E402
+from tac.loss_t2_xpred import x_prediction_loss  # noqa: E402
 from tac.losses import (  # noqa: E402
     _hwc_to_chw,
     eval_scorer_loss,
@@ -71,26 +76,21 @@ from tac.losses import (  # noqa: E402
     segnet_uncertainty_weighted_loss,
     uniward_quant_noise_loss,
 )
+from tac.mae_mask_aug import (  # noqa: E402
+    MAEMaskAugConfig,
+    MAEMaskAugmenter,
+)
 from tac.mask_codec import extract_masks, mask_pair_from_index  # noqa: E402
 from tac.profiles import PROFILES  # noqa: E402
-from tac.fridrich_losses import dct_quant_loss  # noqa: E402
-from tac.feature_masking import FeatureMasker  # noqa: E402
-from tac.loss_t2_xpred import x_prediction_loss  # noqa: E402
-from tac.renderer import build_renderer, simulate_eval_roundtrip  # noqa: E402
+from tac.renderer import simulate_eval_roundtrip  # noqa: E402
+from tac.scorer import detect_device, load_scorers  # noqa: E402
 from tac.self_augmentation_v2 import (  # noqa: E402
     HighSigmaSampler,
     HighSigmaStrategyConfig,
     apply_sigma_noise_to_input,
 )
-from tac.mae_mask_aug import (  # noqa: E402
-    MAEMaskAugConfig,
-    MAEMaskAugmenter,
-)
-from tac.contrib.wavelet_renderer import build_wavelet_renderer  # noqa: E402
-from tac.scorer import detect_device, load_scorers  # noqa: E402
 from tac.training import EMA  # noqa: E402
 from tac.utils import setup_signal_handlers, write_telemetry  # noqa: E402
-
 
 # ── Variant routing ─────────────────────────────────────────────────────
 #
@@ -2472,10 +2472,9 @@ def train(args: argparse.Namespace):
     # device move below. The swap is in-place — `model` is mutated.
     if getattr(args, "use_self_compress_codec", False):
         from tac.self_compress import (
-            swap_renderer_convs_with_self_compress,
-            renderer_average_bits_per_weight,
             get_protected_patterns,
-            SC_PROTECTED_NAME_PATTERNS,
+            renderer_average_bits_per_weight,
+            swap_renderer_convs_with_self_compress,
         )
         # Lane SG (2026-04-28, hardened by Codex F3 2026-04-28): pick the
         # protection list per chosen scorer prior and pass it as a
@@ -3928,7 +3927,7 @@ def train(args: argparse.Namespace):
                 "eval_pose": round(eval_pose, 8),
                 "eval_seg": round(eval_seg, 8),
                 "best_epoch": best_epoch,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "distillation_policy": getattr(args, "distillation_policy_provenance", None),
                 "distillation_policy_sha256": getattr(args, "distillation_policy_sha256", None),
                 "score_claim_eligible": False,
@@ -4166,7 +4165,7 @@ def train(args: argparse.Namespace):
             "--output-dir", str(out_dir),
             "--poses", str(args.auth_eval_poses),
         ]
-        print(f"\n[auth-eval] Launching CUDA auth eval against best checkpoint...")
+        print("\n[auth-eval] Launching CUDA auth eval against best checkpoint...")
         print(f"[auth-eval] cmd: {' '.join(cmd)}")
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)

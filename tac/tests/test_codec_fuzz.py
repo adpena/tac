@@ -14,13 +14,13 @@ broke it (hypothesis shrinks failures to minimal counter-examples).
 """
 from __future__ import annotations
 
-import struct
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
-from hypothesis import HealthCheck, assume, given, settings, strategies as st
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from tac.lossless.frequency_coder import (
     decode_uint16_frequency_stream,
@@ -28,7 +28,6 @@ from tac.lossless.frequency_coder import (
     encode_uint16_frequency_stream,
     encode_uint16_prev_symbol_stream,
 )
-
 
 # ── lossless frequency coder ──────────────────────────────────────────────────
 
@@ -94,7 +93,7 @@ def test_frequency_stream_encoded_bytes_match_payload_count(tokens: list[int]) -
 torch = pytest.importorskip("torch")
 
 
-def _toy_module(in_ch: int, out_ch: int, kernel: int = 3) -> "torch.nn.Module":
+def _toy_module(in_ch: int, out_ch: int, kernel: int = 3) -> torch.nn.Module:
     """Build a tiny conv module with deterministic weights."""
     import torch.nn as nn
     return nn.Sequential(

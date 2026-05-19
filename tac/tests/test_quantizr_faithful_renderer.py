@@ -17,13 +17,9 @@ from tac.quantizr_faithful_renderer import (
     Frame2StaticHead,
     FrameHead,
     JointFrameGenerator,
-    SepConvGNAct,
-    SepResBlock,
-    SharedMaskDecoder,
     build_quantizr_faithful_renderer,
     make_coord_grid,
 )
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # Architectural invariants (the user's audit said these MUST hold)
@@ -469,7 +465,6 @@ def test_inflate_shim_loads_qzs3(tmp_path) -> None:
 # Keep imports needed for the inflate-shim tests at module level so they
 # error early if the path resolves wrong.
 from pathlib import Path  # noqa: E402  (intentional bottom import)
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

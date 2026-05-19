@@ -119,14 +119,14 @@ class StageTimer:
     def start(self) -> StageTimer:
         """Mark stage start. Returns self for chaining."""
         import datetime
-        self.start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.start_iso = datetime.datetime.now(datetime.UTC).isoformat()
         self._start_mono = time.monotonic()
         return self
 
     def stop(self) -> StageTimer:
         """Mark stage end. Returns self for chaining."""
         import datetime
-        self.end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.end_iso = datetime.datetime.now(datetime.UTC).isoformat()
         self.duration_seconds = round(time.monotonic() - self._start_mono, 2)
         return self
 
@@ -170,7 +170,7 @@ def print_cost_estimate(gpu: str, estimated_hours: float, platform: str = "modal
     print(f"  Est. runtime: {estimated_hours:.1f} hours")
     print(f"  Est. cost: ${est.estimated_cost:.2f}")
     if est.is_free_tier:
-        print(f"  (free tier — no charge)")
+        print("  (free tier — no charge)")
 
 
 def collect_replicability_metadata(device: str = "cpu") -> dict[str, Any]:

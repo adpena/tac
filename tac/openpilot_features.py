@@ -109,7 +109,6 @@ def extract_supercombo_features(
         try:
             from tac.openpilot_seeding import (
                 OPENPILOT_SUPERCOMBO_DEFAULT_PATH,
-                SupercomboUnavailable,
                 load_supercombo_model,
             )
 
@@ -185,7 +184,7 @@ class SceneEmbeddingDistiller(nn.Module):
         )
 
     @classmethod
-    def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> "SceneEmbeddingDistiller":
+    def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> SceneEmbeddingDistiller:
         payload = torch.load(Path(path), map_location=map_location)
         model = cls(
             input_dim=int(payload["input_dim"]),
@@ -244,7 +243,7 @@ def _install_scene_embedding_distiller_module() -> None:
 
     tac_pkg = sys.modules.get("tac")
     if tac_pkg is not None:
-        setattr(tac_pkg, "scene_embedding_distiller", module)
+        tac_pkg.scene_embedding_distiller = module
 
 
 _install_scene_embedding_distiller_module()

@@ -44,7 +44,6 @@ from tac.preflight import PreflightError
 from tac.segmap_renderer import SEGMAP_INPUT_SIZE, SegMap, SegMapTrainer
 from tac.training import TrainConfig
 
-
 # ── Mock scorers shaped like upstream PoseNet/SegNet (mirrored from
 #    test_segmap_renderer.py to keep this file self-contained). ──
 

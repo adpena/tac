@@ -31,13 +31,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import re
 import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
 
 # ── Repo layout ──────────────────────────────────────────────────────────────
 
@@ -414,7 +412,7 @@ def run_lane(
     handle: AzureVMHandle,
     lane_script_path: str,
     *,
-    env_vars: Optional[dict] = None,
+    env_vars: dict | None = None,
     remote_workdir: str = "/home/azureuser/pact",
     log_path: str = "/tmp/lane_run.log",
 ) -> tuple[int, str]:

@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "experiments" / "certify_component_sensitivity_maps.py"
 COMPONENTS = ("posenet", "segnet", "combined")

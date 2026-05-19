@@ -11,15 +11,13 @@ the empirical heuristic.
 from __future__ import annotations
 
 import importlib.util
-import json
+import sys
 import zipfile
 from pathlib import Path
 
 import brotli
 import pytest
 import torch
-
-import sys
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
@@ -29,6 +27,7 @@ from experiments.build_qpose_archive import (
     PR67_REFERENCE_MASK_BYTES,
     build_qpose_archive,
 )
+
 from tac.qp1_pose_codec import decode_qp1
 from tac.quantizr_faithful_renderer import build_quantizr_faithful_renderer
 

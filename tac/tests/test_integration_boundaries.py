@@ -7,7 +7,6 @@ These tests verify that data flows correctly BETWEEN components:
   - Archive construction and validation
   - CRF mask encode/decode roundtrip
 """
-import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,7 +96,7 @@ class TestPoseShape(unittest.TestCase):
         Now verifies preflight_check actually rejects wrong-shape poses,
         regression-protecting the catastrophic 1199-overlapping-pairs bug.
         """
-        from tac.preflight import preflight_check, PreflightError
+        from tac.preflight import PreflightError, preflight_check
         # Wrong number of pairs (1199 overlapping vs 600 non-overlapping).
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
             torch.save(torch.randn(1199, 6), f.name)
@@ -127,7 +126,7 @@ class TestArchiveValidation(unittest.TestCase):
 
     def test_valid_archive_passes(self):
         """Archive with all 3 required files passes validation."""
-        from tac.submission_archive import validate_archive, RENDERER_SUBMISSION_MANIFEST
+        from tac.submission_archive import RENDERER_SUBMISSION_MANIFEST, validate_archive
 
         with tempfile.TemporaryDirectory() as td:
             import zipfile
@@ -141,7 +140,7 @@ class TestArchiveValidation(unittest.TestCase):
 
     def test_missing_poses_fails(self):
         """Archive missing optimized_poses.pt fails validation."""
-        from tac.submission_archive import validate_archive, RENDERER_SUBMISSION_MANIFEST
+        from tac.submission_archive import RENDERER_SUBMISSION_MANIFEST, validate_archive
 
         with tempfile.TemporaryDirectory() as td:
             import zipfile
@@ -173,8 +172,8 @@ class TestQATParametrizeNoDoubleWrap(unittest.TestCase):
 
     def test_no_double_parametrization(self):
         """Creating QATRendererFP4 twice on same model doesn't stack."""
-        from tac.renderer import AsymmetricPairGenerator
         from tac.fp4_quantize import QATRendererFP4
+        from tac.renderer import AsymmetricPairGenerator
 
         model = AsymmetricPairGenerator(
             base_ch=8, mid_ch=8, embed_dim=4, depth=1, pose_dim=6,

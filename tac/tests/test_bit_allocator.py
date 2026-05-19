@@ -27,7 +27,6 @@ from tac.bit_allocator import (
     allocation_report,
 )
 
-
 # ── Budget conservation ───────────────────────────────────────────────────
 
 

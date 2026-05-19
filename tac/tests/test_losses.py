@@ -21,7 +21,6 @@ import torch.nn.functional as F
 
 from tac.losses import kl_distill_segnet_only, segnet_uncertainty_weighted_loss
 
-
 # ── Test stub: minimal SegNet-shaped module ─────────────────────────────────
 #
 # `kl_distill_segnet_only` calls `segnet.preprocess_input(fx)` then

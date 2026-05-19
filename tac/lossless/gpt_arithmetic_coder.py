@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import math
-from collections.abc import Callable
 import json
-from pathlib import Path
+import math
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 

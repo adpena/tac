@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
 
 # ── Contest-defined constants (NEVER tune these — they are scoring-rule fixed) ──
 SEG_COEFFICIENT = 100.0  # [contest-defined] upstream/evaluate.py
@@ -189,7 +189,7 @@ def predict_score_band(
     rel_err_pct_per_weight: float,
     n_quantized_layers: int,
     calibration_anchors: list[CalibrationAnchor],
-    distortion_proxy: Optional[DistortionProxy] = None,
+    distortion_proxy: DistortionProxy | None = None,
     band_half_width_score: float = 0.05,  # [heuristic:council-Q1 "0.05 = sane sanity-band width"]
 ) -> ScoreBand:
     """Predict a contest-CUDA score band for a candidate.

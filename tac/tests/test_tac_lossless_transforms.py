@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:

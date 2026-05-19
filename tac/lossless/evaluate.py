@@ -269,7 +269,7 @@ def evaluate_local_submission_contract(
     dataset_name: str = "commaai/commavq",
     num_proc: int | None = None,
     python_executable: str | None = None,
-) -> tuple[LosslessCompressionResult, LosslessVerificationResult, Path, "Callable[[], None] | None"]:
+) -> tuple[LosslessCompressionResult, LosslessVerificationResult, Path, Callable[[], None] | None]:
     """Evaluate a submission archive against the commavq dataset.
 
     Returns (result, verification, decompressed_root, cleanup_fn).
@@ -277,7 +277,6 @@ def evaluate_local_submission_contract(
     after it is done with *decompressed_root* to remove the temporary
     directory.  When *work_dir* is provided, *cleanup_fn* is ``None``.
     """
-    import typing
 
     archive = Path(archive_path).resolve()
     interpreter = python_executable or sys.executable

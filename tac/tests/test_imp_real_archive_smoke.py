@@ -35,7 +35,6 @@ from tac.iterative_magnitude_pruning import (
     prune_lowest_magnitude,
 )
 
-
 _ROOT = Path(__file__).resolve().parents[3]
 _ANCHOR = (
     _ROOT / "experiments" / "results" / "lane_g_v3_landed" / "iter_0" / "renderer.bin"

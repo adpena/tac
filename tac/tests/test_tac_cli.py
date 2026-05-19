@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import tempfile
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-import subprocess
-
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = ROOT / "src"

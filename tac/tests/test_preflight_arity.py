@@ -908,7 +908,8 @@ def test_preflight_training_inputs_catches_gt_video_range(tmp_path) -> None:
     must FAIL — this is the WILDE catastrophe. Frames at TTO-optimized
     range cluster around max ~184."""
     import torch
-    from tac.preflight import preflight_training_inputs, PreflightError
+
+    from tac.preflight import PreflightError, preflight_training_inputs
     # Synthetic GT-video-range frames (max 255, NOT TTO-optimized)
     bad = torch.randint(0, 256, (1200, 384, 512, 3), dtype=torch.uint8).float()
     bad_path = tmp_path / "tto_frames.pt"
@@ -935,7 +936,8 @@ def test_preflight_training_inputs_accepts_tto_optimized_range(tmp_path) -> None
     we only verify the range check itself doesn't raise prematurely).
     """
     import torch
-    from tac.preflight import preflight_training_inputs, PreflightError
+
+    from tac.preflight import PreflightError, preflight_training_inputs
     good = torch.rand(1200, 384, 512, 3) * 184  # TTO-optimized range
     good_path = tmp_path / "tto_frames.pt"
     torch.save(good, good_path)
@@ -964,7 +966,8 @@ def test_preflight_check_rejects_wrong_pair_count_in_poses(tmp_path) -> None:
     """R38 regression: the 1199-overlapping-pairs catastrophe. preflight_check
     must reject pose tensors with the wrong N (not 600 for 600 pairs)."""
     import torch
-    from tac.preflight import preflight_check, PreflightError
+
+    from tac.preflight import PreflightError, preflight_check
     pose_path = tmp_path / "poses.pt"
     torch.save(torch.randn(1199, 6), pose_path)
     with pytest.raises(PreflightError):

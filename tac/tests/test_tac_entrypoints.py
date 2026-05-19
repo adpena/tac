@@ -10,6 +10,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 import sys
+
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -18,9 +19,9 @@ from tac.entrypoints import (
     build_postfilter_meta,
     make_dilated_default_tag,
     make_fixed_h32_segnet_tag,
-    resolve_cloud_asset_bundle,
-    resolve_cloud_asset,
     resolve_cloud_archive_source,
+    resolve_cloud_asset,
+    resolve_cloud_asset_bundle,
     save_best_checkpoint,
     save_final_artifacts,
 )

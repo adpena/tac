@@ -26,18 +26,16 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn as nn
 
 from tac.learnable_pair_weights import (
     LearnablePairWeights,
+    _inverse_softplus,
     compute_pair_weight_dual_update,
-    compute_pair_weighted_primal_loss,
     compute_pair_weight_rate_penalty,
+    compute_pair_weighted_primal_loss,
     load_learnable_pair_weights,
     save_learnable_pair_weights,
-    _inverse_softplus,
 )
-
 
 # ── Module basics (Round 10 buffer-only API) ──────────────────────────────
 

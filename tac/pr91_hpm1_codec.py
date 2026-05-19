@@ -21,13 +21,11 @@ cannot fully decompile. Production replay path is the upstream PR91
 from __future__ import annotations
 
 import hashlib
-import json
-import time
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -43,31 +41,11 @@ except ImportError:  # pragma: no cover
 from tac.pr85_bundle import (
     HPM1_HEADER_BYTES,
     HPM1_MAGIC,
-    Pr85BundleError,
-    Pr85SegmentContract,
-    SEGMENT_ORDER,
-    pack_pr85_bundle,
     parse_hpm1_mask_segment,
     parse_pr85_bundle,
 )
 from tac.pr86_hpac_codec import (
-    DEFAULT_HPAC_PROBABILITY_VARIANT,
-    DEFAULT_PR86_ARCHIVE,
-    EXPECTED_PR86_TOKENS_SHA256,
-    HPACMini,
-    Pr86HpacReplayError,
-    _categorical_from_probs,
-    _group_masks,
-    _normalize_probability_row,
-    collect_dependency_report,
-    decode_tokens_hpac,
-    encode_symbols_hpac_with_prev_context,
-    encode_tokens_hpac,
-    load_hpac_model_from_ppmd,
-    read_pr86_archive,
-    resolve_hpac_probability_variant,
     sha256_bytes,
-    supported_hpac_probability_variant_names,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

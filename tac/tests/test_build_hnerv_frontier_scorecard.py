@@ -5,7 +5,6 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import pytest
-
 from experiments.build_hnerv_frontier_scorecard import (
     followup_targets,
     inspect_single_member_archive,

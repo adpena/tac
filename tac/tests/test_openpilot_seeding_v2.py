@@ -13,9 +13,7 @@ V2 fixes 8 issues identified in the V1 audit:
 """
 from __future__ import annotations
 
-import importlib.util
 import logging
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +40,6 @@ from tac.openpilot_seeding import (
     infer_pose_from_video,
     seed_pose_tto,
 )
-
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "experiments" / "seed_poses_from_openpilot.py"

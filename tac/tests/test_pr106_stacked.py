@@ -586,7 +586,6 @@ def test_apply_yshift_no_op_with_zero_row():
 def test_apply_lrl1_no_op_with_zero_coeffs():
     """All-zero coeffs yield identity correction (no pixel change)."""
     inflate = _load_inflate()
-    import torch
     K, low_h, low_w = 4, 48, 64
     H, W = 32, 32  # smaller test frame for speed
     rng = np.random.default_rng(seed=33)

@@ -259,7 +259,7 @@ def _load_next_frame_runtime(
 def _next_frame_runtime_metadata(model: object) -> dict[str, object]:
     payload = gpt_model_runtime_metadata(model)
     if hasattr(model, "_tac_model_profile"):
-        payload["model_profile"] = getattr(model, "_tac_model_profile")
+        payload["model_profile"] = model._tac_model_profile
     return payload
 
 

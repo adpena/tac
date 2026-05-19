@@ -8,14 +8,12 @@ under those conditions is the bug this module prevents.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from tac.predictor.score_band import (
     CalibrationAnchor,
-    ScoreBand,
     fit_distortion_curve,
     load_calibration_anchors,
     predict_score_band,

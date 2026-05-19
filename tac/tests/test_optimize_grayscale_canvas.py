@@ -14,8 +14,6 @@ script + auth eval — these tests cover the math + interfaces only.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn as nn
@@ -31,7 +29,6 @@ from tac.optimize_grayscale_canvas import (
     OptimizeConfig,
     _gaussian_softmax_soft,
     _gray_logits_to_continuous,
-    _render_pair_from_logits,
     _soft_embedding_lookup,
     _ste_round_clamp,
     _validate_device,
@@ -39,7 +36,6 @@ from tac.optimize_grayscale_canvas import (
     optimize_grayscale_canvas,
 )
 from tac.preflight import PreflightError
-
 
 # ── device validation ────────────────────────────────────────────────────
 

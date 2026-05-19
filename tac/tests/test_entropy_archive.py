@@ -27,7 +27,6 @@ from tac.entropy_archive import (
     quantize_weights,
 )
 
-
 # ── compress_byte_stream / decompress_byte_stream (LOSSLESS) ──────────────
 
 

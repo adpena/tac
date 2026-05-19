@@ -6,8 +6,6 @@ import numpy as np
 import pytest
 import torch
 
-import numpy as np
-
 from tac.sjkl_basis import (
     SJKLBasis,
     apply_sjkl_residual,

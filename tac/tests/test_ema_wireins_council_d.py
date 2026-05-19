@@ -21,7 +21,6 @@ Per CLAUDE.md "EMA — NON-NEGOTIABLE" + the audit's recommended fix list
 from __future__ import annotations
 
 import ast
-import importlib
 import inspect
 from pathlib import Path
 
@@ -172,7 +171,6 @@ def test_check_88_detects_missing_ema_in_synthetic_script(tmp_path: Path) -> Non
     """Negative test: a fresh training script with optimizer.step() but no
     EMA must be flagged by Check 88."""
     from tac.preflight import (
-        MetaBugViolation,
         check_training_paths_use_ema_correctly,
     )
     # Build a synthetic repo with one offender.
@@ -299,6 +297,7 @@ def test_ema_does_not_mutate_live_model_on_update() -> None:
     that EMA back-shadowed the live model — this test rules that out.
     """
     import torch
+
     from tac.training import EMA
     model = torch.nn.Linear(4, 4)
     pre_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -356,7 +355,7 @@ _AST_TEST_SKIP = {
 
 
 def _find_optimizer_step_then_ema_update_order(
-    tree: "ast.Module",
+    tree: ast.Module,
 ) -> tuple[bool, str]:
     """AST walk: for each function body containing both `optimizer.step()`
     (or `*.step()` with a recognised receiver name) and `ema.update(...)`,
@@ -431,12 +430,12 @@ def test_ema_update_called_after_optimizer_step_via_ast() -> None:
         if not ok:
             failures.append(f"{rel}: {msg}")
     assert not failures, (
-        f"EMA ordering violations (must be optimizer.step → ema.update):\n  "
+        "EMA ordering violations (must be optimizer.step → ema.update):\n  "
         + "\n  ".join(failures)
     )
 
 
-def _find_ema_constructor_decay_arg(tree: "ast.Module") -> list[tuple[int, str]]:
+def _find_ema_constructor_decay_arg(tree: ast.Module) -> list[tuple[int, str]]:
     """Walk AST for `EMA(model, decay=<X>)` constructor calls. Return list
     of (lineno, decay_repr) for each EMA(...) call, where decay_repr is
     either:
@@ -473,7 +472,6 @@ def _find_ema_constructor_decay_arg(tree: "ast.Module") -> list[tuple[int, str]]
 
 def _decay_repr(decay_kw) -> str:
     """Reduce an AST keyword node to a string we can pattern-match against."""
-    import ast
 
     if decay_kw is None:
         return "<missing>"
@@ -540,7 +538,7 @@ def test_ema_decay_is_quantizr_canonical_via_ast() -> None:
                     f"named .ema_decay."
                 )
     assert not failures, (
-        f"EMA decay constructor violations:\n  " + "\n  ".join(failures)
+        "EMA decay constructor violations:\n  " + "\n  ".join(failures)
     )
 
 
@@ -575,7 +573,7 @@ def test_ema_decay_is_quantizr_canonical_via_ast() -> None:
 
 
 def _has_ema_caller_responsible_marker(
-    text: str, fn: "ast.FunctionDef | ast.AsyncFunctionDef",
+    text: str, fn: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> bool:
     """Return True if `fn` carries the `# EMA-CALLER-RESPONSIBLE:` marker
     on its def-line OR within the first 3 lines of its body (using the
