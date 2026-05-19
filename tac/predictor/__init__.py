@@ -9,6 +9,14 @@ This module replaces the rate-only `predicted_score_band` lookup that drove the
 apogee_int4 8x miss (predicted [0.155, 0.180]; landed 1.4287 [contest-CUDA]).
 """
 
+from tac.predictor.distortion_proxy_local import (
+    MAX_EXTRAPOLATION_MULTIPLIER,
+    ProxyFit,
+    fit_proxy,
+    make_distortion_proxy,
+    make_distortion_proxy_from_file,
+    predict_distortion,
+)
 from tac.predictor.score_band import (
     CalibrationAnchor,
     DistortionProxy,
@@ -19,10 +27,18 @@ from tac.predictor.score_band import (
 )
 
 __all__ = [
+    # score_band public API
     "CalibrationAnchor",
     "DistortionProxy",
     "ScoreBand",
     "fit_distortion_curve",
     "load_calibration_anchors",
     "predict_score_band",
+    # distortion_proxy_local public API
+    "MAX_EXTRAPOLATION_MULTIPLIER",
+    "ProxyFit",
+    "fit_proxy",
+    "make_distortion_proxy",
+    "make_distortion_proxy_from_file",
+    "predict_distortion",
 ]
