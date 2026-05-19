@@ -21,7 +21,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from tools import lane_maturity as lm
 
 REPO = Path(__file__).resolve().parents[3]
@@ -427,7 +426,7 @@ def test_check_90_passes_on_real_registry():
 
 def test_check_90_strict_raises_on_inconsistent_registry(tmp_path, monkeypatch):
     """Check 90 must RAISE MetaBugViolation when registry is inconsistent."""
-    from tac.preflight import check_lane_registry_consistent, MetaBugViolation
+    from tac.preflight import MetaBugViolation, check_lane_registry_consistent
     repo = _make_repo(tmp_path, [
         {"id": "lane_bad", "name": "Bad", "phase": 1, "level": 3,  # wrong
          "gates": _empty_gates(), "notes": ""}

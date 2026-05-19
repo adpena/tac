@@ -72,6 +72,7 @@ def train():
         sys.path.insert(0, "/app/src")
         sys.path.insert(0, "/upstream")
         import torch
+
         from tac.data import decode_archive, decode_video
         print("Precomputing frames...")
         comp = decode_archive(archive_path)

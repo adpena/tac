@@ -37,7 +37,6 @@ from tac.lora_pose import (
 )
 from tac.submission_archive import load_optimized_poses
 
-
 # ── Forward correctness ──────────────────────────────────────────────────
 
 

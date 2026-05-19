@@ -21,7 +21,6 @@ from tac.semantic_quantization import (
     semantic_adaptive_quantize,
 )
 
-
 # ── quantize_tensor (uniform symmetric) ───────────────────────────────────
 
 

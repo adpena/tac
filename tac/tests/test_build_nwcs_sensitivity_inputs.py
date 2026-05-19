@@ -15,7 +15,6 @@ from tac.component_sensitivity_artifact import (
 )
 from tac.neural_weight_corpus import build_corpus_manifest, write_corpus_manifest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "experiments" / "build_nwcs_sensitivity_inputs.py"
 

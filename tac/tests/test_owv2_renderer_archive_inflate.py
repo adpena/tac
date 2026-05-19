@@ -33,7 +33,6 @@ Anchor: ``experiments/results/lane_g_v3_landed/iter_0/renderer.bin``
 """
 from __future__ import annotations
 
-import sys
 from importlib import util as importlib_util
 from pathlib import Path
 
@@ -49,7 +48,6 @@ from tac.owv2_renderer_archive import (
     is_owv2_archive,
 )
 from tac.renderer_export import load_renderer_checkpoint
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ANCHOR_PATH = (

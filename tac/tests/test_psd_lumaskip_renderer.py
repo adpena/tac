@@ -15,7 +15,6 @@ import torch.nn as nn
 
 from tac.psd_lumaskip_renderer import PSDLumaSkipPostFilter
 
-
 # ──────────────────────────────────────────────────────────────────────────
 # Test fixtures
 # ──────────────────────────────────────────────────────────────────────────
@@ -321,7 +320,7 @@ def test_ema_compatibility():
 
 def test_variants_registry_wires_psd_lumaskip():
     """``build_postfilter('psd_lumaskip', ...)`` returns a PSDLumaSkipPostFilter."""
-    from tac.architectures import build_postfilter, VARIANTS
+    from tac.architectures import VARIANTS, build_postfilter
 
     assert "psd_lumaskip" in VARIANTS
     model = build_postfilter("psd_lumaskip", hidden=32, kernel=3)

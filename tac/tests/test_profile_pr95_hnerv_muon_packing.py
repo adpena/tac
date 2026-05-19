@@ -9,7 +9,6 @@ from pathlib import Path
 
 import brotli
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOL_PATH = REPO_ROOT / "experiments" / "profile_pr95_hnerv_muon_packing.py"
 spec = importlib.util.spec_from_file_location("profile_pr95_hnerv_muon_packing", TOOL_PATH)
@@ -21,6 +20,7 @@ assert spec.loader is not None
 # `sys.modules.get(cls.__module__).__dict__`, which raises AttributeError on
 # None when the module isn't registered yet.
 import sys as _sys
+
 _sys.modules["profile_pr95_hnerv_muon_packing"] = tool
 spec.loader.exec_module(tool)
 

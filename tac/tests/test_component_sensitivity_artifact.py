@@ -13,7 +13,6 @@ from tac.component_sensitivity_artifact import (
     write_component_sensitivity_manifest,
 )
 
-
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64

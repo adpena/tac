@@ -7,7 +7,6 @@ import torch.nn as nn
 
 from tac.experiments import train_renderer
 
-
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "remote_lane_t2drop_bootstrap.sh"
 

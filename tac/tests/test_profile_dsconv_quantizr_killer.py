@@ -28,7 +28,6 @@ Cost paranoia: zero GPU dollars wasted on a misconfigured 12h run.
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -42,7 +41,7 @@ REPO = Path(__file__).resolve().parents[3]
 def test_dsconv_quantizr_killer_profile_registered() -> None:
     """The profile MUST be in PROFILES dict so --profile dsconv_quantizr_killer
     works. If this fails, the bootstrap script will SystemExit before launch."""
-    from tac.profiles import PROFILES, DSCONV_QUANTIZR_KILLER
+    from tac.profiles import DSCONV_QUANTIZR_KILLER, PROFILES
 
     assert "dsconv_quantizr_killer" in PROFILES, (
         "DSCONV_QUANTIZR_KILLER not registered in PROFILES dict. "
@@ -381,7 +380,7 @@ def test_build_renderer_returns_pair_generator() -> None:
     (NOT AsymmetricPairGenerator). The renderer_export FP4A path supports
     both pair_modes."""
     from tac.profiles import DSCONV_QUANTIZR_KILLER
-    from tac.renderer import build_renderer, PairGenerator, AsymmetricPairGenerator
+    from tac.renderer import AsymmetricPairGenerator, PairGenerator, build_renderer
 
     p = DSCONV_QUANTIZR_KILLER
     model = build_renderer(
@@ -405,5 +404,5 @@ def test_build_renderer_returns_pair_generator() -> None:
         f"expected PairGenerator (use_zoom_flow=False), got {type(model).__name__}"
     )
     assert not isinstance(model, AsymmetricPairGenerator), (
-        f"PairGenerator path should NOT route to AsymmetricPairGenerator"
+        "PairGenerator path should NOT route to AsymmetricPairGenerator"
     )

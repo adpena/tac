@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-
 MANIFEST_SCHEMA_VERSION = 1
 DEFAULT_STATE_DICT_KEYS = ("model_state_dict", "state_dict", "model")
 TENSOR_INCLUDE_REASON = "selected_weight_tensor"

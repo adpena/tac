@@ -9,8 +9,8 @@ from pathlib import Path
 
 from src.comma_lab import cli
 from src.comma_lab.scheduler.registry import load_platform_registry
-from src.comma_lab.scheduler.repository import collect_run_records
 from src.comma_lab.scheduler.reporting import build_budget_report
+from src.comma_lab.scheduler.repository import collect_run_records
 
 
 def write_json(path: Path, payload: object) -> None:

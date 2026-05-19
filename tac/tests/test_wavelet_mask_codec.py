@@ -6,7 +6,6 @@ import torch
 
 from tac.wavelet_mask_codec import (
     WAVELET_MAGIC,
-    WAVELET_VERSION,
     WaveletConfig,
     decode_wavelet_codec,
     dequantize_subband,

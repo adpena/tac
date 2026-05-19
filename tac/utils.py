@@ -9,10 +9,9 @@ from __future__ import annotations
 import atexit
 import json
 import signal
-import subprocess
 import sys
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -185,7 +184,7 @@ def record_finding(category: str, title: str, body: str,
         variant: Model variant if applicable
         tags: Comma-separated tags
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     # DuckDB
     con = _get_research_db()
@@ -229,7 +228,7 @@ def record_run(variant: str, platform: str, epoch: int,
         tag: Run tag
         notes: Free-text notes
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     # DuckDB
     con = _get_research_db()
@@ -273,7 +272,7 @@ def record_council(session_type: str, title: str, body: str,
         body: Full council output
         file_path: Path where output was also saved (if any)
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     con = _get_research_db()
     if con:
         try:

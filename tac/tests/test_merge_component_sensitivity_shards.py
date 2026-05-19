@@ -24,8 +24,8 @@ from experiments.profile_component_sensitivity import (
     _channel_ref_payload,
     _channel_ref_sha256,
 )
-from tac.sensitivity_map import load_sensitivity_map, save_sensitivity_map
 
+from tac.sensitivity_map import load_sensitivity_map, save_sensitivity_map
 
 ALL_REFS = [
     ("layer0.weight", 0),

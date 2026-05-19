@@ -13,7 +13,6 @@ from tac.preflight import (
     check_shell_scripts_syntax_clean,
 )
 
-
 # ---------------- Check 67 (python-files-compile) ----------------
 
 def _py_repo(tmp_path: Path) -> Path:

@@ -79,11 +79,10 @@ References
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
-
 
 # ── magic / version (no archive bytes; for report headers only) ─────────
 

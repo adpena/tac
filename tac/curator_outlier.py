@@ -202,7 +202,7 @@ class CuratorOutlierScorer:
         )
 
     @classmethod
-    def load(cls, path: Path) -> "CuratorOutlierScorer":
+    def load(cls, path: Path) -> CuratorOutlierScorer:
         state = torch.load(Path(path), map_location="cpu", weights_only=False)
         scorer = cls(
             n_pca_components=state["n_pca_components"],

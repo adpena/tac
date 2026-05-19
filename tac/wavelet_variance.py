@@ -43,12 +43,8 @@ loss functions (e.g. boundary-weighted L∞) without circular imports.
 
 from __future__ import annotations
 
-import math
-from typing import Tuple
-
 import torch
 import torch.nn.functional as F
-
 
 __all__ = ["db4_kernels", "wavelet_variance_map"]
 
@@ -56,7 +52,7 @@ __all__ = ["db4_kernels", "wavelet_variance_map"]
 # ── Daubechies-4 (db4) coefficients — 8-tap, 4 vanishing moments ────────
 # Source: Daubechies, "Ten Lectures on Wavelets" (1992), Table 6.1.
 # Cross-checked against PyWavelets `pywt.Wavelet('db4').dec_lo`.
-_DB4_LO: Tuple[float, ...] = (
+_DB4_LO: tuple[float, ...] = (
     -0.010597401784997278,
      0.032883011666982945,
      0.030841381835986965,
@@ -68,7 +64,7 @@ _DB4_LO: Tuple[float, ...] = (
 )
 
 
-def _qmf_high(lo: Tuple[float, ...]) -> Tuple[float, ...]:
+def _qmf_high(lo: tuple[float, ...]) -> tuple[float, ...]:
     """Quadrature-mirror high-pass derived from the low-pass filter.
 
     Standard orthonormal-wavelet construction: g[n] = (-1)^n * h[N-1-n].
@@ -80,7 +76,7 @@ def _qmf_high(lo: Tuple[float, ...]) -> Tuple[float, ...]:
     return tuple((-1.0) ** n * lo[N - 1 - n] for n in range(N))
 
 
-_DB4_HI: Tuple[float, ...] = _qmf_high(_DB4_LO)
+_DB4_HI: tuple[float, ...] = _qmf_high(_DB4_LO)
 
 
 # Cache of pre-built kernel tensors keyed by (dtype, device) so callers

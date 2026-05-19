@@ -27,7 +27,7 @@ import fcntl
 import json
 import os
 import socket
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +56,7 @@ def tracker_path(repo_root: Path | None = None) -> Path:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _load_records(path: Path) -> list[dict[str, Any]]:

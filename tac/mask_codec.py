@@ -36,7 +36,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from tac.camera import FRAME_H as SEGNET_H, FRAME_W as SEGNET_W, NUM_CLASSES
+from tac.camera import FRAME_H as SEGNET_H
+from tac.camera import FRAME_W as SEGNET_W
+from tac.camera import NUM_CLASSES
 
 
 def _resolve_ffmpeg_candidate(value: str) -> str | None:

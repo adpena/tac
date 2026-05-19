@@ -160,7 +160,7 @@ def test_warp_inverse_validates_indices_within_bounds() -> None:
 def test_preflight_catches_mask_half_sim_without_zoom_flow() -> None:
     """A profile setting mask_half_sim_prob > 0 without use_zoom_flow=True
     is dead-weight compute (the renderer can't consume the flow signal)."""
-    from tac.preflight import preflight_profiles, PreflightError
+    from tac.preflight import PreflightError, preflight_profiles
     from tac.profiles import PROFILES
 
     # Inject a bad profile temporarily

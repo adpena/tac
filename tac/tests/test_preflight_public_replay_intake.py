@@ -15,7 +15,6 @@ import pytest
 
 from tac.pr85_bundle import SEGMENT_ORDER, pack_pr85_bundle
 
-
 brotli = pytest.importorskip("brotli")
 
 REPO = Path(__file__).resolve().parents[3]

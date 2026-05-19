@@ -22,30 +22,30 @@ from tac.preflight import (
     _scan_python_for_eval_roundtrip_false,
     _scan_python_for_mps_fallback,
     _scan_python_for_pack_sparse_delta_approved,
+    _scan_remote_script_for_nvdec_probe,
     _scan_remote_script_for_plain_cmg3a_dispatch,
     _scan_remote_script_for_plain_pmg_dispatch,
-    _scan_remote_script_for_nvdec_probe,
-    _scan_submission_for_provider_or_cpu_score_leakage,
     _scan_shell_for_missing_set_e,
     _scan_shell_for_pipefail_grep_q,
     _scan_shell_for_zip_binary,
+    _scan_submission_for_provider_or_cpu_score_leakage,
     _scan_training_script_for_auth_eval,
-    check_no_active_mcp_server_config,
-    check_no_compromised_lightning_supply_chain,
-    check_no_live_mcp_processes,
+    check_cmg3a_remote_dispatch_requires_pose_safety,
+    check_inflate_sh_handles_br_centrally,
     check_lightning_exact_eval_runner_bootstraps_dali,
     check_lightning_ssh_static_policy,
-    check_cmg3a_remote_dispatch_requires_pose_safety,
-    check_pmg_remote_dispatch_requires_geometry_escape,
-    check_inflate_sh_handles_br_centrally,
+    check_no_active_mcp_server_config,
+    check_no_compromised_lightning_supply_chain,
     check_no_disable_eval_roundtrip_flag,
     check_no_eval_roundtrip_false,
+    check_no_live_mcp_processes,
     check_no_mps_fallback_default,
     check_no_pack_sparse_delta_approved_outside_promotion_tool,
     check_no_pipefail_grep_q_trap,
     check_no_scorer_load_at_inflate,
-    check_no_submission_provider_or_cpu_score_leakage,
     check_no_shell_zip_binary,
+    check_no_submission_provider_or_cpu_score_leakage,
+    check_pmg_remote_dispatch_requires_geometry_escape,
     check_public_release_hygiene,
     check_remote_scripts_have_nvdec_probe,
     check_shell_set_e_present,
@@ -2121,6 +2121,7 @@ class TestPreflightAllInvokesMetaBugChecks:
 
     def test_preflight_all_invokes_all_meta_bug_checks(self) -> None:
         import inspect
+
         import tac.preflight as pf
 
         # Source-grep preflight_all to verify each check is referenced.
@@ -2173,6 +2174,7 @@ class TestPreflightAllInvokesMetaBugChecks:
         the check back to warn-only.
         """
         import inspect
+
         import tac.preflight as pf
 
         src = inspect.getsource(pf.preflight_all)
@@ -2668,6 +2670,7 @@ class TestEvalRoundtripGate:
 
     def test_true_with_env_present_warns(self, capsys) -> None:
         import os
+
         from tac.eval_roundtrip_gate import enforce_eval_roundtrip
 
         os.environ["TAC_ALLOW_NO_ROUNDTRIP"] = "1"
@@ -2682,6 +2685,7 @@ class TestEvalRoundtripGate:
 
     def test_false_with_env_present_warns_and_proceeds(self, capsys) -> None:
         import os
+
         from tac.eval_roundtrip_gate import enforce_eval_roundtrip
 
         os.environ["TAC_ALLOW_NO_ROUNDTRIP"] = "1"
@@ -2703,6 +2707,7 @@ class TestEvalRoundtripGate:
 
     def test_provenance_written_when_output_dir_given(self, tmp_path: Path) -> None:
         import json
+
         from tac.eval_roundtrip_gate import enforce_eval_roundtrip
 
         out = tmp_path / "run_dir"
@@ -3316,6 +3321,15 @@ class TestArchiveBuildersUseDeterministicZip:
 
 
 from tac.preflight import (
+    _scan_doc_for_untagged_scores,
+    _scan_for_cpu_fallback_in_subagent_prompts,
+    _scan_for_halfframe_without_trained_profile,
+    _scan_for_uniward_delta_without_attestation,
+    _scan_for_unspecific_waivers,
+    _scan_for_vastai_prompt_no_cost_cap,
+    _scan_python_for_vastai_create_no_label,
+    _scan_python_for_vastai_create_no_tracker,
+    _scan_test_file_for_dead_imports,
     check_halfframe_archive_uses_trained_profile,
     check_inflate_scorer_load_has_runtime_banner,
     check_profile_keys_have_resolvers,
@@ -3328,17 +3342,7 @@ from tac.preflight import (
     check_vastai_create_writes_tracker,
     check_vastai_prompts_have_cost_cap,
     check_waivers_specify_env_gate,
-    _scan_doc_for_untagged_scores,
-    _scan_for_cpu_fallback_in_subagent_prompts,
-    _scan_for_halfframe_without_trained_profile,
-    _scan_for_uniward_delta_without_attestation,
-    _scan_for_unspecific_waivers,
-    _scan_for_vastai_prompt_no_cost_cap,
-    _scan_python_for_vastai_create_no_label,
-    _scan_python_for_vastai_create_no_tracker,
-    _scan_test_file_for_dead_imports,
 )
-
 
 # ─── Check A: Vast.ai create instance must include --label ──────────────────
 
@@ -3802,8 +3806,8 @@ class TestNewMetaBugChecksSmoke:
 
 
 from tac.preflight import (
-    check_kl_div_reduction_correct,
     _scan_python_for_kl_div_batchmean,
+    check_kl_div_reduction_correct,
 )
 
 
@@ -3999,8 +4003,8 @@ class TestKlDivReductionCorrect:
 
 
 from tac.preflight import (
-    check_no_silent_auto_discovery_with_warn,
     _scan_python_for_silent_auto_discovery,
+    check_no_silent_auto_discovery_with_warn,
 )
 
 
@@ -4193,7 +4197,6 @@ class TestNoSilentAutoDiscoveryWithWarn:
         """Specific regression test: `experiments/qat_finetune.py` must NOT
         be flagged after the Bug 1 fix (the pre-fix file WOULD have been
         flagged). This is the one offender we fixed in the same patch."""
-        from pathlib import Path as _P
         from tac.preflight import REPO_ROOT
         target = REPO_ROOT / "experiments" / "qat_finetune.py"
         assert target.exists(), f"qat_finetune.py missing: {target}"

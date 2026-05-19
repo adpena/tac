@@ -16,11 +16,10 @@ import pytest
 
 from tac.preflight import (
     MetaBugViolation,
+    check_deploy_script_profiles_exist_in_registry,
     check_no_orphan_src_tac_modules,
     check_profile_loss_modes_in_validator_allowlist,
-    check_deploy_script_profiles_exist_in_registry,
 )
-
 
 # ── Check 48: orphan src/tac modules ─────────────────────────────────────────
 

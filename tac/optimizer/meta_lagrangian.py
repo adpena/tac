@@ -35,24 +35,22 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tac.predictor.score_band import (  # noqa: E402
-    PR106_TOTAL_RATE_DENOM,
     POSE_COEFFICIENT_SQRT_INNER,
+    PR106_TOTAL_RATE_DENOM,
     RATE_COEFFICIENT,
     SEG_COEFFICIENT,
     CalibrationAnchor,
     ScoreBand,
-    load_calibration_anchors,
     predict_score_band,
 )
-
 
 # ── Contest score reproduction (matches upstream/evaluate.py) ─────────────
 
@@ -154,8 +152,8 @@ class MetaLagrangianSearch:
         self,
         calibration_anchors: list[CalibrationAnchor],
         distortion_proxy: DistortionProxy,
-        constraints: Optional[LagrangianConstraints] = None,
-        sanity_gate: Optional[Callable[..., object]] = None,
+        constraints: LagrangianConstraints | None = None,
+        sanity_gate: Callable[..., object] | None = None,
     ) -> None:
         self.anchors = calibration_anchors
         self.proxy = distortion_proxy
@@ -171,8 +169,8 @@ class MetaLagrangianSearch:
         rel_err_pct: float,
         n_layers: int,
         lane_class: str,
-        archive_path: Optional[Path] = None,
-        sanity_predicted_band: Optional[tuple[float, float]] = None,
+        archive_path: Path | None = None,
+        sanity_predicted_band: tuple[float, float] | None = None,
     ) -> CandidateEvaluation:
         ev = CandidateEvaluation(
             candidate_id=candidate_id,

@@ -53,12 +53,11 @@ import torch
 import torch.nn as nn
 
 from tac.darts import (
+    DARTSAlphaTrajectory,
     DARTSAnnealSchedule,
     DARTSCell,
-    DARTSAlphaTrajectory,
     DARTSOptimizer,
 )
-
 
 __all__ = [
     "GhostConvVariant",

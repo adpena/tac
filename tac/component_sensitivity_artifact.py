@@ -10,12 +10,11 @@ import hashlib
 import json
 import math
 import re
-from copy import deepcopy
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from numbers import Real
 from pathlib import Path
 from typing import Any
-
 
 COMPONENT_SENSITIVITY_FORMAT = "component_sensitivity_v1"
 COMPONENT_SENSITIVITY_SCHEMA_VERSION = 1

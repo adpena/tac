@@ -16,10 +16,10 @@ builder = importlib.util.module_from_spec(spec)
 sys.modules["build_sjkl_residual"] = builder
 spec.loader.exec_module(builder)
 
-from tac.sjkl_basis import decode_full_sjkl_payload, decode_sjkl_alpha_block  # noqa: E402
-
 import brotli  # noqa: E402
 import numpy as np  # noqa: E402
+
+from tac.sjkl_basis import decode_full_sjkl_payload, decode_sjkl_alpha_block  # noqa: E402
 
 
 def _run_cpu_stub_build(tmp_path, *, rank=4, n_pairs=16, alpha_bits=4, basis_quant_bits=6, seed=42, max_bytes=32768):

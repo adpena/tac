@@ -12,14 +12,20 @@ QZS3 payload deployed in PR #67's rank-1 archive.
 from __future__ import annotations
 
 import importlib.util
-import subprocess
 import struct
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
 import pytest
 import torch
+from experiments.repack_quantizr_faithful_qzs3_archive import (
+    RENDERER_CODEC_QZS3,
+    RENDERER_CODEC_QZS4,
+    build_archive,
+    build_submission_archive,
+)
 
 from tac.quantizr_faithful_renderer import build_quantizr_faithful_renderer
 from tac.quantizr_qzs3_codec import (
@@ -29,13 +35,6 @@ from tac.quantizr_qzs3_codec import (
     encode_qzs4_block_search_state_dict,
     qzs3_qv_specs,
 )
-from experiments.repack_quantizr_faithful_qzs3_archive import (
-    RENDERER_CODEC_QZS3,
-    RENDERER_CODEC_QZS4,
-    build_archive,
-    build_submission_archive,
-)
-
 
 PR67_INFLATE = (
     Path(__file__).resolve().parents[3]

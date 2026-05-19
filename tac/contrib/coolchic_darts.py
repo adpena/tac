@@ -62,12 +62,11 @@ import torch.nn as nn
 
 from tac.contrib.coolchic_renderer import CoolChicLatentRenderer
 from tac.darts import (
-    DARTSAnnealSchedule,
     DARTSAlphaTrajectory,
+    DARTSAnnealSchedule,
     DARTSCell,
     DARTSOptimizer,
 )
-
 
 __all__ = [
     "COOLCHIC_HIDDEN_CANDIDATES",

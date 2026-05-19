@@ -27,9 +27,7 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import json
-import math
 import struct
 from typing import Any
 
@@ -1153,7 +1151,7 @@ def swap_renderer_convs_with_self_compress(
     }
 
 
-def list_self_compress_layers(model: nn.Module) -> list[tuple[str, "SelfCompressingConv2d"]]:
+def list_self_compress_layers(model: nn.Module) -> list[tuple[str, SelfCompressingConv2d]]:
     """Return the list of (qualified_name, layer) for SC layers in model."""
     out: list[tuple[str, SelfCompressingConv2d]] = []
     for name, module in model.named_modules():

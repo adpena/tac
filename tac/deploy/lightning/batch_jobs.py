@@ -10,8 +10,8 @@ No human logs are parsed for scores here.
 """
 from __future__ import annotations
 
-import dataclasses
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -21,8 +21,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any
 
 try:
     import fcntl

@@ -14,7 +14,6 @@ from tac.tto import (
     test_time_optimize,
 )
 
-
 # ---- Helpers ---- #
 
 def _make_frames(n: int = 8, h: int = 64, w: int = 64) -> torch.Tensor:

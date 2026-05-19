@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
-import time
 import textwrap
+import time
 from pathlib import Path
 
 from tac import preflight
-
 
 REPO = Path(__file__).resolve().parents[3]
 

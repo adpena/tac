@@ -43,7 +43,6 @@ from tac.pose_delta_codec_v2 import (
 )
 from tac.submission_archive import load_optimized_poses
 
-
 _REPO = Path(__file__).resolve().parents[3]
 _COMPRESS_ARCHIVE_PATH = (
     _REPO / "submissions" / "robust_current" / "compress_archive.py"

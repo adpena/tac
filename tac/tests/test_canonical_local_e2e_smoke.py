@@ -10,8 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 REPO = Path(__file__).resolve().parents[3]
 SMOKE_TOOL = REPO / "experiments/canonical_local_auth_eval_smoke.py"
 DEFAULT_FIXTURE = REPO / "experiments/results/lane_g_v3_landed/archive_lane_g_v3.zip"

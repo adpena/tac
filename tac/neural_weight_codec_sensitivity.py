@@ -51,9 +51,7 @@ import torch.nn.functional as F
 from tac.neural_weight_codec import (
     WeightCodec,
     WeightCodecConfig,
-    tensor_to_blocks,
 )
-
 
 __all__ = [
     "NWCS_RENDERER_MAGIC",
@@ -102,7 +100,7 @@ class NWCSRendererTensorEntry:
         dtype: str | None = None,
         original_dtype: str | None = None,
         block_metadata: dict[str, Any] | None = None,
-    ) -> "NWCSRendererTensorEntry":
+    ) -> NWCSRendererTensorEntry:
         """Build metadata for an already encoded per-tensor NWCS blob.
 
         This helper does not encode the tensor. It records the original tensor
@@ -773,7 +771,7 @@ class SensitivityAwareWeightCodec(WeightCodec):
         device: str | torch.device = "cpu",
         log_interval: int = 100,
         seed: int = 1234,
-    ) -> tuple["SensitivityAwareWeightCodec", list[float]]:
+    ) -> tuple[SensitivityAwareWeightCodec, list[float]]:
         """Train the codec with importance-weighted reconstruction loss.
 
         High-sensitivity blocks (top quartile by default) get an extra

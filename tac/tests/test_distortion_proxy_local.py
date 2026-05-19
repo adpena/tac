@@ -24,18 +24,15 @@ from pathlib import Path
 import pytest
 
 from tac.predictor import (
+    MAX_EXTRAPOLATION_MULTIPLIER,
     CalibrationAnchor,
     DistortionProxy,
-    MAX_EXTRAPOLATION_MULTIPLIER,
-    ProxyFit,
     fit_proxy,
-    load_calibration_anchors,
     make_distortion_proxy,
     make_distortion_proxy_from_file,
     predict_distortion,
     predict_score_band,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures: canonical calibration anchors (mirror test_score_band_predictor.py).

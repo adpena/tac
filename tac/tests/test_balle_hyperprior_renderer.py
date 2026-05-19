@@ -29,7 +29,6 @@ from tac.balle_hyperprior_renderer import (
     static_factorised_rate_bits,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 1: encode → decode round-trip preserves all weights
 # ─────────────────────────────────────────────────────────────────────────────

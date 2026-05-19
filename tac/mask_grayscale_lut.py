@@ -45,7 +45,6 @@ from typing import Final
 import torch
 import torch.nn.functional as F
 
-
 # CLASS_TO_GRAY mirror of Selfcomp/inflate.py CLASS_TARGETS = [0, 255, 64, 192, 128].
 # The list-index is the class id; we publish a dict for explicit lookup.
 CLASS_TO_GRAY: Final[dict[int, int]] = {

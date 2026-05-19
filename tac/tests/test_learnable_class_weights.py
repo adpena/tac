@@ -26,7 +26,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn as nn
 
 from tac.learnable_class_weights import (
     LearnableClassWeights,
@@ -36,7 +35,6 @@ from tac.learnable_class_weights import (
     load_learnable_class_weights,
     save_learnable_class_weights,
 )
-
 
 # ── Module basics (Round 10 buffer-only API) ─────────────────────────────
 

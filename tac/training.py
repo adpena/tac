@@ -44,7 +44,6 @@ from .losses import (
     kl_distill_scorer_loss,
     posenet_embedding_loss,
     saliency_reconstruction_loss,
-
     scorer_forward_pair,
     scorer_loss,
     scorer_loss_cached,
@@ -784,7 +783,7 @@ class Trainer:
         # VP saliency prior: pre-compute the spatial weight map once
         self._vp_saliency_map: torch.Tensor | None = None
         if config.use_vp_saliency:
-            from .camera import vanishing_point_saliency, FRAME_H, FRAME_W
+            from .camera import FRAME_H, FRAME_W, vanishing_point_saliency
 
             self._vp_saliency_map = vanishing_point_saliency(
                 H=FRAME_H,
@@ -1760,8 +1759,8 @@ class Trainer:
 
                 # Apply eval-matched roundtrip (simulate contest eval resize chain)
                 if cfg.eval_roundtrip:
-                    from tac.renderer import simulate_eval_roundtrip
                     from tac.camera import CAMERA_H, CAMERA_W
+                    from tac.renderer import simulate_eval_roundtrip
                     # filtered is (B, 2, H, W, 3) HWC — convert to CHW for roundtrip
                     B_f, T_f, H_f, W_f, C_f = filtered.shape
                     flat_chw = filtered.reshape(B_f * T_f, H_f, W_f, C_f).permute(0, 3, 1, 2).contiguous()

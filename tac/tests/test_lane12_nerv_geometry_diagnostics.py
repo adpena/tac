@@ -5,8 +5,8 @@ exercise scorer/PoseNet code.
 """
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import io
 import json
 import sys
@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 import torch
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DIAG_PATH = REPO_ROOT / "experiments" / "diagnose_nerv_geometry.py"

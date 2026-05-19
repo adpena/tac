@@ -27,7 +27,6 @@ import tac.experiments.train_renderer as tr
 from tac.fp4_quantize import QATRendererFP4
 from tac.profiles import DEN, SHIRAZ, WILDE
 
-
 # ── Helpers ────────────────────────────────────────────────────────────
 
 

@@ -17,8 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tac.preflight import PreflightError
 from tac.learnable_class_targets import LearnableClassTargets
+from tac.preflight import PreflightError
 from tac.segmap_renderer import (
     SEGMAP_INPUT_SIZE,
     ResidualBlock,
@@ -26,7 +26,6 @@ from tac.segmap_renderer import (
     SegMapTrainer,
 )
 from tac.training import EMA, TrainConfig
-
 
 # ─── Mock scorers shaped like upstream PoseNet/SegNet ────────────────────
 

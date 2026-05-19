@@ -32,8 +32,9 @@ import json
 import logging
 import math
 import struct
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import torch
@@ -2223,8 +2224,8 @@ def gpu_lane_full_pipeline(
             'diagnostics': dict with per-stage timing and metrics
     """
     from tac.fridrich import (
-        estimate_detection_boundary,
         compute_pixel_cost_map,
+        estimate_detection_boundary,
         fridrich_constrained_optimize,
         optimal_quantization_stc,
     )

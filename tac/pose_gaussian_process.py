@@ -26,7 +26,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-
 POSE_GP_SENTINEL = b"pose_gp_v1"
 POSE_GP_DEGREE = 10
 POSE_GP_NUM_COEFFS = POSE_GP_DEGREE + 1

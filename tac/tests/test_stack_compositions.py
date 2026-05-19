@@ -32,7 +32,6 @@ from tac.stack_compositions import (
     validate_jnwcs_ec_composition,
 )
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 

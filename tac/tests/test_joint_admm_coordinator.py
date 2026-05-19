@@ -30,7 +30,6 @@ from tac.joint_admm_coordinator import (
     run_admm,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Synthetic streams (CPU-only, no scorer load)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,6 +374,7 @@ def test_strict_scorer_rule_no_scorer_import():
     # the AdmmResult class identity for subsequent tests in the same
     # session (Python's isinstance uses identity, not name).
     import inspect
+
     import tac.joint_admm_coordinator as coord_module
     src = inspect.getsource(coord_module)
     forbidden_patterns = [

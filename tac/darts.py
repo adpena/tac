@@ -82,13 +82,11 @@ References
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 __all__ = [
     "DARTSCell",

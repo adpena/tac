@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO_ROOT / "experiments" / "sweep_owv3_byte_plan.py"
 

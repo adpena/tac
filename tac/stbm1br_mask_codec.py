@@ -22,10 +22,8 @@ return wrong masks. The production path uses the Rust bridge
 """
 from __future__ import annotations
 
-import bz2
 import hashlib
 import struct
-import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -279,4 +277,4 @@ def decode_stbm1br_mask_file(
 
 
 # Local Mapping import (deferred to avoid runtime cost / circular concerns)
-from typing import Mapping  # noqa: E402  - placed late to match original module layout
+from collections.abc import Mapping  # noqa: E402  - placed late to match original module layout

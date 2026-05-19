@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import random
 import io
+import random
 import struct
 import zipfile
 import zlib
@@ -16,7 +16,6 @@ from tac.custom_binary_container import (
     pack_archive_to_zip_compatible,
     unpack_archive,
 )
-
 
 LANE_A_ARCHIVE = Path("/Users/adpena/Projects/pact/experiments/results/lane_a_landed/archive_lane_a.zip")
 

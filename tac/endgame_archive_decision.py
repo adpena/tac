@@ -24,22 +24,11 @@ import argparse
 import hashlib
 import json
 import math
-import struct
-import zipfile
 from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Iterable, Mapping, Sequence
-
-from tac.archive_byte_profile import contest_rate_term
-from tac.pr85_bundle import (
-    HPM1_MAGIC,
-    PR85_HEADERLESS_RANDMULTI_SPECS,
-    Pr85BundleError,
-    SEGMENT_ORDER,
-    parse_hpm1_mask_segment,
-    parse_pr85_bundle,
-)
+from typing import Any
 
 SCHEMA = "endgame_archive_decision_profile_v1"
 TOOL = "experiments/profile_endgame_archive_decision.py"

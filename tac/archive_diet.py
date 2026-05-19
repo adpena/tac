@@ -49,11 +49,10 @@ Public API
 from __future__ import annotations
 
 import io
-import struct
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 
@@ -182,6 +181,7 @@ def _apply_arithmetic_renderer(payload: bytes) -> tuple[bytes, bool]:
         return payload, False
 
     import tempfile
+
     from tac.arithmetic_qint_codec import repack_payload_tar_xz_to_arithmetic
 
     with tempfile.NamedTemporaryFile(suffix=".tar.xz", delete=False) as in_f:

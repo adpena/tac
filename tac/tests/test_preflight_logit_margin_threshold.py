@@ -23,8 +23,8 @@ if str(SRC) not in sys.path:
 
 from tac.preflight import (  # noqa: E402
     MetaBugViolation,
-    check_logit_margin_loss_uses_boundary_mask,
     _scan_lane19_threshold_calls,
+    check_logit_margin_loss_uses_boundary_mask,
 )
 
 

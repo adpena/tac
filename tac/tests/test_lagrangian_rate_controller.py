@@ -45,7 +45,6 @@ from tac.learnable_bit_quant import (
     renderer_average_learnable_bits_per_weight,
 )
 
-
 # ── Construction validation ─────────────────────────────────────────────
 
 

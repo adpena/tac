@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -301,7 +301,7 @@ class EgoMotionFlowSolver:
     def generate(
         self,
         masks: torch.Tensor,
-        initial_frame: Optional[torch.Tensor] = None,
+        initial_frame: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate a frame sequence satisfying ego-motion flow constraints.
 
@@ -509,9 +509,9 @@ class RoadPlaneHomography:
     def generate(
         self,
         masks: torch.Tensor,
-        initial_frame: Optional[torch.Tensor] = None,
-        ego_rotation: Optional[torch.Tensor] = None,
-        ego_translation: Optional[torch.Tensor] = None,
+        initial_frame: torch.Tensor | None = None,
+        ego_rotation: torch.Tensor | None = None,
+        ego_translation: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate frames with road constrained by homography.
 
@@ -886,7 +886,7 @@ class MatchedFilterOptimizer:
         self,
         frames: torch.Tensor,
         scorer_fn: nn.Module,
-        target_error: Optional[torch.Tensor] = None,
+        target_error: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply iterative matched filter optimization.
 
@@ -981,8 +981,8 @@ class KalmanFrameSmoother:
         elif isinstance(config, dict):
             config = KalmanSmootherConfig(**config)
         self.config = config
-        self._pca_mean: Optional[torch.Tensor] = None
-        self._pca_basis: Optional[torch.Tensor] = None
+        self._pca_mean: torch.Tensor | None = None
+        self._pca_basis: torch.Tensor | None = None
 
     def fit_pca(
         self,
@@ -1049,7 +1049,7 @@ class KalmanFrameSmoother:
     def smooth(
         self,
         frames: torch.Tensor,
-        scorer_targets: Optional[torch.Tensor] = None,
+        scorer_targets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply Rauch-Tung-Striebel smoother to frame sequence.
 
@@ -1278,8 +1278,8 @@ class CompressedSensingRecovery:
     def recover(
         self,
         frames: torch.Tensor,
-        measurement_fn: Optional[nn.Module] = None,
-        target: Optional[torch.Tensor] = None,
+        measurement_fn: nn.Module | None = None,
+        target: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Recover sparse frames via ISTA.
 
@@ -1392,8 +1392,8 @@ class TrajectoryOptimizer:
     def optimize(
         self,
         frames: torch.Tensor,
-        scorer_fn: Optional[nn.Module] = None,
-        boundary_frames: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        scorer_fn: nn.Module | None = None,
+        boundary_frames: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Optimize frame trajectory with control cost.
 
@@ -1499,7 +1499,7 @@ class AdaptiveOpticsConfig:
         lr: Learning rate for mode coefficient optimization.
     """
     num_modes: int = 50
-    mode_weights: Optional[list[float]] = None
+    mode_weights: list[float] | None = None
     regularization: float = 0.001
     num_iterations: int = 100
     lr: float = 0.1
@@ -1531,7 +1531,7 @@ class AdaptiveOpticsCorrector:
         elif isinstance(config, dict):
             config = AdaptiveOpticsConfig(**config)
         self.config = config
-        self._basis: Optional[torch.Tensor] = None
+        self._basis: torch.Tensor | None = None
 
     def _build_zernike_basis(
         self,
@@ -1655,7 +1655,7 @@ class AdaptiveOpticsCorrector:
     def optimize(
         self,
         frames: torch.Tensor,
-        scorer_fn: Optional[nn.Module] = None,
+        scorer_fn: nn.Module | None = None,
     ) -> torch.Tensor:
         """Optimize frames by optimizing Zernike mode coefficients.
 
@@ -1890,7 +1890,7 @@ class OFDMOptimizer:
     def compute_frequency_sensitivity(
         self,
         frames: torch.Tensor,
-        scorer_fn: Optional[nn.Module] = None,
+        scorer_fn: nn.Module | None = None,
     ) -> torch.Tensor:
         """Compute per-frequency scorer sensitivity.
 
@@ -2001,7 +2001,7 @@ class OFDMOptimizer:
     def optimize(
         self,
         frames: torch.Tensor,
-        scorer_fn: Optional[nn.Module] = None,
+        scorer_fn: nn.Module | None = None,
     ) -> torch.Tensor:
         """Optimize frames via OFDM water-filling in DCT domain.
 
@@ -2092,7 +2092,7 @@ class TurboScorerOptimizer:
         scorer_fn: nn.Module,
         num_steps: int,
         lr: float,
-        prior: Optional[torch.Tensor] = None,
+        prior: torch.Tensor | None = None,
         prior_weight: float = 1.0,
     ) -> torch.Tensor:
         """Run gradient descent on a single scorer.

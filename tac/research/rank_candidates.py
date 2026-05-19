@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, csv, json
+
+import argparse
+import csv
+import json
 from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 

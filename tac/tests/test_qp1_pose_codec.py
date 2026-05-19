@@ -9,24 +9,21 @@ Asserts:
 """
 from __future__ import annotations
 
-import importlib.util
 import struct
 from pathlib import Path
 
 import brotli
 import numpy as np
 import pytest
-import torch
 
 from tac.qp1_pose_codec import (
-    POSE_SCALE,
     QP1_MAGIC,
     QP2_MAGIC,
-    QPV1DimensionStream,
-    QPV1Payload,
     QPV1_MAGIC,
     VELOCITY_OFFSET,
     VELOCITY_SCALE,
+    QPV1DimensionStream,
+    QPV1Payload,
     decode_qp1,
     decode_qp2_residual_topk,
     decode_qpv1,
@@ -35,7 +32,6 @@ from tac.qp1_pose_codec import (
     parse_qpv1,
     qp2_residual_atom_plan,
 )
-
 
 PR67_ARCHIVE = Path(__file__).resolve().parents[3] / (
     "reports/raw/leaderboard_intel_20260501/pr67_archive.zip"

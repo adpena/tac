@@ -39,7 +39,6 @@ from tac.renderer_export import (
 )
 from tac.self_compress import SC_PROTECTED_NAME_PATTERNS
 
-
 REPO = Path(__file__).resolve().parents[3]
 LANE_A_RENDERER = REPO / "experiments" / "results" / "lane_a_landed" / "iter_0" / "renderer.bin"
 

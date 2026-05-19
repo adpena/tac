@@ -3,7 +3,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 HELPER = REPO_ROOT / "scripts" / "pfp16_a_plus_plus_exact_t4_eval.sh"
 EXPECTED_SHA = "0af839abb30e0dfdcfbcbf75247b136db8731196ef26e58374c76a1b562ded7f"

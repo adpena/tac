@@ -55,7 +55,7 @@ class Bootstrap:
     workspace: Path = field(default_factory=lambda: Path("/workspace/pact"))
 
     @classmethod
-    def for_profile(cls, profile: str, output_subdir: str | None = None) -> "Bootstrap":
+    def for_profile(cls, profile: str, output_subdir: str | None = None) -> Bootstrap:
         """Construct with output_subdir defaulting to the bash convention."""
         sub = output_subdir or f"experiments/results/{profile.lower()}"
         return cls(profile=profile.lower(), output_subdir=sub)

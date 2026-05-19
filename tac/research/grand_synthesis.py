@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class Verdict(str, Enum):
@@ -65,9 +64,9 @@ class CouncilExperiment:
     blocking: bool = False
 
     # Score decomposition (projected)
-    projected_seg: Optional[float] = None
-    projected_pose: Optional[float] = None
-    projected_rate: Optional[float] = None
+    projected_seg: float | None = None
+    projected_pose: float | None = None
+    projected_rate: float | None = None
 
 
 @dataclass

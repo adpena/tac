@@ -57,7 +57,7 @@ import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 
@@ -67,7 +67,6 @@ from tac.block_fp_codec import (
     pack_block_fp,
     unpack_block_fp,
 )
-
 
 SZV1_MAGIC: bytes = b"SZv1"
 SZV1_VERSION: int = 1
@@ -128,7 +127,7 @@ class SzabolcsArchiveStats:
 
 def pack_szabolcs_archive(
     model: torch.nn.Module,
-    output_path: Optional[Union[Path, str]] = None,
+    output_path: Path | str | None = None,
     *,
     block_size: int = DEFAULT_BLOCK_SIZE,
     clip_threshold: float = DEFAULT_CLIP_THRESHOLD,
@@ -265,7 +264,7 @@ class SzabolcsArchiveContents:
     header: dict[str, Any]
 
 
-def unpack_szabolcs_archive(data: Union[bytes, Path, str]) -> SzabolcsArchiveContents:
+def unpack_szabolcs_archive(data: bytes | Path | str) -> SzabolcsArchiveContents:
     """Inverse of :func:`pack_szabolcs_archive`.
 
     Returns a config dict + a state_dict ready to load into a freshly built

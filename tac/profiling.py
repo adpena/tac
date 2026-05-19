@@ -42,7 +42,7 @@ class StageTimer:
         self.end: float | None = None
         self.elapsed: float | None = None
 
-    def __enter__(self) -> "StageTimer":
+    def __enter__(self) -> StageTimer:
         self.start = time.monotonic()
         return self
 

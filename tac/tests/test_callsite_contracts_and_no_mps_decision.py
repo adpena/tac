@@ -25,7 +25,6 @@ from tac.preflight import (
     check_no_proxy_metric_drives_decision,
 )
 
-
 # ── Check 82 (callsite contracts) ────────────────────────────────────────────
 
 

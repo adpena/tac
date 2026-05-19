@@ -37,7 +37,6 @@ from tac.pose_from_embedding import (
     save_mlp,
 )
 
-
 # ── Module constants pin ────────────────────────────────────────────────
 
 

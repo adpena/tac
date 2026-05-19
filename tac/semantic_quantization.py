@@ -31,8 +31,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
-
 
 # Default bit allocation per semantic class
 DEFAULT_CLASS_BITS: dict[int, int] = {

@@ -40,7 +40,6 @@ from tac.nerv_mask_codec import (
     render_mask_logits,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 1: positional_encode determinism + shape correctness
 # ─────────────────────────────────────────────────────────────────────────────

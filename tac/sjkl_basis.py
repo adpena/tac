@@ -463,7 +463,7 @@ def encode_sjkl_alpha_block_v2_sparse(
     if pair_indices.shape != (n_pairs,):
         raise ValueError(f"pair_indices must be (n_pairs={n_pairs},), got {pair_indices.shape}")
     if int(pair_indices.min()) < 0 or int(pair_indices.max()) > 0xFFFF:
-        raise ValueError(f"pair_indices must fit in uint16 [0, 65535]")
+        raise ValueError("pair_indices must fit in uint16 [0, 65535]")
     if len(set(int(x) for x in pair_indices.tolist())) != n_pairs:
         raise ValueError("pair_indices must not contain duplicates")
 

@@ -86,7 +86,7 @@ class TestINT4Quantization:
     """Test INT4 quantization utilities from benchmark script."""
 
     def test_quantize_int4_per_channel(self):
-        from tac.experiments.benchmark_int4 import quantize_int4_per_channel, dequantize_int4_per_channel
+        from tac.experiments.benchmark_int4 import quantize_int4_per_channel
         w = torch.randn(16, 3, 3, 3)
         q, s = quantize_int4_per_channel(w)
         assert q.shape == w.shape
@@ -94,7 +94,7 @@ class TestINT4Quantization:
         assert s.shape == (16,)
 
     def test_roundtrip_quality(self):
-        from tac.experiments.benchmark_int4 import quantize_int4_per_channel, dequantize_int4_per_channel
+        from tac.experiments.benchmark_int4 import dequantize_int4_per_channel, quantize_int4_per_channel
         w = torch.randn(16, 3, 3, 3)
         q, s = quantize_int4_per_channel(w)
         w_recon = dequantize_int4_per_channel(q, s)
@@ -103,16 +103,16 @@ class TestINT4Quantization:
         assert mse < 0.1, f"INT4 MSE too high: {mse}"
 
     def test_quantize_model_int4(self):
-        from tac.experiments.benchmark_int4 import quantize_model_int4
         from tac.architectures import build_postfilter
+        from tac.experiments.benchmark_int4 import quantize_model_int4
         model = build_postfilter("dilated", hidden=16)
         _, stats = quantize_model_int4(model)
         assert "_summary" in stats
         assert stats["_summary"]["total_params"] > 0
 
     def test_save_int4_checkpoint(self):
-        from tac.experiments.benchmark_int4 import save_int4_checkpoint, quantize_model_int4
         from tac.architectures import build_postfilter
+        from tac.experiments.benchmark_int4 import quantize_model_int4, save_int4_checkpoint
         model = build_postfilter("dilated", hidden=16)
         quantize_model_int4(model)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -123,8 +123,8 @@ class TestINT4Quantization:
 
     def test_int4_smaller_than_int8(self):
         """INT4 checkpoint should be significantly smaller than INT8."""
-        from tac.experiments.benchmark_int4 import save_int4_checkpoint, quantize_model_int4
         from tac.architectures import build_postfilter
+        from tac.experiments.benchmark_int4 import quantize_model_int4, save_int4_checkpoint
         model = build_postfilter("dilated", hidden=32)
         quantize_model_int4(model)
         with tempfile.TemporaryDirectory() as tmpdir:

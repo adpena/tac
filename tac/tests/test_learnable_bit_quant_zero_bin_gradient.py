@@ -68,7 +68,6 @@ import torch
 
 from tac.learnable_bit_quant import _PerElementSTEQuantize
 
-
 LN2 = math.log(2.0)
 
 

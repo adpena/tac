@@ -18,24 +18,23 @@ CLAUDE.md non-negotiables verified:
 from __future__ import annotations
 
 import json
+
 import pytest
 import torch
-import torch.nn as nn
 
 from tac.imps_renderer_archive import (
     IMPS_ARCHIVE_MAGIC,
     IMPS_ARCHIVE_VERSION,
-    IMPS_PER_TENSOR_SPARSITY_GATE,
     IMPS_PER_TENSOR_NUMEL_CAP,
+    IMPS_PER_TENSOR_SPARSITY_GATE,
     IMPSArchiveError,
+    _eligible_for_sparse_csr,
     decode_imps_archive,
     encode_imps_archive,
-    _eligible_for_sparse_csr,
 )
 from tac.iterative_magnitude_pruning import (
     apply_mask_to_model,
     iter_prunable_parameters,
-    prune_lowest_magnitude,
 )
 
 

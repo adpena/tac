@@ -27,8 +27,25 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/adpena/tac"
+Repository = "https://github.com/adpena/tac"
+Issues = "https://github.com/adpena/tac/issues"
+"Research Workspace" = "https://github.com/adpena/comma-lab"
 "Comma Challenge" = "https://github.com/commaai/comma_video_compression_challenge"
-"Submission PR #107" = "https://github.com/commaai/comma_video_compression_challenge/pull/107"
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.5"]
+viz = [
+    "plotly>=5.0",
+    "matplotlib>=3.8",
+    "pillow>=10.0",
+]
+notebooks = ["marimo>=0.3"]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.0",
+    "hypothesis>=6.0",
+    "ruff>=0.4",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -36,3 +53,38 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tac"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",    # line length handled by formatter
+    "E741",    # ambiguous variable name (E/l/I etc., often physics symbols)
+    "E402",    # module-level import not at top (intentional in some entry points)
+    "B008",    # function call in default argument (intentional with Click decorators)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tac/preflight.py" = ["ALL"]
+"tac/tests/*.py" = ["F841"]
+
+[tool.ruff.format]
+quote-style = "preserve"
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = ["tac/tests"]
+timeout = 60
+markers = [
+    "slow: marks tests that load scorer models (deselect with '-m \"not slow\"')",
+]

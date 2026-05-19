@@ -25,7 +25,6 @@ from tac.preflight import (
     preflight_t4_oom_training_guard,
 )
 
-
 # ── Live-codebase gate ───────────────────────────────────────────────────────
 
 

@@ -22,7 +22,6 @@ from tac.archive_codec import (
     build_minimal_archive,
 )
 
-
 # ── TextureAtomCodebook (4-bit quantized) ──────────────────────────────────
 
 

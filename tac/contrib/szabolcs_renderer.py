@@ -69,7 +69,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ── Constants (mirroring /tmp/szabolcs_re/inflate.py) ──────────────────────
 
 CAMERA_SIZE: tuple[int, int] = (1164, 874)  # (W, H) — camera-native output
@@ -470,7 +469,7 @@ def build_szabolcs_renderer(
 
 
 def load_szabolcs_renderer(
-    data: "bytes | str | object",
+    data: bytes | str | object,
     device: str | torch.device = "cpu",
 ) -> SzabolcsRenderer:
     """Inflate a SZv1 binary into a ready-to-run ``SzabolcsRenderer``.

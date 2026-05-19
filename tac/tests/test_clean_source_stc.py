@@ -39,7 +39,6 @@ from tac.stc_boundary_codec import (
     encode_mask_video_stc,
 )
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ROBUST_DIR = _REPO_ROOT / "submissions" / "robust_current"
 if str(_ROBUST_DIR) not in sys.path:

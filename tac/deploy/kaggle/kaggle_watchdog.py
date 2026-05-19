@@ -4,10 +4,9 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
-
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -15,7 +14,7 @@ if str(HERE) not in sys.path:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _default_status_sync(manifest_path: Path) -> dict[str, object]:

@@ -443,7 +443,7 @@ class HyperbolicFoveation(nn.Module):
             "converged_in": int(self._last_inverse_iters),
         }
 
-    def resized(self, image_size: tuple[int, int]) -> "HyperbolicFoveation":
+    def resized(self, image_size: tuple[int, int]) -> HyperbolicFoveation:
         """Return a geometry-equivalent copy for a different image size."""
         new_h, new_w = _as_image_size(image_size)
         old_h, old_w = self.image_size

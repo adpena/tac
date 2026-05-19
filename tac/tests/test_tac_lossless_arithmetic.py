@@ -5,7 +5,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -133,9 +132,10 @@ class TacLosslessArithmeticTests(unittest.TestCase):
         self.assertFalse(estimate.measured)
 
     def test_materialize_gpt_arithmetic_stream_writes_uint16_token_stream(self) -> None:
-        import numpy as np
         import tempfile
         from pathlib import Path
+
+        import numpy as np
 
         from tac.lossless.arithmetic import materialize_gpt_arithmetic_stream
 
@@ -170,9 +170,10 @@ class TacLosslessArithmeticTests(unittest.TestCase):
         )
 
     def test_materialize_gpt_arithmetic_stream_prefers_dataset_map_when_available(self) -> None:
-        import numpy as np
         import tempfile
         from pathlib import Path
+
+        import numpy as np
 
         from tac.lossless.arithmetic import materialize_gpt_arithmetic_stream
 
@@ -235,9 +236,10 @@ class TacLosslessArithmeticTests(unittest.TestCase):
         self.assertEqual(tokens.tolist(), [1024, 1, 2, 3, 4, 1025, 1024, 5, 6, 7, 8, 1025])
 
     def test_materialize_gpt_arithmetic_stream_prefers_sharded_numpy_batches_when_available(self) -> None:
-        import numpy as np
         import tempfile
         from pathlib import Path
+
+        import numpy as np
 
         from tac.lossless.arithmetic import materialize_gpt_arithmetic_stream
 
@@ -307,9 +309,10 @@ class TacLosslessArithmeticTests(unittest.TestCase):
         )
 
     def test_materialize_gpt_arithmetic_stream_reads_dataset_style_shard_columns(self) -> None:
-        import numpy as np
         import tempfile
         from pathlib import Path
+
+        import numpy as np
 
         from tac.lossless.arithmetic import materialize_gpt_arithmetic_stream
 
@@ -377,9 +380,10 @@ class TacLosslessArithmeticTests(unittest.TestCase):
         self.assertEqual(tokens.tolist(), [1024, 1, 2, 3, 4, 1025, 1024, 5, 6, 7, 8, 1025])
 
     def test_materialize_gpt_arithmetic_stream_handles_numpy_backed_shard_arrays(self) -> None:
-        import numpy as np
         import tempfile
         from pathlib import Path
+
+        import numpy as np
 
         from tac.lossless.arithmetic import materialize_gpt_arithmetic_stream
 
@@ -459,9 +463,10 @@ class TacLosslessArithmeticTests(unittest.TestCase):
 
     def test_write_symbol_frequency_report_emits_json_summary(self) -> None:
         import json
-        import numpy as np
         import tempfile
         from pathlib import Path
+
+        import numpy as np
 
         from tac.lossless.arithmetic import write_symbol_frequency_report
 

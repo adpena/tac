@@ -21,7 +21,6 @@ from tac.preflight import (
     check_pose_stream_uses_fp16_or_smaller,
 )
 
-
 # ───────────────────────────────────────────────────────────────────────────
 # Live-codebase smoke (must always pass)
 # ───────────────────────────────────────────────────────────────────────────

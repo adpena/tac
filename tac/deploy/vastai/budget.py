@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from tac.deploy.base import BudgetState, repo_root
@@ -124,7 +124,7 @@ class BudgetTracker:
         """Append a spending event and persist immediately."""
         self._state.total_spent += amount
         self._state.sessions.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "instance_id": instance_id,
             "amount": amount,
             "description": description,

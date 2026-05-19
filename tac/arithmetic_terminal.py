@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import io
 import struct
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -80,7 +79,6 @@ from tac.balle_hyperprior_codec import (
     _pmf_to_int_freq,
     discretized_gaussian_pmf,
 )
-
 
 _ATBH_MAGIC: bytes = b"ATBH"
 _ATBH_VERSION: int = 1

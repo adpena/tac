@@ -26,8 +26,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
 REPO = Path(__file__).resolve().parents[3]
 
 
@@ -225,6 +223,8 @@ def test_v2_inherits_v1_arch_knobs() -> None:
     """Every architecture knob in V1 must be unchanged in V2."""
     from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME as v1,
+    )
+    from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME_ANNEALED as v2,
     )
     arch_keys = (
@@ -243,6 +243,8 @@ def test_v2_inherits_v1_loss_knobs() -> None:
     differs)."""
     from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME as v1,
+    )
+    from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME_ANNEALED as v2,
     )
     loss_keys = (
@@ -265,6 +267,8 @@ def test_v2_inherits_v1_phase_schedule() -> None:
     """5-phase epoch counts + LRs must match V1."""
     from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME as v1,
+    )
+    from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME_ANNEALED as v2,
     )
     for i in range(1, 6):
@@ -281,6 +285,8 @@ def test_v2_seed_differs_from_v1() -> None:
     rebuilds explore different RNG basins."""
     from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME as v1,
+    )
+    from tac.profiles import (
         QUANTIZR_REPLICA_88K_HALFFRAME_ANNEALED as v2,
     )
     assert v2["seed"] != v1["seed"], (

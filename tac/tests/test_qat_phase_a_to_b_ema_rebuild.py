@@ -36,7 +36,6 @@ import torch.nn.utils.parametrize as parametrize
 
 from tac.training import EMA
 
-
 # ── Tiny INT8/FP4 fake-quant parametrizations (mimic real wrap shape) ──
 #
 # We intentionally use parametrize.register_parametrization directly so the

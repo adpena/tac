@@ -13,13 +13,8 @@ from pathlib import Path
 import pytest
 import torch
 
+import tac.deploy.lightning.batch_jobs as lightning_batch_jobs
 from tac.deploy.lightning.batch_jobs import (
-    ARTIFACT_DALI_BOOTSTRAP,
-    ARTIFACT_DALI_REQUIREMENTS,
-    ARTIFACT_INFRA_FAILURE,
-    ARTIFACT_INFLATE_RUNTIME_BOOTSTRAP,
-    ARTIFACT_INFLATE_RUNTIME_STATIC_PREFLIGHT,
-    ARTIFACT_METADATA,
     ARTIFACT_COMPONENT_RESPONSE_INPUTS,
     ARTIFACT_COMPONENT_RESPONSE_SUMMARY,
     ARTIFACT_COMPONENT_RESPONSE_VALIDATION,
@@ -27,22 +22,28 @@ from tac.deploy.lightning.batch_jobs import (
     ARTIFACT_COMPONENT_SENSITIVITY_RUN,
     ARTIFACT_COMPONENT_SENSITIVITY_SUMMARY,
     ARTIFACT_COMPONENT_SENSITIVITY_VALIDATION,
-    COMPONENT_SENSITIVITY_CANONICAL_ARTIFACT_FILES,
-    ARTIFACT_VALIDATION,
-    CANONICAL_ARTIFACT_FILES,
-    COMPONENT_SENSITIVITY_HOLDOUT_MAP_FILES,
-    COMPONENT_SENSITIVITY_CURVE_FILES,
-    COMPONENT_SENSITIVITY_MAP_FILES,
-    COMPONENT_RESPONSE_CURVE_FILES,
+    ARTIFACT_DALI_BOOTSTRAP,
+    ARTIFACT_DALI_REQUIREMENTS,
+    ARTIFACT_INFLATE_RUNTIME_BOOTSTRAP,
+    ARTIFACT_INFLATE_RUNTIME_STATIC_PREFLIGHT,
+    ARTIFACT_INFRA_FAILURE,
+    ARTIFACT_METADATA,
     ARTIFACT_RUNNER_PREFLIGHT,
     ARTIFACT_SUPPLY_CHAIN_SCAN,
     ARTIFACT_SUPPLY_CHAIN_SCAN_PRE,
+    ARTIFACT_VALIDATION,
+    CANONICAL_ARTIFACT_FILES,
+    COMPONENT_RESPONSE_CURVE_FILES,
+    COMPONENT_SENSITIVITY_CANONICAL_ARTIFACT_FILES,
+    COMPONENT_SENSITIVITY_CURVE_FILES,
+    COMPONENT_SENSITIVITY_HOLDOUT_MAP_FILES,
+    COMPONENT_SENSITIVITY_MAP_FILES,
+    LIGHTNING_EMPTY_ARTIFACT_INFRA_TERMINAL_CLASS,
+    LIGHTNING_MISSING_EXACT_EVAL_JSON_TERMINAL_CLASS,
     LightningAdjudicationSpec,
     LightningBatchJobsClient,
     LightningBatchJobSpec,
     LightningStudioCloudAccountMismatchError,
-    LIGHTNING_EMPTY_ARTIFACT_INFRA_TERMINAL_CLASS,
-    LIGHTNING_MISSING_EXACT_EVAL_JSON_TERMINAL_CLASS,
     archive_identity,
     default_exact_eval_local_artifact_dir,
     default_exact_eval_output_dir,
@@ -54,17 +55,15 @@ from tac.deploy.lightning.batch_jobs import (
     make_diagnostic_component_sensitivity_spec,
     make_exact_eval_spec,
     make_official_component_response_spec,
-    mirror_local_component_sensitivity_artifact_dir,
     mirror_local_artifact_dir,
+    mirror_local_component_sensitivity_artifact_dir,
     official_component_response_command,
-    validate_local_component_sensitivity_artifact_dir,
-    validate_local_component_response_artifact_dir,
     validate_local_artifact_dir,
+    validate_local_component_response_artifact_dir,
+    validate_local_component_sensitivity_artifact_dir,
     validate_studio_machine_class_pair,
 )
-import tac.deploy.lightning.batch_jobs as lightning_batch_jobs
 from tac.sensitivity_map import save_sensitivity_map
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CLI = REPO_ROOT / "scripts" / "launch_lightning_batch_job.py"

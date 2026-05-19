@@ -319,7 +319,7 @@ def verify_internal_promotion_token(token: str | None) -> bool:
 
 def load_trust_root(
     root: Path | str | None = None,
-) -> dict[str, "Ed25519PublicKey"]:  # type: ignore[name-defined]
+) -> dict[str, Ed25519PublicKey]:  # type: ignore[name-defined]
     """Codex R5-3 #1: load and validate the trust-root pubkey registry.
 
     File format::
@@ -374,7 +374,7 @@ def load_trust_root(
             f"trust root at {path} root is not a JSON object: "
             f"{type(data).__name__}"
         )
-    keys: dict[str, "Ed25519PublicKey"] = {}
+    keys: dict[str, Ed25519PublicKey] = {}
     for approver_id, entry in data.items():
         if not isinstance(approver_id, str) or not approver_id.strip():
             raise TrustRootMalformed(
@@ -592,7 +592,7 @@ def write_attestation(
     ruling_text: str,
     signed_by_user: str,
     git_head: str,
-    private_key: "Ed25519PrivateKey | bytes",  # type: ignore[name-defined]
+    private_key: Ed25519PrivateKey | bytes,  # type: ignore[name-defined]
     delta_path_at_signing: str | None = None,
     root: Path | str | None = None,
     signed_at_utc: str | None = None,

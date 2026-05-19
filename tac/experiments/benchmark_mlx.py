@@ -18,30 +18,23 @@ from __future__ import annotations
 
 import gc
 import time
-from pathlib import Path
-
-import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import numpy as np
 
+from tac.camera import FRAME_H as H
+from tac.camera import FRAME_W as W
+from tac.camera import NUM_CLASSES
 from tac.mlx_renderer import (
-    MaskRenderer,
-    MotionPredictor,
-    PairGenerator,
+    _nearest_upsample_2x,
+    _warp_with_flow,
     build_mlx_renderer,
-    pretrain_loss_fn,
     haar_dwt2d,
     haar_idwt2d,
-    _warp_with_flow,
-    # Codex R5-2 Finding #2 (2026-04-27): dead-import cleanup. The MLX
-    # renderer only ships nearest-neighbour upsample (`_nearest_upsample_2x`);
-    # the `_bilinear_upsample_2x` symbol never existed. Use the real one.
-    _nearest_upsample_2x,
+    pretrain_loss_fn,
 )
-
-from tac.camera import FRAME_H as H, FRAME_W as W, NUM_CLASSES
 
 
 def make_fake_data(batch_size: int = 1):
@@ -487,7 +480,7 @@ def bench_cpu_lane():
 
     print(f"\n  GPU/CPU ratio: {t_cpu / t_gpu:.1f}x (GPU faster)")
     print(f"  Verdict: {'GPU always wins' if t_gpu < t_cpu else 'CPU competitive'}")
-    print(f"  CPU lane verdict: Use GPU for ALL training. CPU only for data prep/IO.")
+    print("  CPU lane verdict: Use GPU for ALL training. CPU only for data prep/IO.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -644,7 +637,7 @@ def bench_combined_best():
 
     # Estimate epoch time with 120 pairs
     n_pairs = 120  # 480/4 subsample
-    print(f"\n  Estimated epoch time (120 pairs):")
+    print("\n  Estimated epoch time (120 pairs):")
     print(f"    Baseline: {n_pairs * t_base / 1000:.1f}s")
     print(f"    Optimized: {n_pairs * t_best / 1000:.1f}s")
 

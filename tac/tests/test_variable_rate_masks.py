@@ -44,7 +44,7 @@ class TestDifficultyMap(unittest.TestCase):
 
     def test_difficulty_map_serialization(self):
         """Difficulty map round-trips through save/load (2.4KB for 600 pairs)."""
-        from tac.variable_rate import save_difficulty_map, load_difficulty_map
+        from tac.variable_rate import load_difficulty_map, save_difficulty_map
 
         difficulty = torch.rand(600)
         with tempfile.NamedTemporaryFile(suffix=".pt") as f:
@@ -109,7 +109,7 @@ class TestVariableRateEncoding(unittest.TestCase):
 
     def test_decode_variable_rate_masks_roundtrip(self):
         """Variable-rate encoded masks decode to correct class indices."""
-        from tac.variable_rate import encode_variable_rate_masks, decode_masks
+        from tac.variable_rate import decode_masks, encode_variable_rate_masks
 
         masks = torch.randint(0, 5, (4, 16, 16)).long()
         difficulty = torch.rand(2)
@@ -135,8 +135,8 @@ class TestVariableRateVsUniform(unittest.TestCase):
 
     def test_variable_rate_same_total_bytes(self):
         """Variable-rate with same average CRF produces similar file size."""
-        from tac.variable_rate import encode_variable_rate_masks
         from tac.mask_codec import encode_masks_monochrome
+        from tac.variable_rate import encode_variable_rate_masks
 
         masks = torch.randint(0, 5, (20, 16, 16)).long()
         difficulty = torch.rand(10)

@@ -28,7 +28,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO = Path(__file__).resolve().parents[3]
 OPTIMIZER_SCRIPT = REPO / "experiments" / "optimize_uniward_delta.py"
 ARCHIVE_SCRIPT = REPO / "experiments" / "build_baseline_archive.py"
@@ -58,8 +57,9 @@ def _build_delta_blob(
     bypass the library refusal in order to verify the downstream gate.
     """
     import torch
-    from tac.uniward_delta import pack_sparse_delta
+
     from tac.lane_c_compliance import INTERNAL_PROMOTION_TOKEN
+    from tac.uniward_delta import pack_sparse_delta
     delta = torch.randn(n_frames, 3, h, w) * 2.0  # within budget
     cost = torch.rand(n_frames, h, w) * 10.0
     kwargs = {
@@ -100,6 +100,7 @@ def _write_test_trust_root(root: Path, entries: dict) -> Path:
     approver_id → pubkey_hex.
     """
     import json as _json
+
     from tac.lane_c_compliance import trust_root_path
     path = trust_root_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +259,7 @@ def test_write_attestation_refuses_empty_approver(tmp_path: Path) -> None:
 def test_write_then_verify_round_trip(tmp_path: Path) -> None:
     """Happy path: write attestation, then verify_attestation_for_blob
     returns the parsed Attestation."""
-    from tac.lane_c_compliance import write_attestation, verify_attestation_for_blob
+    from tac.lane_c_compliance import verify_attestation_for_blob, write_attestation
     priv, pubkey_hex = _gen_test_signing_key()
     _write_test_trust_root(tmp_path, {"yousfi": pubkey_hex})
     blob = b"some-delta-bytes" * 32
@@ -280,7 +281,7 @@ def test_write_then_verify_round_trip(tmp_path: Path) -> None:
 
 
 def test_verify_raises_missing_when_no_file(tmp_path: Path) -> None:
-    from tac.lane_c_compliance import verify_attestation_for_blob, AttestationMissing
+    from tac.lane_c_compliance import AttestationMissing, verify_attestation_for_blob
     blob = b"unsigned-delta" * 32
     with pytest.raises(AttestationMissing):
         verify_attestation_for_blob(blob, root=tmp_path)
@@ -291,8 +292,11 @@ def test_verify_raises_mismatch_on_sha_drift(tmp_path: Path) -> None:
     placed an attestation file at the canonical path for blob A,
     verifying blob B against the same path must fail."""
     from tac.lane_c_compliance import (
-        write_attestation, verify_attestation_for_blob, AttestationMismatch,
-        attestation_path_for, compute_blob_sha256,
+        AttestationMismatch,
+        attestation_path_for,
+        compute_blob_sha256,
+        verify_attestation_for_blob,
+        write_attestation,
     )
     priv, pubkey_hex = _gen_test_signing_key()
     _write_test_trust_root(tmp_path, {"yousfi": pubkey_hex})
@@ -318,8 +322,10 @@ def test_verify_raises_mismatch_on_sha_drift(tmp_path: Path) -> None:
 
 def test_verify_raises_malformed_on_missing_fields(tmp_path: Path) -> None:
     from tac.lane_c_compliance import (
-        verify_attestation_for_blob, AttestationMalformed,
-        attestation_path_for, compute_blob_sha256,
+        AttestationMalformed,
+        attestation_path_for,
+        compute_blob_sha256,
+        verify_attestation_for_blob,
     )
     blob = b"delta-with-broken-attestation" * 32
     sha = compute_blob_sha256(blob)
@@ -339,8 +345,10 @@ def test_verify_raises_malformed_on_missing_fields(tmp_path: Path) -> None:
 
 def test_verify_raises_malformed_on_wrong_schema(tmp_path: Path) -> None:
     from tac.lane_c_compliance import (
-        verify_attestation_for_blob, AttestationMalformed,
-        attestation_path_for, compute_blob_sha256,
+        AttestationMalformed,
+        attestation_path_for,
+        compute_blob_sha256,
+        verify_attestation_for_blob,
     )
     blob = b"delta-with-future-schema" * 32
     sha = compute_blob_sha256(blob)
@@ -639,10 +647,12 @@ def _repo_test_trust_root():
     contents. This avoids destroying real trust-root entries.
     """
     import json as _json
+
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
         Ed25519PrivateKey,
     )
+
     from tac.lane_c_compliance import trust_root_path
 
     priv = Ed25519PrivateKey.generate()
@@ -699,7 +709,9 @@ def test_archive_builder_refuses_approved_with_sha_mismatch(
     # Sign blob_a IN THE REPO (not tmp_path) because the archive
     # builder checks attestations relative to REPO.
     from tac.lane_c_compliance import (
-        write_attestation, attestation_path_for, compute_blob_sha256,
+        attestation_path_for,
+        compute_blob_sha256,
+        write_attestation,
     )
     sha_a = compute_blob_sha256(blob_a)
     att_path_a = attestation_path_for(sha_a, root=REPO)
@@ -741,7 +753,9 @@ def test_archive_builder_accepts_approved_with_valid_attestation(
     delta_path.write_bytes(blob)
 
     from tac.lane_c_compliance import (
-        write_attestation, attestation_path_for, compute_blob_sha256,
+        attestation_path_for,
+        compute_blob_sha256,
+        write_attestation,
     )
     sha = compute_blob_sha256(blob)
     att_path = attestation_path_for(sha, root=REPO)
@@ -849,8 +863,10 @@ def test_r5_3_1_unsigned_attestation_refused(tmp_path: Path) -> None:
     the attestation file, and the verifier had no cryptographic check.
     """
     from tac.lane_c_compliance import (
-        verify_attestation_for_blob, AttestationMalformed,
-        attestation_path_for, compute_blob_sha256,
+        AttestationMalformed,
+        attestation_path_for,
+        compute_blob_sha256,
+        verify_attestation_for_blob,
     )
     blob = b"some-delta-bytes" * 32
     sha = compute_blob_sha256(blob)
@@ -877,8 +893,9 @@ def test_r5_3_1_attestation_with_wrong_signature_refused(tmp_path: Path) -> None
     trust root must be refused with AttestationSignatureInvalid.
     """
     from tac.lane_c_compliance import (
-        write_attestation, verify_attestation_for_blob,
         AttestationSignatureInvalid,
+        verify_attestation_for_blob,
+        write_attestation,
     )
     real_priv, real_pub_hex = _gen_test_signing_key()
     wrong_priv, _wrong_pub_hex = _gen_test_signing_key()
@@ -900,8 +917,9 @@ def test_r5_3_1_approver_not_in_trust_root_refused(tmp_path: Path) -> None:
     in the trust root is refused REGARDLESS of whether the signature
     would have verified. Only allowlisted approvers can issue."""
     from tac.lane_c_compliance import (
-        write_attestation, verify_attestation_for_blob,
         AttestationApproverNotInTrustRoot,
+        verify_attestation_for_blob,
+        write_attestation,
     )
     priv, pub_hex = _gen_test_signing_key()
     # Trust root has fridrich, NOT yousfi.
@@ -922,8 +940,9 @@ def test_r5_3_1_trust_root_missing_refused(tmp_path: Path) -> None:
     hasn't bootstrapped its registry yet.
     """
     from tac.lane_c_compliance import (
-        write_attestation, verify_attestation_for_blob,
         TrustRootMissing,
+        verify_attestation_for_blob,
+        write_attestation,
     )
     priv, _pub_hex = _gen_test_signing_key()
     # Do NOT call _write_test_trust_root — file is absent.
@@ -941,8 +960,10 @@ def test_r5_3_1_trust_root_malformed_refused(tmp_path: Path) -> None:
     """REGRESSION (Codex R5-3 #1): a trust-root file with non-hex pubkey
     is refused with TrustRootMalformed."""
     from tac.lane_c_compliance import (
-        write_attestation, verify_attestation_for_blob,
-        TrustRootMalformed, trust_root_path,
+        TrustRootMalformed,
+        trust_root_path,
+        verify_attestation_for_blob,
+        write_attestation,
     )
     priv, _pub_hex = _gen_test_signing_key()
     tr_path = trust_root_path(tmp_path)
@@ -1010,7 +1031,8 @@ def test_r5_3_1_canonical_payload_missing_field_raises(tmp_path: Path) -> None:
     a record missing any of the trust-bearing fields. Otherwise a
     rotated record could partially commit."""
     from tac.lane_c_compliance import (
-        canonical_signed_payload, AttestationMalformed,
+        AttestationMalformed,
+        canonical_signed_payload,
     )
     with pytest.raises(AttestationMalformed):
         canonical_signed_payload({
@@ -1031,8 +1053,11 @@ def test_r5_3_1_tampered_ruling_text_invalidates_signature(
     a signed attestation file (e.g. softens "rejected for safety" into
     "approved"), the Ed25519 signature must no longer verify."""
     from tac.lane_c_compliance import (
-        write_attestation, verify_attestation_for_blob,
-        AttestationSignatureInvalid, attestation_path_for, compute_blob_sha256,
+        AttestationSignatureInvalid,
+        attestation_path_for,
+        compute_blob_sha256,
+        verify_attestation_for_blob,
+        write_attestation,
     )
     priv, pub_hex = _gen_test_signing_key()
     _write_test_trust_root(tmp_path, {"yousfi": pub_hex})
@@ -1064,7 +1089,8 @@ def test_r5_3_2_pack_refuses_approved_without_token(tmp_path: Path) -> None:
     supplied. This is the library-level closure of the bypass.
     """
     import torch
-    from tac.uniward_delta import pack_sparse_delta, COMPLIANCE_APPROVED
+
+    from tac.uniward_delta import COMPLIANCE_APPROVED, pack_sparse_delta
     delta = torch.randn(2, 3, 8, 8) * 1.5
     cost = torch.rand(2, 8, 8) * 5.0
     with pytest.raises(ValueError, match="promotion tool"):
@@ -1079,7 +1105,8 @@ def test_r5_3_2_pack_refuses_approved_with_wrong_token(tmp_path: Path) -> None:
     with a bogus value must be refused (constant-time comparison so
     prefix attacks don't help)."""
     import torch
-    from tac.uniward_delta import pack_sparse_delta, COMPLIANCE_APPROVED
+
+    from tac.uniward_delta import COMPLIANCE_APPROVED, pack_sparse_delta
     delta = torch.randn(2, 3, 8, 8) * 1.5
     cost = torch.rand(2, 8, 8) * 5.0
     with pytest.raises(ValueError, match="promotion tool"):
@@ -1096,10 +1123,13 @@ def test_r5_3_2_pack_accepts_approved_with_correct_token(
     """REGRESSION (Codex R5-3 #2, positive direction): with the correct
     token, pack succeeds. The promotion tool relies on this contract."""
     import torch
-    from tac.uniward_delta import (
-        pack_sparse_delta, unpack_sparse_delta, COMPLIANCE_APPROVED,
-    )
+
     from tac.lane_c_compliance import INTERNAL_PROMOTION_TOKEN
+    from tac.uniward_delta import (
+        COMPLIANCE_APPROVED,
+        pack_sparse_delta,
+        unpack_sparse_delta,
+    )
     delta = torch.randn(2, 3, 8, 8) * 1.5
     cost = torch.rand(2, 8, 8) * 5.0
     blob = pack_sparse_delta(
@@ -1116,8 +1146,11 @@ def test_r5_3_2_pending_and_rejected_do_not_need_token(tmp_path: Path) -> None:
     do NOT require the token (they're operator-issuable — the gate is
     only on approved)."""
     import torch
+
     from tac.uniward_delta import (
-        pack_sparse_delta, COMPLIANCE_PENDING, COMPLIANCE_REJECTED,
+        COMPLIANCE_PENDING,
+        COMPLIANCE_REJECTED,
+        pack_sparse_delta,
     )
     delta = torch.randn(2, 3, 8, 8) * 1.5
     cost = torch.rand(2, 8, 8) * 5.0
@@ -1142,6 +1175,7 @@ def test_r5_3_3_concurrent_write_attestation_only_one_succeeds(
     FileExistsError. The previous path.exists() + path.write_text()
     pattern allowed BOTH to write, with the second silently winning."""
     import threading
+
     from tac.lane_c_compliance import write_attestation
     priv, _pub = _gen_test_signing_key()
     blob = b"race-condition-delta" * 32
@@ -1152,7 +1186,7 @@ def test_r5_3_3_concurrent_write_attestation_only_one_succeeds(
         try:
             barrier.wait(timeout=5)
             write_attestation(
-                blob=blob, approver=f"yousfi",
+                blob=blob, approver="yousfi",
                 ruling_text="concurrent",
                 signed_by_user="x", git_head="abc",
                 private_key=priv, root=tmp_path,
@@ -1245,7 +1279,8 @@ def test_r5_3_4_attestation_path_resolves_under_attestation_dir(
     """REGRESSION (Codex R5-3 #4): a valid hex SHA must resolve to a
     path STRICTLY under the attestation directory."""
     from tac.lane_c_compliance import (
-        attestation_path_for, ATTESTATION_DIR,
+        ATTESTATION_DIR,
+        attestation_path_for,
     )
     valid_sha = "a" * 64
     path = attestation_path_for(valid_sha, root=tmp_path)

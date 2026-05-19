@@ -7,7 +7,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 BEST_RE = re.compile(r"best checkpoint -> epoch (?P<epoch>\d+) score=(?P<score>[0-9.]+) int8=(?P<int8_bytes>\d+) bytes")
 SAVED_FP32_RE = re.compile(r"Saved fp32:\s+(?P<path>\S+)")
 SAVED_INT8_RE = re.compile(r"Saved int8:\s+(?P<path>\S+)\s+\((?P<int8_bytes>\d+)\s+bytes\)")

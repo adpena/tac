@@ -20,11 +20,10 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # Video probing
@@ -428,7 +427,7 @@ def preprocess(
     writer_proc = subprocess.Popen(writer_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     if adaptive_mask:
-        print(f"Adaptive masking ENABLED (gradient + temporal + spatial prior)", file=sys.stderr)
+        print("Adaptive masking ENABLED (gradient + temporal + spatial prior)", file=sys.stderr)
 
     frame_idx = 0
     prev_frame: np.ndarray | None = None
@@ -610,7 +609,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 def masks_to_roi_map(
-    masks: "np.ndarray",
+    masks: np.ndarray,
     encode_w: int,
     encode_h: int,
     total_frames: int,
@@ -637,7 +636,7 @@ def masks_to_roi_map(
         List of ROI map lines in SVT-AV1 format.
     """
     import math
-    import numpy as np
+
 
     cols = math.ceil(encode_w / 64)
     rows = math.ceil(encode_h / 64)

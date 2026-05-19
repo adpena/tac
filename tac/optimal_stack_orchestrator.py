@@ -80,10 +80,9 @@ import json
 import logging
 import time
 import zipfile
-from dataclasses import asdict, dataclass, field
-from io import BytesIO
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 

@@ -45,9 +45,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 ENV_VAR = "TAC_ALLOW_NO_ROUNDTRIP"
 SENTINEL_VALUE = "1"

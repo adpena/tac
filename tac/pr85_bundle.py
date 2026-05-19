@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Mapping
+from typing import Any
 
 SEGMENT_ORDER: tuple[str, ...] = (
     "mask",
@@ -100,7 +101,7 @@ class Pr85Bundle:
         return {name: len(bytes(segment)) for name, segment in self.segments.items()}
 
     @property
-    def segment_contracts(self) -> dict[str, "Pr85SegmentContract"]:
+    def segment_contracts(self) -> dict[str, Pr85SegmentContract]:
         """Return deterministic local byte contracts for parsed segments."""
 
         return {

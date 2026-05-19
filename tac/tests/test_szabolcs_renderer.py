@@ -33,7 +33,6 @@ from tac.contrib.szabolcs_renderer import (
     encode_luma_to_probability_map,
 )
 
-
 # ── Constants for tests ────────────────────────────────────────────────────
 
 

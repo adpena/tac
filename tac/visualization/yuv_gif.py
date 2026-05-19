@@ -28,15 +28,14 @@ import io
 import sys
 from pathlib import Path
 
+import matplotlib
 import numpy as np
 import torch
 
 from tac.versioned_output import versioned_write
 
-import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -137,9 +136,9 @@ def main() -> None:
     if upstream_str not in sys.path:
         sys.path.insert(0, upstream_str)
 
+    from frame_utils import rgb_to_yuv6
     from PIL import Image
 
-    from frame_utils import rgb_to_yuv6
     from tac.architectures import build_postfilter
     from tac.data import decode_archive, decode_video
     from tac.quantization import load_int8

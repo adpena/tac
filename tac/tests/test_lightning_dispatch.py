@@ -35,7 +35,7 @@ def _load_launcher_module():
 
 
 def test_dispatcher_module_imports_clean():
-    from tac.deploy.lightning import LightningDispatcher, DispatchResult  # noqa: F401
+    from tac.deploy.lightning import DispatchResult, LightningDispatcher  # noqa: F401
 
 
 def test_dispatcher_gpu_tier_normalize():

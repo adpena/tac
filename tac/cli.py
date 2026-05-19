@@ -16,16 +16,15 @@ from pathlib import Path
 from typing import Any
 
 from .lossless.arithmetic import (
-    GPTArithmeticEstimate,
     build_gpt_arithmetic_plan,
     estimate_gpt_arithmetic_workload,
     materialize_gpt_arithmetic_stream,
     write_symbol_frequency_report,
 )
 from .lossless.codecs import (
-    benchmark_zstd_dict_file,
-    benchmark_zstd_dict_directory,
     benchmark_zstd_dict_chunked_file,
+    benchmark_zstd_dict_directory,
+    benchmark_zstd_dict_file,
     compress_lossless_file,
     decompress_lossless_file,
     evaluate_lossless_baseline_submission,
@@ -38,11 +37,16 @@ from .lossless.frequency_coder import (
     encode_uint16_frequency_file,
     encode_uint16_prev_symbol_file,
 )
-from .lossless.gpt_arithmetic_coder import encode_commavq_gpt_global_sample, encode_commavq_gpt_sample
 from .lossless.global_prev_symbol import benchmark_global_prev_symbol_record_order_sample
+from .lossless.gpt_arithmetic_coder import encode_commavq_gpt_global_sample, encode_commavq_gpt_sample
+from .lossless.gpt_score import probe_commavq_gpt_devices, score_commavq_gpt_sample
 from .lossless.hybrid_selector import SelectionMetric, rank_exact_candidates
 from .lossless.next_frame_coder import encode_commavq_next_frame_sample
-from .lossless.gpt_score import probe_commavq_gpt_devices, score_commavq_gpt_sample
+from .lossless.profiles import PROFILES as LOSSLESS_PROFILES
+from .lossless.rgb_semantic_labels import build_rgb_label_map_sample
+from .lossless.semantic_labels import build_pose_label_map_sample
+from .lossless.state import promote_lossless_result
+from .lossless.submission import build_submission_zip
 from .lossless.tiny_frame_predictor import summarize_tiny_frame_predictor
 from .lossless.tiny_frame_train import probe_tiny_frame_training
 from .lossless.token_rgb_bridge import (
@@ -50,11 +54,6 @@ from .lossless.token_rgb_bridge import (
     decode_commavq_token_file_to_rgb,
     load_official_commavq_bridge,
 )
-from .lossless.semantic_labels import build_pose_label_map_sample
-from .lossless.rgb_semantic_labels import build_rgb_label_map_sample
-from .lossless.profiles import PROFILES as LOSSLESS_PROFILES
-from .lossless.state import promote_lossless_result
-from .lossless.submission import build_submission_zip
 from .profiles import PROFILES as LOSSY_PROFILES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -597,7 +596,7 @@ def _run_lossy(args: argparse.Namespace) -> dict[str, Any]:
         raw_saliency = torch.ones(len(comp_frames), h, w)
         if args.saliency:
             print(f"[tac] WARNING: Saliency file not found: {args.saliency}")
-        print(f"[tac] Using uniform saliency (no weighting)")
+        print("[tac] Using uniform saliency (no weighting)")
 
     models_dir = Path(args.models_dir)
     posenet, segnet = load_scorers(
@@ -1079,7 +1078,7 @@ def _run_ensemble(args: argparse.Namespace) -> Any:
 
 
 def _run_rd_floor(args: argparse.Namespace) -> Any:
-    from .experiments.rd_floor import build_report, load_summary_points, print_human_report, RAW_ROOT
+    from .experiments.rd_floor import RAW_ROOT, build_report, load_summary_points, print_human_report
 
     root = args.root if args.root else RAW_ROOT
     targets = sorted(set(args.target or [1.80, 1.75]), reverse=True)

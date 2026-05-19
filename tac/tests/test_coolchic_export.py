@@ -22,25 +22,23 @@ Test surface:
 """
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
 import torch
 
 from tac.contrib.coolchic_renderer import (
-    build_coolchic_renderer,
     build_c3_residual_renderer,
+    build_coolchic_renderer,
 )
 from tac.renderer_export import (
     detect_checkpoint_type,
-    export_coolchic_renderer,
     export_c3_residual_renderer,
-    load_coolchic_renderer,
-    load_c3_residual_renderer,
+    export_coolchic_renderer,
     load_any_renderer_checkpoint,
+    load_c3_residual_renderer,
+    load_coolchic_renderer,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -266,7 +264,7 @@ class TestMagicByteCollisions:
     added or shadowed by existing format bytes."""
 
     def test_coolchic_magic_distinct_from_existing_formats(self):
-        from tac.renderer_export import _COOLCHIC_MAGIC, _C3_RESIDUAL_MAGIC
+        from tac.renderer_export import _C3_RESIDUAL_MAGIC, _COOLCHIC_MAGIC
         existing = {b"DPSM", b"ASYM", b"FP4A", b"I4LZ", b"MXLZ"}
         assert _COOLCHIC_MAGIC not in existing
         assert _C3_RESIDUAL_MAGIC not in existing

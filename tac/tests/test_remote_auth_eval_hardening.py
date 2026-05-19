@@ -22,7 +22,6 @@ from tac.preflight import (
     check_remote_lane_auth_eval_json_adjudication,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 

@@ -25,7 +25,7 @@ CLAUDE.md compliance:
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Mapping
+from collections.abc import Mapping
 
 import torch
 
@@ -104,7 +104,7 @@ def allocate_bits(
     min_bits: int = DEFAULT_MIN_BITS,
     max_bits: int = DEFAULT_MAX_BITS,
     bisect_iters: int = 64,
-) -> "OrderedDict[str, torch.Tensor]":
+) -> OrderedDict[str, torch.Tensor]:
     """Water-fill per-weight bit allocation under a total bit budget.
 
     Args:
@@ -249,8 +249,8 @@ def allocate_bits(
 def _scatter_back(
     flat_bits: torch.Tensor,
     meta: list[tuple[str, torch.Size, int]],
-) -> "OrderedDict[str, torch.Tensor]":
-    out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+) -> OrderedDict[str, torch.Tensor]:
+    out: OrderedDict[str, torch.Tensor] = OrderedDict()
     offset = 0
     for name, shape, n in meta:
         chunk = flat_bits[offset : offset + n].to(torch.uint8).reshape(shape)

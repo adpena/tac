@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-
 from experiments.convert_fisher_to_owv3_sensitivity_map import (
     SensitivityConversionError,
     convert_importance_to_channel_sensitivity,

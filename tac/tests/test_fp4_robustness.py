@@ -22,14 +22,13 @@ import torch.nn as nn
 from tac.fp4_quantize import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_CODEBOOK,
-    QATRendererFP4,
     RESIDUAL_CODEBOOK,
+    QATRendererFP4,
     _quantize_block,
     dequantize_fp4,
     fake_quant_fp4,
     quantize_fp4,
 )
-
 
 # ── Codebook properties ───────────────────────────────────────────────────
 

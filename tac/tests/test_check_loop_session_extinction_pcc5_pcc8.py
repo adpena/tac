@@ -20,11 +20,10 @@ import pytest
 from tac.preflight import (
     PreflightError,
     check_remote_archive_eval_self_bootstraps_uv_and_ffmpeg,
-    check_venv_creators_use_ensurepip,
-    check_vastai_create_uses_min_disk_60,
     check_remote_chain_drivers_clean_inflated_per_candidate,
+    check_vastai_create_uses_min_disk_60,
+    check_venv_creators_use_ensurepip,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 

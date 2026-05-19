@@ -27,14 +27,12 @@ Usage::
 
 from __future__ import annotations
 
+import bisect
 import io
 import json
-import math
 import struct
 import zipfile
 from typing import Any
-
-import bisect
 
 import torch
 import torch.nn as nn
@@ -401,7 +399,7 @@ class NeuralEntropyModel(nn.Module):
         return buf.getvalue()
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "NeuralEntropyModel":
+    def deserialize(cls, data: bytes) -> NeuralEntropyModel:
         """Deserialize an entropy model from bytes.
 
         Uses safe manual unpacking (no pickle/torch.load). Compatible with
@@ -952,7 +950,7 @@ def _smoke_test() -> None:
     for k in state:
         err = (state[k] - restored_state[k]).abs().max().item()
         assert err < 0.1, f"Weight quant error for {k}: {err}"
-    print(f"  weight quantization: OK")
+    print("  weight quantization: OK")
 
     # 7. Full archive round-trip
     video = b"fake_video_data_12345"
@@ -1003,7 +1001,7 @@ def _smoke_test() -> None:
 
     # 10. compress_byte_stream edge case: empty input
     assert decompress_byte_stream(compress_byte_stream(b"")) == b""
-    print(f"  byte stream empty: OK")
+    print("  byte stream empty: OK")
 
     print("entropy_archive: all smoke tests passed")
 

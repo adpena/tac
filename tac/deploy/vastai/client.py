@@ -12,11 +12,12 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 from tac.deploy.base import ExperimentConfig, InstanceSpec, repo_root
 from tac.deploy.vastai.budget import BudgetTracker
@@ -525,7 +526,7 @@ class VastClient:
             dph=dph,
             ssh_host=ssh_host,
             ssh_port=ssh_port,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
             timeout_hours=experiment.timeout_hours,
             status="created",
             ssh_key_path=key_path,

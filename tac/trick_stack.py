@@ -161,7 +161,7 @@ class TrickStackConfig:
     total_time_budget: float = 1800.0  # 30 min eval limit
 
     @classmethod
-    def from_profile(cls, profile: dict[str, Any], **overrides: Any) -> "TrickStackConfig":
+    def from_profile(cls, profile: dict[str, Any], **overrides: Any) -> TrickStackConfig:
         """Create config from a profile dict with optional overrides."""
         merged = {**profile, **overrides}
         # Filter to only fields that exist in the dataclass
@@ -809,8 +809,10 @@ def stacked_inflate(
 
     Returns dict with timing and improvement estimates.
     """
-    import av
     import logging
+
+    import av
+
     from tac.quantization import load_postfilter_int8
 
     # Validate extra_kwargs: warn about unrecognized keys that may indicate typos
@@ -1212,6 +1214,7 @@ def cpu_stacked_inflate(
         dict with timings, stages_run, n_frames, total_elapsed.
     """
     import av
+
     from tac.quantization import load_postfilter_int8
 
     if config is None:

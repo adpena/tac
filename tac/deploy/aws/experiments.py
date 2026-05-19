@@ -6,8 +6,8 @@ overriding ``gpu_type`` and ``estimated_cost_per_hour``.
 """
 from __future__ import annotations
 
-from tac.deploy.base import ExperimentConfig
 from tac.deploy.aws.ec2_client import SPOT_PRICE_ESTIMATES
+from tac.deploy.base import ExperimentConfig
 
 
 def adapt_for_aws(

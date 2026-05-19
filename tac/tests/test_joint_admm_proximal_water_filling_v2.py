@@ -38,7 +38,6 @@ from tac.joint_admm_proximal_water_filling_v2 import (
     build_water_filling_v2_frontier,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures: small block-FP-eligible weight tensor + Hessian + cached score
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,7 +389,7 @@ def test_admm_4stream_nonconvex_discrete_converges_synthetic() -> None:
 def test_no_scorer_import_in_module() -> None:
     """[synthetic] Lane 10 wrapper module text contains no scorer imports."""
     import tac.joint_admm_proximal_water_filling_v2 as mod
-    src = open(mod.__file__, "r", encoding="utf-8").read()
+    src = open(mod.__file__, encoding="utf-8").read()
     forbidden_substrings = ["import segnet", "import posenet", "scorer.load", "load_scorers"]
     for s in forbidden_substrings:
         assert s not in src.lower(), f"Lane 10 wrapper must not reference {s}"

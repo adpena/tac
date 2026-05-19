@@ -41,8 +41,7 @@ CLAUDE.md compliance:
 """
 from __future__ import annotations
 
-import re
-from typing import Iterable
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -629,7 +628,7 @@ def swap_renderer_convs_with_learnable_bits(
 
 def list_learnable_bit_layers(
     model: nn.Module,
-) -> list[tuple[str, "LearnableBitConv2d"]]:
+) -> list[tuple[str, LearnableBitConv2d]]:
     """Return every (name, layer) for LearnableBitConv2d in the model."""
     return [
         (name, mod)
@@ -864,7 +863,7 @@ class LagrangianRateController:
 def compute_learnable_bit_rate_penalty(
     model: nn.Module,
     target_bits_per_weight: float | None,
-    lambda_rate: float | "LagrangianRateController",
+    lambda_rate: float | LagrangianRateController,
 ) -> torch.Tensor:
     """Linear Lagrangian rate penalty: ``λ × (mean_bits − target)``.
 

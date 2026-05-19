@@ -69,7 +69,6 @@ from typing import Any
 
 import torch
 
-
 POSE_DELTA_FORMAT_SENTINEL_V1 = "pose_delta_v1"
 DEFAULT_DELTA_QUANT_BITS = 8  # int8 -> 127 levels per side
 

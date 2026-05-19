@@ -21,19 +21,17 @@ from __future__ import annotations
 
 import zlib
 
-import numpy as np
 import pytest
 import torch
 
 from tac.uniward_delta import (
-    DeltaSpec,
     MAGIC,
     SCHEMA_VERSION,
+    DeltaSpec,
     apply_delta_to_frame,
     pack_sparse_delta,
     unpack_sparse_delta,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -884,10 +882,12 @@ def test_codex_r5_compliance_status_round_trips_for_all_values() -> None:
     only legitimate caller; tests pass the token explicitly to exercise
     the same codepath the gate validates).
     """
-    from tac.uniward_delta import (
-        COMPLIANCE_PENDING, COMPLIANCE_APPROVED, COMPLIANCE_REJECTED,
-    )
     from tac.lane_c_compliance import INTERNAL_PROMOTION_TOKEN
+    from tac.uniward_delta import (
+        COMPLIANCE_APPROVED,
+        COMPLIANCE_PENDING,
+        COMPLIANCE_REJECTED,
+    )
     delta, cost = _random_delta(n_frames=2, H=8, W=8, sparsity=0.1, seed=22)
     for status in (COMPLIANCE_PENDING, COMPLIANCE_APPROVED, COMPLIANCE_REJECTED):
         kwargs = {
@@ -950,6 +950,7 @@ def test_codex_r5_legacy_v1_blob_decodes_as_pending_ruling() -> None:
     """
     import json as _json
     import struct as _struct
+
     from tac.uniward_delta import COMPLIANCE_PENDING, MAGIC
 
     delta, cost = _random_delta(n_frames=2, H=8, W=8, sparsity=0.1, seed=25)
@@ -984,6 +985,7 @@ def test_codex_r5_unknown_compliance_status_in_blob_falls_back_to_pending() -> N
     """
     import json as _json
     import struct as _struct
+
     from tac.uniward_delta import COMPLIANCE_PENDING, MAGIC
 
     delta, cost = _random_delta(n_frames=1, H=4, W=4, sparsity=0.5, seed=26)
@@ -1094,6 +1096,7 @@ def test_codex_r5_archive_builder_refuses_rejected_even_with_override() -> None:
     import sys as _sys
     import tempfile
     from pathlib import Path
+
     from tac.uniward_delta import COMPLIANCE_REJECTED
 
     repo_root = Path(__file__).resolve().parents[3]

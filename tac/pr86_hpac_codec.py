@@ -20,19 +20,13 @@ quarantined.
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import importlib.metadata
-import io
 import json
-import sys
-import time
-import zipfile
-from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 

@@ -20,7 +20,6 @@ from tac.neural_weight_codec_sensitivity import (
     encode_with_variable_codebook,
 )
 
-
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
 

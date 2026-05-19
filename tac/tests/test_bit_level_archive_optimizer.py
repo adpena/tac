@@ -22,7 +22,6 @@ from tac.bit_level_archive_optimizer import (
     BLPS_VERSION,
     ArchiveByteComposition,
     BitLevelArchiveOptimizer,
-    PerDimQuantizer,
     audit_archive_byte_composition,
     build_shared_brotli_dictionary,
     decode_blps,
@@ -31,7 +30,6 @@ from tac.bit_level_archive_optimizer import (
     fit_per_dim_quantizer,
     quantize_poses,
 )
-
 
 # ── per-dim quantizer fit ─────────────────────────────────────────────
 
@@ -186,7 +184,8 @@ def test_blps_decode_rejects_version_mismatch():
     # Bump version byte
     encoded[4] = 99
     # Have to also fix the CRC since we changed bytes
-    import struct, zlib
+    import struct
+    import zlib
     payload_len = len(encoded) - 4  # exclude old crc
     new_crc = zlib.crc32(bytes(encoded[:payload_len])) & 0xFFFFFFFF
     encoded[-4:] = struct.pack(">I", new_crc)

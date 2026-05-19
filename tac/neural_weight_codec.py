@@ -48,7 +48,6 @@ import torch.nn.functional as F
 
 from tac.neural_weight_corpus import build_corpus_from_checkpoints
 
-
 __all__ = [
     "WeightCodec",
     "WeightCodecConfig",

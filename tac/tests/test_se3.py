@@ -40,10 +40,10 @@ import torch
 from scipy.spatial.transform import Rotation as ScipyRotation
 
 from tac.se3 import (
-    NEAR_PI_THRESHOLD,
-    SE3Element,
-    SMALL_ANGLE_THRESHOLD,
     _LIE_ALGEBRA_SENTINEL,
+    NEAR_PI_THRESHOLD,
+    SMALL_ANGLE_THRESHOLD,
+    SE3Element,
     batched_geodesic_step_axis_angle,
     exp_map_se3,
     exp_map_so3,
@@ -58,7 +58,6 @@ from tac.se3 import (
     riemannian_gradient_se3,
     vee_so3,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Helpers

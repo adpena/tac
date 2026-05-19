@@ -81,7 +81,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-
 # Standard rec.601 luma weights (matches `rgb_to_yuv6` in upstream/frame_utils.py)
 _LUMA_R: float = 0.299
 _LUMA_G: float = 0.587

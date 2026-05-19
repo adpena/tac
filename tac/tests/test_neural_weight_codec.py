@@ -10,10 +10,6 @@ Each test asserts SIGN/VALUE per Round 26 finding (anti-arbitrariness):
 """
 from __future__ import annotations
 
-import struct
-import tempfile
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn as nn
@@ -25,7 +21,6 @@ from tac.neural_weight_codec import (
     tensor_to_blocks,
     train_codec,
 )
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 

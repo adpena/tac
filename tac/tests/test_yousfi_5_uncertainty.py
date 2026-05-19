@@ -26,7 +26,6 @@ import torch.nn.functional as F
 from tac.fridrich import segnet_uncertainty_map
 from tac.losses import segnet_uncertainty_weighted_loss
 
-
 # ── Mock SegNet ──────────────────────────────────────────────────────────
 
 

@@ -1,5 +1,10 @@
 # tac — Task-Aware Compression
 
+[![Test](https://github.com/adpena/tac/actions/workflows/test.yml/badge.svg)](https://github.com/adpena/tac/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Code style: ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 Neural video compression optimized for downstream perception models.
 
 **`tac`** is the tight production library extracted from **`comma-lab`** (the comma video compression contest research workspace at https://github.com/adpena/comma-lab — currently being sanitized for public release; see PR [#107](https://github.com/commaai/comma_video_compression_challenge/pull/107) for the contest submission). This repo contains the reusable codec primitives, score-band predictor with refusal modes, distortion proxy, parallel-dispatch toolchain, and hardened preflight infrastructure. The full research trajectory — experimental ledger, byte-level deconstruction of public PRs, lane registry, dispatch wrappers, methodology writeup, and 585 session-memory files — lives in `comma-lab`.
@@ -171,8 +176,9 @@ tac lossless decompress output.tac -o recovered.bin
 
 ## Links
 
-- [Repository](https://github.com/adpena/pact)
-- [comma.ai video compression challenge](https://github.com/commaai/comma-video-compression-challenge)
+- [Repository](https://github.com/adpena/tac)
+- [Research workspace (comma-lab)](https://github.com/adpena/comma-lab)
+- [comma.ai video compression challenge](https://github.com/commaai/comma_video_compression_challenge)
 
 ## License
 

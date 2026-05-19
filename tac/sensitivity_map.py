@@ -12,13 +12,13 @@ non-authoritative by callers.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import Any
 
 import torch
 import torch.nn as nn
-
 
 SENSITIVITY_MAP_FORMAT = "tac_score_sensitivity_map_v1"
 CERTIFIED_SENSITIVITY_MAP_CERTIFICATION_FORMAT = "component_sensitivity_map_certification_v1"

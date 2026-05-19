@@ -38,7 +38,6 @@ from tac.preflight import (  # noqa: E402
     check_imp_dispatch_calls_train_distill,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Real-codebase regression — STRICT @ 0 violations
 # ─────────────────────────────────────────────────────────────────────────────

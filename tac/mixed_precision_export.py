@@ -62,7 +62,6 @@ import lzma
 import math
 import struct
 from pathlib import Path
-from typing import Union
 
 import torch
 import torch.nn as nn
@@ -447,7 +446,7 @@ def export_int4_lzma2(
 
 
 def load_int4_lzma2(
-    path_or_bytes: Union[Path, str, bytes],
+    path_or_bytes: Path | str | bytes,
     device: str = "cpu",
 ) -> dict[str, torch.Tensor]:
     """Load and dequantize int4+LZMA2 or mixed-precision+LZMA2 weights.
@@ -548,7 +547,7 @@ def load_int4_lzma2(
 
 
 def load_int4_lzma2_into_model(
-    path_or_bytes: Union[Path, str, bytes],
+    path_or_bytes: Path | str | bytes,
     model: nn.Module,
     device: str = "cpu",
     strict: bool = True,

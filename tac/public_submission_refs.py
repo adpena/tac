@@ -7,8 +7,8 @@ runtime behavior branches or score claims.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from typing import Iterable
 
 CONTEST_REPO = "commaai/comma_video_compression_challenge"
 CONTEST_PULL_URL = "https://github.com/commaai/comma_video_compression_challenge/pull/{number}"

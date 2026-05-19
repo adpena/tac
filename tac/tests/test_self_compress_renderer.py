@@ -21,12 +21,9 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import tempfile
 from pathlib import Path
 
-import pytest
 import torch
-import torch.nn as nn
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INFLATE_PATH = REPO_ROOT / "submissions" / "robust_current" / "inflate_renderer.py"
@@ -107,8 +104,7 @@ class TestSwapRendererConvsWithSelfCompress:
 
     def test_protected_layers_stay_fp32(self):
         from tac.self_compress import (
-            swap_renderer_convs_with_self_compress, SelfCompressingConv2d,
-            SC_PROTECTED_NAME_PATTERNS,
+            swap_renderer_convs_with_self_compress,
         )
         m = self._build()
         diag = swap_renderer_convs_with_self_compress(m, init_bits=8.0)
@@ -138,7 +134,8 @@ class TestSwapRendererConvsWithSelfCompress:
         """The bit_depth.bits tensors add a small overhead (one float per
         SC output channel) but no other params should change."""
         from tac.self_compress import (
-            swap_renderer_convs_with_self_compress, list_self_compress_layers,
+            list_self_compress_layers,
+            swap_renderer_convs_with_self_compress,
         )
         m = self._build()
         n_before = sum(p.numel() for p in m.parameters())
@@ -153,7 +150,6 @@ class TestSwapRendererConvsWithSelfCompress:
 
     def test_swap_preserves_forward_at_init(self):
         """At init_bits=8 the SC quantization barely affects the output."""
-        import torch.nn.functional as F
         from tac.self_compress import swap_renderer_convs_with_self_compress
         m = self._build()
         m.eval()
@@ -180,9 +176,11 @@ def _build_swapped_renderer(seed: int = 7, bit_choices=(0, 2, 2, 3, 3, 4)):
     """Helper: build a dilated-h64 renderer with SC swap and a varied
     per-channel bit distribution mimicking post-training state."""
     import random
+
     from tac.renderer import build_renderer
     from tac.self_compress import (
-        swap_renderer_convs_with_self_compress, list_self_compress_layers,
+        list_self_compress_layers,
+        swap_renderer_convs_with_self_compress,
     )
     torch.manual_seed(seed)
     random.seed(seed + 1)
@@ -202,7 +200,8 @@ def _build_swapped_renderer(seed: int = 7, bit_choices=(0, 2, 2, 3, 3, 4)):
 class TestSCv1ExportLoad:
     def test_round_trip_byte_exact_forward(self, tmp_path):
         from tac.renderer_export import (
-            export_self_compressed_renderer, load_self_compressed_renderer,
+            export_self_compressed_renderer,
+            load_self_compressed_renderer,
         )
         m = _build_swapped_renderer()
         bin_path = tmp_path / "renderer.bin"
@@ -241,8 +240,8 @@ class TestSCv1ExportLoad:
         """At avg ~2.5 SC bits/weight, SCv1 must be smaller than the same
         arch's FP4 export (which is 4 bits/weight)."""
         from tac.renderer_export import (
-            export_self_compressed_renderer,
             export_asymmetric_checkpoint_fp4,
+            export_self_compressed_renderer,
         )
         # SC version (mean ~2.5)
         m_sc = _build_swapped_renderer(bit_choices=(0, 2, 2, 2, 3, 3))
@@ -270,7 +269,8 @@ class TestSCv1ExportLoad:
 
     def test_detect_checkpoint_type_returns_self_compress_v1(self, tmp_path):
         from tac.renderer_export import (
-            export_self_compressed_renderer, detect_checkpoint_type,
+            detect_checkpoint_type,
+            export_self_compressed_renderer,
         )
         m = _build_swapped_renderer()
         bin_path = tmp_path / "r.bin"
@@ -282,7 +282,8 @@ class TestSCv1ExportLoad:
 
     def test_load_any_renderer_dispatches_scv1(self, tmp_path):
         from tac.renderer_export import (
-            export_self_compressed_renderer, load_any_renderer_checkpoint,
+            export_self_compressed_renderer,
+            load_any_renderer_checkpoint,
         )
         m = _build_swapped_renderer()
         bin_path = tmp_path / "r.bin"
@@ -366,11 +367,12 @@ class TestInflateRendererLoadsSCv1:
 class TestRendererRatePenalty:
     def test_compute_rate_penalty_zero_when_under_target(self):
         """When avg bits/weight is well below target, the ReLU-penalty is 0."""
-        from tac.self_compress import (
-            swap_renderer_convs_with_self_compress, list_self_compress_layers,
-            compute_renderer_rate_penalty,
-        )
         from tac.renderer import build_renderer
+        from tac.self_compress import (
+            compute_renderer_rate_penalty,
+            list_self_compress_layers,
+            swap_renderer_convs_with_self_compress,
+        )
         m = build_renderer(
             num_classes=5, embed_dim=6, base_ch=36, mid_ch=60, motion_hidden=32,
             depth=1, use_zoom_flow=True, pose_dim=6,
@@ -384,11 +386,12 @@ class TestRendererRatePenalty:
         assert pen.item() == 0.0
 
     def test_rate_penalty_positive_when_over_target(self):
-        from tac.self_compress import (
-            swap_renderer_convs_with_self_compress, list_self_compress_layers,
-            compute_renderer_rate_penalty,
-        )
         from tac.renderer import build_renderer
+        from tac.self_compress import (
+            compute_renderer_rate_penalty,
+            list_self_compress_layers,
+            swap_renderer_convs_with_self_compress,
+        )
         m = build_renderer(
             num_classes=5, embed_dim=6, base_ch=36, mid_ch=60, motion_hidden=32,
             depth=1, use_zoom_flow=True, pose_dim=6,
@@ -411,11 +414,13 @@ class TestRendererRatePenalty:
 
     def test_rate_penalty_drives_bits_down_one_step(self):
         """A single optimizer step of rate-only loss must reduce avg bits."""
-        from tac.self_compress import (
-            swap_renderer_convs_with_self_compress, list_self_compress_layers,
-            compute_renderer_rate_penalty, renderer_average_bits_per_weight,
-        )
         from tac.renderer import build_renderer
+        from tac.self_compress import (
+            compute_renderer_rate_penalty,
+            list_self_compress_layers,
+            renderer_average_bits_per_weight,
+            swap_renderer_convs_with_self_compress,
+        )
         m = build_renderer(
             num_classes=5, embed_dim=6, base_ch=36, mid_ch=60, motion_hidden=32,
             depth=1, use_zoom_flow=True, pose_dim=6,

@@ -31,7 +31,6 @@ frame pairs (B, T, H, W, 3) suitable for ``scorer_forward_pair``.
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -320,7 +319,7 @@ class SegMapTrainer:
         posenet,
         segnet,
         device: str | torch.device = "cuda",
-        learnable_class_targets: Optional[nn.Module] = None,
+        learnable_class_targets: nn.Module | None = None,
     ):
         # Enforce CLAUDE.md non-negotiables BEFORE any GPU spend.
         if not config.eval_roundtrip:
@@ -458,9 +457,9 @@ class SegMapTrainer:
         self,
         mask_pairs: torch.Tensor,
         gt_pairs: torch.Tensor,
-        ema: Optional[EMA] = None,
+        ema: EMA | None = None,
         roundtrip_noise_std: float = 0.5,
-        pair_weights: Optional[torch.Tensor] = None,
+        pair_weights: torch.Tensor | None = None,
         batch_size: int = 8,
     ) -> dict[str, float]:
         """Run one pass over (mask_pairs, gt_pairs), CHUNKED in mini-batches.
@@ -504,9 +503,9 @@ class SegMapTrainer:
         if mask_pairs.dim() == 4:
             if self.learnable_class_targets is None:
                 raise ValueError(
-                    f"mask_pairs has 4 dims (B, T, H, W) — "
-                    f"requires learnable_class_targets to project via LUT. "
-                    f"Otherwise pass (B, T, NUM_CLASSES, H, W) one-hot."
+                    "mask_pairs has 4 dims (B, T, H, W) — "
+                    "requires learnable_class_targets to project via LUT. "
+                    "Otherwise pass (B, T, NUM_CLASSES, H, W) one-hot."
                 )
             from tac.mask_grayscale_lut import NUM_CLASSES as _NC
             b, t, h, w = mask_pairs.shape
@@ -537,7 +536,7 @@ class SegMapTrainer:
 
         # Validate pair_weights shape ONCE before chunking so the same
         # contract holds whether or not we hit the Lane WC-S path.
-        pw_full: Optional[torch.Tensor] = None
+        pw_full: torch.Tensor | None = None
         if pair_weights is not None:
             if pair_weights.numel() != b:
                 raise ValueError(
@@ -728,7 +727,7 @@ class SegMapTrainer:
             "num_steps": steps,
         }
 
-    def export_inference_state_dict(self, ema: Optional[EMA] = None) -> dict:
+    def export_inference_state_dict(self, ema: EMA | None = None) -> dict:
         """Return a state-dict shaped for the Selfcomp ``load_segmap`` consumer.
 
         The reference ``load_segmap`` (Selfcomp inflate.py L183-220) reads:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
-import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from tac.component_sensitivity_artifact import validate_component_sensitivity_manifest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "experiments" / "build_component_sensitivity_manifest.py"

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[3]
 REMOTE_SCRIPTS = [
     REPO / "scripts" / "remote_lane_j_nwc_neural_weight_compression.sh",
